@@ -30,11 +30,13 @@ let currentSummarySessionId = null
 let currentQuestionSessionId = null
 let currentSSE = null
 let selectedQuestionId = null
+let selectedQuestionSessionId = null
 let currentQuestionUserMessageId = null
 let showAllProcessDetails = false
 let isEditingSummary = false
 let refreshPromise = null
 let refreshQueued = false
+let shouldScrollMessagesToBottom = false
 const SOURCE_ROOTS = ['notes/', 'nodes/', 'descriptions_output/', 'changes/']
 
 function esc(s) {
@@ -146,7 +148,10 @@ function questionThreads() {
 }
 
 function selectedQuestion() {
-  return questionThreads().find((question) => question.id === selectedQuestionId) || null
+  const threads = questionThreads()
+  return threads.find((question) => question.id === selectedQuestionId)
+    || threads.find((question) => question.sessionID === selectedQuestionSessionId)
+    || null
 }
 
 function projectDetailUrl(questionId = selectedQuestionId) {
@@ -159,6 +164,7 @@ function projectDetailUrl(questionId = selectedQuestionId) {
 async function fetchProjectView(questionId = selectedQuestionId) {
   detail = await fetchJson(projectDetailUrl(questionId))
   selectedQuestionId = detail.selectedQuestionID || detail.questions?.[0]?.id || null
+  selectedQuestionSessionId = detail.selectedThread?.sessionID || selectedQuestion()?.sessionID || null
 }
 
 async function refreshProjectView(questionId = selectedQuestionId) {
@@ -279,6 +285,8 @@ async function renderQuestionList() {
     `
     item.onclick = async () => {
       selectedQuestionId = question.id
+      selectedQuestionSessionId = question.sessionID
+      shouldScrollMessagesToBottom = true
       await refreshProjectView(question.id)
     }
     questionListEl.appendChild(item)
@@ -319,6 +327,10 @@ function renderPartNode(part) {
   }
 
   return null
+}
+
+function scrollMessagesToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight
 }
 
 function renderToolPart(el, part) {
@@ -383,6 +395,8 @@ async function renderQuestions() {
 
   currentQuestionSessionId = question.sessionID
   currentQuestionUserMessageId = detail.selectedThread?.userMessageID || question.userMessageID || null
+  selectedQuestionId = question.id
+  selectedQuestionSessionId = question.sessionID
   qaMeta.textContent = `${questionThreads().length} 条会话线程 · 当前会话 ${question.sessionID}`
 
   const turns = detail.selectedThread?.questionID === question.id
@@ -430,6 +444,11 @@ async function renderQuestions() {
 
     messagesEl.appendChild(el)
   }
+
+  if (shouldScrollMessagesToBottom || detail.selectedThread?.running) {
+    requestAnimationFrame(scrollMessagesToBottom)
+    shouldScrollMessagesToBottom = false
+  }
 }
 
 async function runSummary(auto = false) {
@@ -468,6 +487,7 @@ async function ask(mode) {
   if (!text) return
   const body = { text, mode }
   const question = selectedQuestion()
+  const targetSessionId = mode === 'followup' ? question?.sessionID : null
   if (mode === 'followup') {
     if (!question?.id || !question?.sessionID) return
     body.questionID = question.id
@@ -481,9 +501,12 @@ async function ask(mode) {
   if (result?.detail) {
     detail = result.detail
     selectedQuestionId = detail.selectedQuestionID || selectedQuestionId
+    selectedQuestionSessionId = targetSessionId || detail.selectedThread?.sessionID || selectedQuestionSessionId
   } else if (mode === 'question' && result?.question?.id) {
     selectedQuestionId = result.question.id
+    selectedQuestionSessionId = result.question.sessionID || selectedQuestionSessionId
   }
+  shouldScrollMessagesToBottom = true
   questionInput.value = ''
   renderSummary()
   await renderQuestions()
