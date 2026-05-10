@@ -485,12 +485,7 @@ export namespace Session {
     search?: string
     limit?: number
   }) {
-    const project = Instance.project
-    const conditions = [eq(SessionTable.project_id, project.id)]
-
-    if (input?.directory) {
-      conditions.push(eq(SessionTable.directory, input.directory))
-    }
+    const conditions = [eq(SessionTable.directory, input?.directory ?? Instance.directory)]
     if (input?.roots) {
       conditions.push(isNull(SessionTable.parent_id))
     }
@@ -587,12 +582,11 @@ export namespace Session {
   }
 
   export const children = fn(SessionID.zod, async (parentID) => {
-    const project = Instance.project
     const rows = Database.use((db) =>
       db
         .select()
         .from(SessionTable)
-        .where(and(eq(SessionTable.project_id, project.id), eq(SessionTable.parent_id, parentID)))
+        .where(eq(SessionTable.parent_id, parentID))
         .all(),
     )
     return rows.map(fromRow)

@@ -32,7 +32,6 @@ let currentSSE = null
 let selectedQuestionId = null
 let currentQuestionUserMessageId = null
 let showAllProcessDetails = false
-let sessionPreviewCache = new Map()
 let isEditingSummary = false
 const SOURCE_ROOTS = ['notes/', 'nodes/', 'descriptions_output/', 'changes/']
 
@@ -292,23 +291,6 @@ function buildTurns(messages, runningQuestionId) {
   return turns
 }
 
-async function questionPreview(question) {
-  if (sessionPreviewCache.has(question.sessionID)) return sessionPreviewCache.get(question.sessionID)
-  const messages = await loadMessages(question.sessionID)
-  const baselineMessages = question.baselineSessionID
-    ? await loadMessages(question.baselineSessionID)
-    : []
-  const inheritedCount = baselineMessages.length
-  const inheritedPrefix = inheritedCount > 0 ? messages.slice(0, inheritedCount) : []
-  const samePrefixShape = inheritedPrefix.length === inheritedCount
-    && inheritedPrefix.every((message, index) => message.info.role === baselineMessages[index]?.info.role)
-  const visibleMessages = samePrefixShape ? messages.slice(inheritedCount) : messages
-  const firstUser = visibleMessages.find((message) => message.info.role === 'user' && hasVisibleUserText(message))
-  const preview = firstUser ? visibleUserText(firstUser) : '未命名问题'
-  sessionPreviewCache.set(question.sessionID, preview)
-  return preview
-}
-
 async function renderQuestionList() {
   const questions = questionThreads()
   questionListMetaEl.textContent = `${questions.length} 条`
@@ -323,7 +305,7 @@ async function renderQuestionList() {
     const item = document.createElement('button')
     item.type = 'button'
     item.className = 'question-item' + (question.id === selectedQuestionId ? ' active' : '')
-    const title = await questionPreview(question)
+    const title = question.previewText || '未命名问题'
     item.innerHTML = `
       <div class="question-title">${esc(title)}</div>
       <div class="question-submeta">

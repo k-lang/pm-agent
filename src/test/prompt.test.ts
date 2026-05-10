@@ -189,7 +189,7 @@ describe("session.prompt agent variant", () => {
           })
           if (match.info.role !== "user") throw new Error("expected user message")
           expect(match.info.model).toEqual({ providerID: ProviderID.make("openrouter"), modelID: ModelID.make("openai/gpt-5.1-codex-max") })
-          expect(match.info.variant).toBe("xhigh")
+          expect(match.info.variant).toBeUndefined()
 
           const override = await SessionPrompt.prompt({
             sessionID: session.id,

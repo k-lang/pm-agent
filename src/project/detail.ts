@@ -2,10 +2,11 @@ import fs from "fs/promises"
 import path from "path"
 import { ulid } from "ulid"
 import z from "zod"
-import { and, Database, desc, eq } from "@/storage/db"
+import { and, asc, Database, desc, eq } from "@/storage/db"
 import { fn } from "@/util/fn"
 import { ProjectQuestionRecordTable, ProjectSummaryRecordTable } from "./project.sql"
 import { Session } from "@/session"
+import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { Instance } from "./instance"
 import { MessageID, SessionID } from "@/session/schema"
@@ -45,6 +46,7 @@ export namespace ProjectDetail {
     parentQuestionID: z.string().optional(),
     userMessageID: MessageID.zod.optional(),
     assistantMessageID: MessageID.zod.optional(),
+    previewText: z.string().optional(),
     time: z.object({
       created: z.number(),
       updated: z.number(),
@@ -169,7 +171,32 @@ export namespace ProjectDetail {
     }
   }
 
-  function questionFromRow(row: typeof ProjectQuestionRecordTable.$inferSelect): QuestionRecord {
+  function visibleUserText(message: MessageV2.WithParts) {
+    return message.parts
+      .filter((part) => part.type === "text" && !part.synthetic && !part.ignored)
+      .map((part) => part.text)
+      .join("")
+      .trim()
+  }
+
+  async function questionPreviewText(row: typeof ProjectQuestionRecordTable.$inferSelect) {
+    if (!row.user_message_id) return undefined
+    try {
+      const message = await MessageV2.get({
+        sessionID: row.session_id,
+        messageID: MessageID.make(row.user_message_id),
+      })
+      const preview = visibleUserText(message)
+      return preview || undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  function questionFromRow(
+    row: typeof ProjectQuestionRecordTable.$inferSelect,
+    options?: { previewText?: string },
+  ): QuestionRecord {
     return {
       id: row.id,
       projectDirectory: row.project_directory,
@@ -181,6 +208,7 @@ export namespace ProjectDetail {
       parentQuestionID: row.parent_question_id ?? undefined,
       userMessageID: row.user_message_id ? MessageID.make(row.user_message_id) : undefined,
       assistantMessageID: row.assistant_message_id ? MessageID.make(row.assistant_message_id) : undefined,
+      previewText: options?.previewText,
       time: {
         created: row.time_created,
         updated: row.time_updated,
@@ -213,15 +241,34 @@ export namespace ProjectDetail {
   })
 
   export const listQuestions = fn(z.object({ directory: z.string() }), async (input) => {
-    return Database.use((db) =>
+    const [rows, firstRows] = Database.use((db) => [
       db
         .select()
         .from(ProjectQuestionRecordTable)
         .where(eq(ProjectQuestionRecordTable.project_directory, input.directory))
         .orderBy(desc(ProjectQuestionRecordTable.time_created))
-        .all()
-        .map(questionFromRow),
-    )
+        .all(),
+      db
+        .select()
+        .from(ProjectQuestionRecordTable)
+        .where(eq(ProjectQuestionRecordTable.project_directory, input.directory))
+        .orderBy(asc(ProjectQuestionRecordTable.time_created))
+        .all(),
+    ])
+
+    const firstRowBySession = new Map<string, typeof ProjectQuestionRecordTable.$inferSelect>()
+    for (const row of firstRows) {
+      if (firstRowBySession.has(row.session_id)) continue
+      firstRowBySession.set(row.session_id, row)
+    }
+
+    const previewBySession = new Map<string, string | undefined>()
+    await Promise.all([...firstRowBySession.entries()].map(async ([sessionID, row]) => {
+      previewBySession.set(sessionID, await questionPreviewText(row))
+    }))
+
+    return rows.map((row) =>
+      questionFromRow(row, { previewText: previewBySession.get(row.session_id) }))
   })
 
   export const currentSummary = fn(z.object({ directory: z.string() }), async (input) => {

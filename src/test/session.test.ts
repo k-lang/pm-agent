@@ -1,4 +1,7 @@
 import { describe, test, expect } from "bun:test"
+import { SessionTable } from "../session/session.sql"
+import { Database, eq } from "../storage/db"
+import { ProjectID } from "../project/schema"
 
 describe("Session CRUD", () => {
   test("create and get session", async () => {
@@ -35,6 +38,32 @@ describe("Session CRUD", () => {
         const ids = sessions.map((s) => s.id)
         expect(ids).toContain(s1.id)
         expect(ids).toContain(s2.id)
+      },
+    })
+  })
+
+  test("list sessions by directory even when project ids differ", async () => {
+    const { Instance } = await import("../project/instance")
+    const { Session } = await import("../session/index")
+
+    await Instance.provide({
+      directory: "/workspace/pm-agent/project_graph_data/jiedaidan",
+      fn: async () => {
+        const first = await Session.create({ title: "first" })
+        const second = await Session.create({ title: "second" })
+
+        Database.use((db) => {
+          db
+            .update(SessionTable)
+            .set({ project_id: ProjectID.global })
+            .where(eq(SessionTable.id, first.id))
+            .run()
+        })
+
+        const sessions = [...Session.list()]
+        const ids = sessions.map((s) => s.id)
+        expect(ids).toContain(first.id)
+        expect(ids).toContain(second.id)
       },
     })
   })

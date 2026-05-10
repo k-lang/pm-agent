@@ -7,15 +7,17 @@ import { tmpdir } from "./fixture/fixture"
 
 describe("session.system", () => {
   test("skills output is sorted by name and stable across calls", async () => {
+    const projectDirName = "demo-project"
     await using tmp = await tmpdir({
       git: true,
       init: async (dir) => {
+        const projectDir = path.join(dir, "project_graph_data", projectDirName)
         for (const [name, description] of [
           ["zeta-skill", "Zeta skill."],
           ["alpha-skill", "Alpha skill."],
           ["middle-skill", "Middle skill."],
         ]) {
-          const skillDir = path.join(dir, ".pm-agent", "skill", name)
+          const skillDir = path.join(projectDir, ".agents", "skills", name)
           await Bun.write(
             path.join(skillDir, "SKILL.md"),
             `---
@@ -35,7 +37,7 @@ description: ${description}
 
     try {
       await Instance.provide({
-        directory: tmp.path,
+        directory: path.join(tmp.path, "project_graph_data", projectDirName),
         fn: async () => {
           const build = await Agent.get("build")
           const first = await SystemPrompt.skills(build!)
