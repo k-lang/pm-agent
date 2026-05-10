@@ -1,0 +1,7 @@
+node_modules/
+.claude/
+*.md
+*.db
+*.sqlite
+*.sqlite3
+project_graph_data/
