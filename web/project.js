@@ -33,6 +33,8 @@ let selectedQuestionId = null
 let currentQuestionUserMessageId = null
 let showAllProcessDetails = false
 let isEditingSummary = false
+let refreshPromise = null
+let refreshQueued = false
 const SOURCE_ROOTS = ['notes/', 'nodes/', 'descriptions_output/', 'changes/']
 
 function esc(s) {
@@ -131,32 +133,6 @@ async function fetchJson(url, options) {
   return res.json()
 }
 
-function hasVisibleUserText(message) {
-  return message.parts.some((part) => part.type === 'text' && !part.synthetic && !part.ignored && part.text.trim())
-}
-
-function visibleUserText(message) {
-  return message.parts
-    .filter((part) => part.type === 'text' && !part.synthetic && !part.ignored)
-    .map((part) => part.text)
-    .join('')
-    .trim()
-}
-
-function isHiddenAssistantPart(part) {
-  return part.type === 'step-start' || part.type === 'step-finish' || part.type === 'compaction' || part.type === 'retry' || part.type === 'subtask'
-}
-
-function assistantReplies(messages, userMessageId) {
-  return messages.filter((item) => item.info.role === 'assistant' && item.info.parentID === userMessageId)
-}
-
-function isQuestionRunning(messages, userMessageId) {
-  const assistants = assistantReplies(messages, userMessageId)
-  if (!assistants.length) return true
-  return assistants.some((assistant) => !assistant.info.time?.completed)
-}
-
 function questionThreads() {
   const questions = detail?.questions || []
   const threads = []
@@ -173,14 +149,39 @@ function selectedQuestion() {
   return questionThreads().find((question) => question.id === selectedQuestionId) || null
 }
 
-async function refreshProjectView() {
-  detail = await fetchJson(API + '/project/detail?directory=' + encodeURIComponent(projectDir))
-  const threads = questionThreads()
-  if (!threads.some((question) => question.id === selectedQuestionId)) {
-    selectedQuestionId = threads[0]?.id || null
+function projectDetailUrl(questionId = selectedQuestionId) {
+  const url = new URL(API + '/project/detail', location.origin)
+  url.searchParams.set('directory', projectDir)
+  if (questionId) url.searchParams.set('selectedQuestionID', questionId)
+  return url.toString()
+}
+
+async function fetchProjectView(questionId = selectedQuestionId) {
+  detail = await fetchJson(projectDetailUrl(questionId))
+  selectedQuestionId = detail.selectedQuestionID || detail.questions?.[0]?.id || null
+}
+
+async function refreshProjectView(questionId = selectedQuestionId) {
+  if (refreshPromise) {
+    refreshQueued = true
+    return refreshPromise
   }
-  renderSummary()
-  await renderQuestions()
+
+  refreshPromise = (async () => {
+    await fetchProjectView(questionId)
+    renderSummary()
+    await renderQuestions()
+  })()
+
+  try {
+    await refreshPromise
+  } finally {
+    refreshPromise = null
+    if (refreshQueued) {
+      refreshQueued = false
+      await refreshProjectView(selectedQuestionId)
+    }
+  }
 }
 
 function connectSSE() {
@@ -231,12 +232,8 @@ function handleBusEvent(event) {
 }
 
 async function loadDetail() {
-  detail = await fetchJson(API + '/project/detail?directory=' + encodeURIComponent(projectDir))
+  await fetchProjectView(selectedQuestionId)
   projectDirEl.textContent = projectDir
-  const threads = questionThreads()
-  if (!selectedQuestionId) {
-    selectedQuestionId = threads[0]?.id || null
-  }
   renderSummary()
   await renderQuestions()
   if (!detail.currentSummary) {
@@ -257,39 +254,6 @@ function renderSummary() {
   btnCancelSummary.classList.toggle('hidden', !isEditingSummary)
 }
 
-async function loadMessages(sessionId) {
-  return fetchJson(API + '/session/' + sessionId + '/message?directory=' + encodeURIComponent(projectDir)) || []
-}
-
-function buildTurns(messages, runningQuestionId) {
-  const turns = []
-  for (const message of messages) {
-    if (message.info.role !== 'user') continue
-    const questionText = visibleUserText(message)
-    if (!questionText) continue
-
-    const assistants = assistantReplies(messages, message.info.id)
-    const answerParts = assistants.flatMap((assistant) => assistant.parts || [])
-    const answerText = answerParts
-      .filter((part) => part.type === 'text' && !part.synthetic && !part.ignored)
-      .map((part) => part.text)
-      .join('')
-      .trim()
-    const details = answerParts.filter((part) => part.type !== 'text' && !isHiddenAssistantPart(part))
-    const running = runningQuestionId === message.info.id && isQuestionRunning(messages, message.info.id)
-
-    if (!answerText && !details.length && !running) continue
-
-    turns.push({
-      userMessageId: message.info.id,
-      questionText,
-      answerText,
-      details,
-      running,
-    })
-  }
-  return turns
-}
 
 async function renderQuestionList() {
   const questions = questionThreads()
@@ -315,7 +279,7 @@ async function renderQuestionList() {
     `
     item.onclick = async () => {
       selectedQuestionId = question.id
-      await renderQuestions()
+      await refreshProjectView(question.id)
     }
     questionListEl.appendChild(item)
   }
@@ -418,23 +382,12 @@ async function renderQuestions() {
   }
 
   currentQuestionSessionId = question.sessionID
-  currentQuestionUserMessageId = question.userMessageID || null
+  currentQuestionUserMessageId = detail.selectedThread?.userMessageID || question.userMessageID || null
   qaMeta.textContent = `${questionThreads().length} 条会话线程 · 当前会话 ${question.sessionID}`
 
-  const messages = await loadMessages(question.sessionID)
-  const baselineMessages = question.baselineSessionID
-    ? await loadMessages(question.baselineSessionID)
+  const turns = detail.selectedThread?.questionID === question.id
+    ? (detail.selectedThread.turns || [])
     : []
-  const inheritedCount = baselineMessages.length
-  const inheritedPrefix = inheritedCount > 0 ? messages.slice(0, inheritedCount) : []
-  const samePrefixShape = inheritedPrefix.length === inheritedCount
-    && inheritedPrefix.every((message, index) => message.info.role === baselineMessages[index]?.info.role)
-  const visibleMessages = samePrefixShape ? messages.slice(inheritedCount) : messages
-  const filtered = visibleMessages.filter((message) => {
-    if (message.info.role === 'user' && !hasVisibleUserText(message)) return false
-    return true
-  })
-  const turns = buildTurns(filtered, currentQuestionUserMessageId)
 
   messagesEl.innerHTML = ''
   if (!turns.length) {
@@ -520,16 +473,20 @@ async function ask(mode) {
     body.questionID = question.id
     body.questionSessionID = question.sessionID
   }
-  const created = await fetchJson(API + '/project/question?directory=' + encodeURIComponent(projectDir), {
+  const result = await fetchJson(API + '/project/question?directory=' + encodeURIComponent(projectDir), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (mode === 'question' && created?.id) {
-    selectedQuestionId = created.id
+  if (result?.detail) {
+    detail = result.detail
+    selectedQuestionId = detail.selectedQuestionID || selectedQuestionId
+  } else if (mode === 'question' && result?.question?.id) {
+    selectedQuestionId = result.question.id
   }
   questionInput.value = ''
-  await refreshProjectView()
+  renderSummary()
+  await renderQuestions()
 }
 
 summaryPreview.onclick = async (event) => {

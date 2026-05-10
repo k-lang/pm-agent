@@ -47,12 +47,32 @@ export namespace ProjectDetail {
     userMessageID: MessageID.zod.optional(),
     assistantMessageID: MessageID.zod.optional(),
     previewText: z.string().optional(),
+    threadStartUserMessageID: MessageID.zod.optional(),
     time: z.object({
       created: z.number(),
       updated: z.number(),
     }),
   })
   export type QuestionRecord = z.infer<typeof QuestionRecord>
+
+  export const Turn = z.object({
+    userMessageID: MessageID.zod,
+    questionText: z.string(),
+    answerText: z.string(),
+    details: MessageV2.Part.array(),
+    running: z.boolean(),
+  })
+  export type Turn = z.infer<typeof Turn>
+
+  export const SelectedThread = z.object({
+    questionID: z.string(),
+    sessionID: SessionID.zod,
+    userMessageID: MessageID.zod.optional(),
+    threadStartUserMessageID: MessageID.zod.optional(),
+    turns: Turn.array(),
+    running: z.boolean(),
+  })
+  export type SelectedThread = z.infer<typeof SelectedThread>
 
   export const Detail = z.object({
     directory: z.string(),
@@ -61,6 +81,8 @@ export namespace ProjectDetail {
     currentSummary: SummaryRecord.optional(),
     summaries: SummaryRecord.array(),
     questions: QuestionRecord.array(),
+    selectedQuestionID: z.string().optional(),
+    selectedThread: SelectedThread.optional(),
   })
   export type Detail = z.infer<typeof Detail>
 
@@ -172,11 +194,67 @@ export namespace ProjectDetail {
   }
 
   function visibleUserText(message: MessageV2.WithParts) {
-    return message.parts
-      .filter((part) => part.type === "text" && !part.synthetic && !part.ignored)
-      .map((part) => part.text)
-      .join("")
-      .trim()
+    return message.parts.reduce((result, part) => {
+      if (part.type !== "text" || part.synthetic || part.ignored) return result
+      return result + part.text
+    }, "").trim()
+  }
+
+  function hasVisibleUserText(message: MessageV2.WithParts) {
+    return message.parts.some((part) => part.type === "text" && !part.synthetic && !part.ignored && part.text.trim())
+  }
+
+  function assistantReplies(messages: MessageV2.WithParts[], userMessageID: MessageID) {
+    return messages.filter((item) => item.info.role === "assistant" && item.info.parentID === userMessageID)
+  }
+
+  function isQuestionRunning(messages: MessageV2.WithParts[], userMessageID: MessageID) {
+    const assistants = assistantReplies(messages, userMessageID)
+    if (!assistants.length) return true
+    return assistants.some((assistant) => assistant.info.role === "assistant" && !assistant.info.time.completed)
+  }
+
+  function isHiddenAssistantPart(part: MessageV2.Part) {
+    return part.type === "step-start" || part.type === "step-finish" || part.type === "compaction" || part.type === "retry" || part.type === "subtask"
+  }
+
+  async function buildTurns(question: QuestionRecord, runningUserMessageID?: MessageID): Promise<Turn[]> {
+    const messages = await Session.messages({ sessionID: question.sessionID })
+    const startIndex = question.threadStartUserMessageID
+      ? messages.findIndex((message) => message.info.id === question.threadStartUserMessageID)
+      : -1
+    const visibleMessages = startIndex > -1 ? messages.slice(startIndex) : messages
+    const filtered = visibleMessages.filter((message) => {
+      if (message.info.role === "user" && !hasVisibleUserText(message)) return false
+      return true
+    })
+
+    const turns: Turn[] = []
+    for (const message of filtered) {
+      if (message.info.role !== "user") continue
+      const questionText = visibleUserText(message)
+      if (!questionText) continue
+
+      const assistants = assistantReplies(filtered, message.info.id)
+      const answerParts = assistants.flatMap((assistant) => assistant.parts || [])
+      const answerText = answerParts.reduce((result, part) => {
+        if (part.type !== "text" || part.synthetic || part.ignored) return result
+        return result + part.text
+      }, "").trim()
+      const details = answerParts.filter((part) => part.type !== "text" && !isHiddenAssistantPart(part))
+      const running = runningUserMessageID === message.info.id && isQuestionRunning(filtered, message.info.id)
+
+      if (!answerText && !details.length && !running) continue
+
+      turns.push({
+        userMessageID: message.info.id,
+        questionText,
+        answerText,
+        details,
+        running,
+      })
+    }
+    return turns
   }
 
   async function questionPreviewText(row: typeof ProjectQuestionRecordTable.$inferSelect) {
@@ -195,7 +273,7 @@ export namespace ProjectDetail {
 
   function questionFromRow(
     row: typeof ProjectQuestionRecordTable.$inferSelect,
-    options?: { previewText?: string },
+    options?: { previewText?: string; threadStartUserMessageID?: MessageID },
   ): QuestionRecord {
     return {
       id: row.id,
@@ -209,6 +287,7 @@ export namespace ProjectDetail {
       userMessageID: row.user_message_id ? MessageID.make(row.user_message_id) : undefined,
       assistantMessageID: row.assistant_message_id ? MessageID.make(row.assistant_message_id) : undefined,
       previewText: options?.previewText,
+      threadStartUserMessageID: options?.threadStartUserMessageID,
       time: {
         created: row.time_created,
         updated: row.time_updated,
@@ -263,12 +342,20 @@ export namespace ProjectDetail {
     }
 
     const previewBySession = new Map<string, string | undefined>()
+    const threadStartUserMessageIDBySession = new Map<string, MessageID | undefined>()
     await Promise.all([...firstRowBySession.entries()].map(async ([sessionID, row]) => {
       previewBySession.set(sessionID, await questionPreviewText(row))
+      threadStartUserMessageIDBySession.set(
+        sessionID,
+        row.user_message_id ? MessageID.make(row.user_message_id) : undefined,
+      )
     }))
 
     return rows.map((row) =>
-      questionFromRow(row, { previewText: previewBySession.get(row.session_id) }))
+      questionFromRow(row, {
+        previewText: previewBySession.get(row.session_id),
+        threadStartUserMessageID: threadStartUserMessageIDBySession.get(row.session_id),
+      }))
   })
 
   export const currentSummary = fn(z.object({ directory: z.string() }), async (input) => {
@@ -296,12 +383,29 @@ export namespace ProjectDetail {
     }
   })
 
-  export const getDetail = fn(z.object({ directory: z.string() }), async (input) => {
+  async function selectedThread(questions: QuestionRecord[], selectedQuestionID?: string) {
+    if (!questions.length) return undefined
+    const selected = questions.find((question) => question.id === selectedQuestionID) ?? questions[0]
+    if (!selected) return undefined
+    const latestInSession = questions.find((question) => question.sessionID === selected.sessionID)
+    const turns = await buildTurns(selected, latestInSession?.userMessageID)
+    return {
+      questionID: selected.id,
+      sessionID: selected.sessionID,
+      userMessageID: latestInSession?.userMessageID,
+      threadStartUserMessageID: selected.threadStartUserMessageID,
+      turns,
+      running: turns.some((turn) => turn.running),
+    } satisfies SelectedThread
+  }
+
+  export const getDetail = fn(z.object({ directory: z.string(), selectedQuestionID: z.string().optional() }), async (input) => {
     const [summaries, questions, current] = await Promise.all([
       listSummaries({ directory: input.directory }),
       listQuestions({ directory: input.directory }),
       currentSummary({ directory: input.directory }),
     ])
+    const selected = await selectedThread(questions, input.selectedQuestionID)
     return {
       directory: input.directory,
       baselineSessionID: current?.sessionID,
@@ -309,6 +413,8 @@ export namespace ProjectDetail {
       currentSummary: current,
       summaries,
       questions,
+      selectedQuestionID: selected?.questionID,
+      selectedThread: selected,
     } satisfies Detail
   })
 
@@ -450,6 +556,12 @@ export namespace ProjectDetail {
     },
   )
 
+  export const AskQuestionResult = z.object({
+    question: QuestionRecord,
+    detail: Detail,
+  })
+  export type AskQuestionResult = z.infer<typeof AskQuestionResult>
+
   export const askQuestion = fn(
     z.object({
       directory: z.string(),
@@ -528,7 +640,17 @@ export namespace ProjectDetail {
         db.select().from(ProjectQuestionRecordTable).where(eq(ProjectQuestionRecordTable.id, recordID)).get(),
       )
       if (!question) throw new NamedError.Unknown({ message: `Question not found after insert: ${recordID}` })
-      return questionFromRow(question)
+      const questionRecord = questionFromRow(question, {
+        previewText: input.mode === "question" ? input.text : undefined,
+        threadStartUserMessageID: input.mode === "question" ? userMessage.info.id : undefined,
+      })
+      return {
+        question: questionRecord,
+        detail: await getDetail({
+          directory: input.directory,
+          selectedQuestionID: input.mode === "question" ? questionRecord.id : input.questionID,
+        }),
+      } satisfies AskQuestionResult
     },
   )
 }

@@ -22,6 +22,7 @@ const CreateProjectInput = z.object({
 
 const ProjectDirectoryQuery = z.object({
   directory: z.string(),
+  selectedQuestionID: z.string().optional(),
 })
 
 const UpdateSummaryInput = z.object({
@@ -142,11 +143,11 @@ export const ProjectRoutes = lazy(() =>
         summary: "Ask project question",
         operationId: "project.question",
         responses: {
-          200: { description: "Question record", content: { "application/json": { schema: resolver(ProjectDetail.QuestionRecord) } } },
+          200: { description: "Question result", content: { "application/json": { schema: resolver(ProjectDetail.AskQuestionResult) } } },
           ...errors(400),
         },
       }),
-      validator("query", ProjectDirectoryQuery),
+      validator("query", ProjectDirectoryQuery.pick({ directory: true })),
       validator("json", AskQuestionInput),
       async (c) => c.json(await ProjectDetail.askQuestion({ ...c.req.valid("query"), ...c.req.valid("json") })),
     )
