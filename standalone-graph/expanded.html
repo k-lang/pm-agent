@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jiedaidan Expanded Graph Demo</title>
+  <link rel="stylesheet" href="/graph.css">
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div>
+        <h1>Jiedaidan Expanded Graph</h1>
+        <p id="meta">加载中...</p>
+      </div>
+      <div id="actions"></div>
+    </header>
+    <main id="layout">
+      <section id="canvas-panel">
+        <section id="legend-panel" class="panel">
+          <h2>Legend</h2>
+          <div class="legend-row"><span class="dot event"></span>Event</div>
+          <div class="legend-row"><span class="dot goal"></span>Goal</div>
+          <div class="legend-row"><span class="dot issue"></span>Issue</div>
+          <div class="legend-row"><span class="dot result"></span>Result</div>
+          <div class="legend-row"><span class="dot work_block"></span>Work Block</div>
+          <div class="legend-row"><span class="dot work_item"></span>Work Item</div>
+        </section>
+        <div id="zoom-controls" class="panel">
+          <button id="btn-zoom-out" type="button">-</button>
+          <button id="btn-zoom-in" type="button">+</button>
+          <button id="btn-fit" type="button">Fit</button>
+        </div>
+        <div id="graph-scroll">
+          <svg id="graph" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid meet">
+            <defs>
+              <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+                <path d="M 0 0 L 10 4 L 0 8 z" fill="#94a3b8"></path>
+              </marker>
+            </defs>
+            <g id="container-layer"></g>
+            <g id="node-layer"></g>
+            <g id="edge-layer"></g>
+            <g id="handle-layer"></g>
+          </svg>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div id="node-card" class="hidden">
+    <div id="node-card-backdrop"></div>
+    <section id="node-card-panel">
+      <button id="node-card-close" type="button">关闭</button>
+      <h2 id="node-card-title"></h2>
+      <div id="node-card-meta"></div>
+      <div id="node-card-fields"></div>
+      <pre id="node-card-description"></pre>
+    </section>
+  </div>
+  <script src="/graph.js"></script>
+</body>
+</html>

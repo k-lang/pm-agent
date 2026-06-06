@@ -1,6 +1,7 @@
 const API = ''
 const params = new URLSearchParams(location.search)
-const projectDir = params.get('directory') || ''
+let projectDir = params.get('directory') || ''
+let projectName = params.get('project') || projectNameFromDirectory(projectDir)
 
 const projectDirEl = document.getElementById('project-dir')
 const summaryStatusEl = document.getElementById('summary-status')
@@ -20,6 +21,8 @@ const btnEditSummary = document.getElementById('btn-edit-summary')
 const btnSaveSummary = document.getElementById('btn-save-summary')
 const btnCancelSummary = document.getElementById('btn-cancel-summary')
 const btnBack = document.getElementById('btn-back')
+const btnFiles = document.getElementById('btn-files')
+const btnGraph = document.getElementById('btn-graph')
 const sourceViewerModal = document.getElementById('source-viewer-modal')
 const sourceViewerPath = document.getElementById('source-viewer-path')
 const sourceViewerContent = document.getElementById('source-viewer-content')
@@ -37,7 +40,7 @@ let isEditingSummary = false
 let refreshPromise = null
 let refreshQueued = false
 let shouldScrollMessagesToBottom = false
-const SOURCE_ROOTS = ['notes/', 'nodes/', 'descriptions_output/', 'changes/']
+const SOURCE_ROOTS = ['notes/', 'nodes/', 'descriptions_output/', 'changes/', 'snapshots/', 'edges/', 'metadata/', 'report_output/']
 
 function esc(s) {
   return String(s)
@@ -49,6 +52,34 @@ function esc(s) {
 
 function escHtml(s) {
   return esc(s)
+}
+
+function projectNameFromDirectory(directory) {
+  return directory.split('/').filter(Boolean).pop() || ''
+}
+
+function replaceProjectUrl() {
+  if (!projectName) return
+  const url = new URL(location.href)
+  url.searchParams.delete('directory')
+  url.searchParams.set('project', projectName)
+  if (selectedQuestionId) url.searchParams.set('selectedQuestionID', selectedQuestionId)
+  else url.searchParams.delete('selectedQuestionID')
+  history.replaceState(null, '', url.toString())
+}
+
+async function resolveProjectDirectory() {
+  if (projectDir) {
+    projectName = projectName || projectNameFromDirectory(projectDir)
+    replaceProjectUrl()
+    return
+  }
+  if (!projectName) throw new Error('缺少 project 参数')
+  const projects = await fetchJson(API + '/project/directories')
+  const project = (projects || []).find((item) => item.name === projectName)
+  if (!project) throw new Error(`项目不存在: ${projectName}`)
+  projectDir = project.directory
+  replaceProjectUrl()
 }
 
 function formatDuration(ms) {
@@ -113,7 +144,7 @@ async function openSourceViewer(sourcePath) {
   sourceViewerPath.textContent = sourcePath
   sourceViewerContent.textContent = '加载中...'
   try {
-    const result = await fetchJson(API + '/file/content?directory=' + encodeURIComponent(projectDir) + '&path=' + encodeURIComponent(sourcePath))
+    const result = await fetchJson(API + '/project/file/content?project=' + encodeURIComponent(projectName) + '&path=' + encodeURIComponent(sourcePath))
     if (!result) {
       sourceViewerContent.textContent = '未返回内容'
       return
@@ -156,7 +187,7 @@ function selectedQuestion() {
 
 function projectDetailUrl(questionId = selectedQuestionId) {
   const url = new URL(API + '/project/detail', location.origin)
-  url.searchParams.set('directory', projectDir)
+  url.searchParams.set('project', projectName)
   if (questionId) url.searchParams.set('selectedQuestionID', questionId)
   return url.toString()
 }
@@ -239,7 +270,9 @@ function handleBusEvent(event) {
 
 async function loadDetail() {
   await fetchProjectView(selectedQuestionId)
-  projectDirEl.textContent = projectDir
+  projectName = projectName || projectNameFromDirectory(projectDir)
+  projectDirEl.textContent = projectName ? `${projectName}/` : ''
+  replaceProjectUrl()
   renderSummary()
   await renderQuestions()
   if (!detail.currentSummary) {
@@ -452,7 +485,7 @@ async function renderQuestions() {
 }
 
 async function runSummary(auto = false) {
-  const summary = await fetchJson(API + '/project/summary/run?directory=' + encodeURIComponent(projectDir), { method: 'POST' })
+  const summary = await fetchJson(API + '/project/summary/run?project=' + encodeURIComponent(projectName), { method: 'POST' })
   detail.currentSummary = summary
   detail.summaries = [summary, ...(detail.summaries || [])]
   renderSummary()
@@ -493,7 +526,7 @@ async function ask(mode) {
     body.questionID = question.id
     body.questionSessionID = question.sessionID
   }
-  const result = await fetchJson(API + '/project/question?directory=' + encodeURIComponent(projectDir), {
+  const result = await fetchJson(API + '/project/question?project=' + encodeURIComponent(projectName), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -551,8 +584,18 @@ btnEditSummary.onclick = startSummaryEdit
 btnSaveSummary.onclick = saveSummary
 btnCancelSummary.onclick = cancelSummaryEdit
 btnBack.onclick = () => { location.href = '/web' }
+btnFiles.onclick = () => {
+  location.href = `/web/project-files.html?project=${encodeURIComponent(projectName)}`
+}
+btnGraph.onclick = () => {
+  location.href = `/web/project-graph.html?project=${encodeURIComponent(projectName)}&view=expanded`
+}
 
-connectSSE()
-loadDetail().catch((error) => {
-  messagesEl.innerHTML = `<div class="empty">${esc(error.message || '加载失败')}</div>`
-})
+resolveProjectDirectory()
+  .then(() => {
+    connectSSE()
+    return loadDetail()
+  })
+  .catch((error) => {
+    messagesEl.innerHTML = `<div class="empty">${esc(error.message || '加载失败')}</div>`
+  })
