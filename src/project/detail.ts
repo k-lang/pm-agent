@@ -11,6 +11,8 @@ import { SessionPrompt } from "@/session/prompt"
 import { Instance } from "./instance"
 import { MessageID, SessionID } from "@/session/schema"
 import { NamedError } from "@/util/error"
+import { Provider } from "@/provider/provider"
+import { ProviderID } from "@/provider/schema"
 
 export namespace ProjectDetail {
   export const SummaryStatus = z.enum(["pending", "running", "completed", "failed"])
@@ -59,6 +61,7 @@ export namespace ProjectDetail {
     userMessageID: MessageID.zod,
     questionText: z.string(),
     answerText: z.string(),
+    errorText: z.string().optional(),
     details: MessageV2.Part.array(),
     running: z.boolean(),
   })
@@ -218,6 +221,15 @@ export namespace ProjectDetail {
     return part.type === "step-start" || part.type === "step-finish" || part.type === "compaction" || part.type === "retry" || part.type === "subtask"
   }
 
+  function messageErrorText(error: unknown): string | undefined {
+    if (!error) return undefined
+    if (typeof error === "string") return error
+    if (typeof error !== "object") return String(error)
+    const record = error as Record<string, any>
+    const data = typeof record.data === "object" && record.data ? record.data as Record<string, any> : undefined
+    return data?.message ?? record.message ?? record.code ?? record.name ?? "error"
+  }
+
   async function buildTurns(question: QuestionRecord, runningUserMessageID?: MessageID): Promise<Turn[]> {
     const messages = await Session.messages({ sessionID: question.sessionID })
     const startIndex = question.threadStartUserMessageID
@@ -237,6 +249,9 @@ export namespace ProjectDetail {
 
       const assistants = assistantReplies(filtered, message.info.id)
       const answerParts = assistants.flatMap((assistant) => assistant.parts || [])
+      const errorText = assistants
+        .map((assistant) => assistant.info.role === "assistant" ? messageErrorText(assistant.info.error) : undefined)
+        .find(Boolean)
       const answerText = answerParts.reduce((result, part) => {
         if (part.type !== "text" || part.synthetic || part.ignored) return result
         return result + part.text
@@ -244,12 +259,13 @@ export namespace ProjectDetail {
       const details = answerParts.filter((part) => part.type !== "text" && !isHiddenAssistantPart(part))
       const running = runningUserMessageID === message.info.id && isQuestionRunning(filtered, message.info.id)
 
-      if (!answerText && !details.length && !running) continue
+      if (!answerText && !errorText && !details.length && !running) continue
 
       turns.push({
         userMessageID: message.info.id,
         questionText,
         answerText,
+        errorText,
         details,
         running,
       })
@@ -562,6 +578,67 @@ export namespace ProjectDetail {
   })
   export type AskQuestionResult = z.infer<typeof AskQuestionResult>
 
+  function errorFromUnknown(error: unknown, providerID: string): NonNullable<MessageV2.Assistant["error"]> {
+    if (Provider.ModelNotFoundError.isInstance(error)) {
+      const hint = error.data.suggestions?.length ? ` Did you mean: ${error.data.suggestions.join(", ")}?` : ""
+      return new NamedError.Unknown({
+        message: `Model not found: ${error.data.providerID}/${error.data.modelID}.${hint}`,
+      }).toObject()
+    }
+    return MessageV2.fromError(error, { providerID: ProviderID.make(providerID) })
+  }
+
+  async function persistQuestionFailure(input: {
+    directory: string
+    recordID: string
+    sessionID: SessionID
+    userMessage: MessageV2.User
+    error: unknown
+  }) {
+    const now = Date.now()
+    const assistant = await Instance.provide({
+      directory: input.directory,
+      fn: () => Session.updateMessage({
+        id: MessageID.ascending(),
+        parentID: input.userMessage.id,
+        role: "assistant",
+        mode: input.userMessage.agent,
+        agent: input.userMessage.agent,
+        variant: input.userMessage.variant,
+        path: {
+          cwd: Instance.directory,
+          root: Instance.worktree,
+        },
+        cost: 0,
+        tokens: {
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+        modelID: input.userMessage.model.modelID,
+        providerID: input.userMessage.model.providerID,
+        error: errorFromUnknown(input.error, input.userMessage.model.providerID),
+        time: {
+          created: now,
+          completed: now,
+        },
+        sessionID: input.sessionID,
+      }),
+    }) as MessageV2.Assistant
+
+    Database.use((db) =>
+      db
+        .update(ProjectQuestionRecordTable)
+        .set({
+          assistant_message_id: assistant.id,
+          time_updated: now,
+        })
+        .where(eq(ProjectQuestionRecordTable.id, input.recordID))
+        .run(),
+    )
+  }
+
   export const askQuestion = fn(
     z.object({
       directory: z.string(),
@@ -633,7 +710,15 @@ export namespace ProjectDetail {
               .where(eq(ProjectQuestionRecordTable.id, recordID))
               .run(),
           )
-        } catch {}
+        } catch (error) {
+          await persistQuestionFailure({
+            directory: input.directory,
+            recordID,
+            sessionID,
+            userMessage: userMessage.info as MessageV2.User,
+            error,
+          }).catch(() => {})
+        }
       })()
 
       const question = Database.use((db) =>

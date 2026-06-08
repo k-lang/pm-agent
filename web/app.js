@@ -340,6 +340,7 @@ async function loadMessages(sessionId) {
       if (el) el.textContent = text
     } else {
       for (const part of parts) upsertPart(info.id, part)
+      renderMessageError(info)
     }
   }
   scrollBottom()
@@ -353,24 +354,33 @@ function ensureMessageContainer(info) {
   messages.appendChild(el)
 }
 
+function errorText(error) {
+  if (!error) return ''
+  if (typeof error === 'string') return error
+  const data = error.data && typeof error.data === 'object' ? error.data : null
+  return data?.message || error.message || error.code || error.name || 'error'
+}
+
+function renderMessageError(info) {
+  if (!info?.error) return
+  const el = messages.querySelector(`[data-id="${info.id}"]`)
+  if (!el) return
+  el.classList.add('error')
+  el.textContent = errorText(info.error)
+}
+
 function upsertMessage(event) {
   const info = event.info || event
   if (!info.role || info.role === 'tool') return
   ensureMessageContainer(info)
-  if (info.error) {
-    const el = messages.querySelector(`[data-id="${info.id}"]`)
-    if (el) {
-      el.classList.add('error')
-      el.textContent = info.error.message || 'error'
-    }
-  }
+  renderMessageError(info)
 }
 
 function renderSessionError(error) {
   if (!error || !currentSessionId) return
   const el = document.createElement('div')
   el.className = 'msg assistant error'
-  el.textContent = error.message || error.code || 'error'
+  el.textContent = errorText(error)
   messages.appendChild(el)
   scrollBottom()
 }

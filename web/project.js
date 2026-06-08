@@ -453,7 +453,12 @@ async function renderQuestions() {
 
     const answerNode = document.createElement('div')
     answerNode.className = 'turn-answer'
-    answerNode.innerHTML = turn.answerText ? renderAssistantMarkdown(turn.answerText, 'answer') : '<div class="loading">生成中...</div>'
+    if (turn.errorText) {
+      answerNode.classList.add('error')
+      answerNode.textContent = turn.errorText
+    } else {
+      answerNode.innerHTML = turn.answerText ? renderAssistantMarkdown(turn.answerText, 'answer') : '<div class="loading">生成中...</div>'
+    }
     el.appendChild(answerNode)
 
     if (turn.details.length) {

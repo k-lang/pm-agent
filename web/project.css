@@ -43,6 +43,7 @@ button:disabled { background: #1f2937; color: #6b7280; cursor: not-allowed; }
 .turn { background: #0f172a; border: 1px solid #374151; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .turn-user { align-self: flex-end; max-width: min(80%, 760px); background: #2563eb; color: #fff; border-radius: 10px; padding: 10px 14px; white-space: pre-wrap; line-height: 1.6; min-width: 0; }
 .turn-answer { align-self: flex-start; max-width: min(88%, 900px); background: #2a2a2a; color: #e0e0e0; border-radius: 10px; padding: 10px 14px; line-height: 1.6; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+.turn-answer.error { background: #3a1717; color: #fca5a5; border: 1px solid #7f1d1d; white-space: pre-wrap; }
 .turn-answer p { margin-bottom: 8px; }
 .turn-answer p:last-child { margin-bottom: 0; }
 .turn-answer pre { background: #111; padding: 10px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
