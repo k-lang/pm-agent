@@ -14,6 +14,7 @@ import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
+import PROMPT_PROJECT_WORKFLOW from "./prompt/project-workflow.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
 import { Global } from "@/global"
@@ -200,6 +201,25 @@ export namespace Agent {
           user,
         ),
         prompt: PROMPT_SUMMARY,
+      },
+      project_workflow: {
+        name: "project_workflow",
+        description: "项目工作推进主 Agent。用于生成工作笔记、图操作草案，并通过受控状态机推进审核流程。",
+        mode: "primary",
+        native: true,
+        hidden: true,
+        options: {},
+        permission: Permission.merge(
+          defaults,
+          Permission.fromConfig({
+            "*": "deny",
+            workflow_action: "allow",
+            skill: "allow",
+            read: "allow",
+          }),
+          user,
+        ),
+        prompt: PROMPT_PROJECT_WORKFLOW,
       },
     }
 

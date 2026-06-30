@@ -11,6 +11,7 @@ import { projectGraphRoot } from "@/project/root"
 import { HTTPException } from "hono/http-exception"
 import { ProjectDetail } from "@/project/detail"
 import { SessionID } from "@/session/schema"
+import { ProjectWorkflow } from "@/workflow/state"
 import { loadExpandedGraph, loadGraph, saveLayout } from "../../../standalone-graph/transform"
 
 const ProjectDirectory = z.object({
@@ -34,6 +35,10 @@ const ProjectDirectoryQuery = z.object({
 const ProjectNameQuery = z.object({
   project: z.string(),
   path: z.string().optional().default(""),
+})
+
+const ProjectOnlyQuery = z.object({
+  project: z.string(),
 })
 
 const UpdateSummaryInput = z.object({
@@ -322,6 +327,36 @@ export const ProjectRoutes = lazy(() =>
         const query = c.req.valid("query")
         const detail = await ProjectDetail.getDetail(resolveProjectDirectoryQuery(query))
         return c.json(sanitizeProjectPayload(detail, query.project))
+      },
+    )
+    .get(
+      "/workflow/state",
+      describeRoute({
+        summary: "Get active project workflow state",
+        operationId: "project.workflowState",
+        responses: {
+          200: { description: "Workflow state", content: { "application/json": { schema: resolver(ProjectWorkflow.ActionResult) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      async (c) => c.json(await ProjectWorkflow.getActive(c.req.valid("query"))),
+    )
+    .post(
+      "/workflow/action",
+      describeRoute({
+        summary: "Run project workflow action",
+        operationId: "project.workflowAction",
+        responses: {
+          200: { description: "Workflow action result", content: { "application/json": { schema: resolver(ProjectWorkflow.ActionResult) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      validator("json", ProjectWorkflow.ActionRequest.omit({ project: true })),
+      async (c) => {
+        const query = c.req.valid("query")
+        return c.json(await ProjectWorkflow.runAction({ project: query.project, ...c.req.valid("json") }))
       },
     )
     .get(

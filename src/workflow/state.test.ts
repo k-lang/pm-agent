@@ -1,0 +1,202 @@
+import fs from "fs/promises"
+import os from "os"
+import path from "path"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { ProjectWorkflow } from "./state"
+import { loadCommandAndExecute } from "@/graph/engine"
+
+const TRACKER_ROOT = "/mnt/sda/test_claude_code/proj5_pm/project_progress_tracker"
+const TRACE_ROOT = path.join(TRACKER_ROOT, "jiedaidan_trace")
+const NOTES_DIR = path.join(TRACE_ROOT, "graph_data", "notes")
+const COMMANDS_DIR = path.join(TRACE_ROOT, "commands")
+
+describe("ProjectWorkflow", () => {
+  let root: string
+  let directory: string
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "pm-agent-workflow-"))
+    directory = path.join(root, "demo")
+    await fs.mkdir(directory, { recursive: true })
+  })
+
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true })
+  })
+
+  function action(action: ProjectWorkflow.Action, payload: Record<string, unknown> = {}) {
+    return ProjectWorkflow.runAction({ project: "demo", directory, action, payload })
+  }
+
+  async function readOriginalNote(file: string) {
+    return fs.readFile(path.join(NOTES_DIR, file), "utf8")
+  }
+
+  async function readStepCommand(step: number) {
+    return JSON.parse(await fs.readFile(path.join(COMMANDS_DIR, `step${step}.json`), "utf8"))
+  }
+
+  async function replayStepsBefore(step: number) {
+    for (let i = 0; i < step; i++) {
+      const result = await loadCommandAndExecute(path.join(COMMANDS_DIR, `step${i}.json`), directory)
+      if (!result.success) throw new Error(`replay step${i} failed: ${result.errors.join("; ")}`)
+    }
+  }
+
+  test("uses jiedaidan original note for a mid-project normal draft-check-validate-preview flow", async () => {
+    await replayStepsBefore(18)
+    const started = await action("开始或恢复")
+    expect(started.stage).toBe("收集材料")
+    expect(started.availableActions.map((item) => item.action)).toContain("更新工作笔记")
+    expect(started.blockedActions.map((item) => item.action)).toContain("生成图操作草案")
+    expect(started.recommendations.join("\n")).toContain("工作笔记")
+
+    const note = await readOriginalNote("knowledge_entry_point.txt")
+    const command = await readStepCommand(18)
+    const noted = await action("更新工作笔记", { content: note, summary: "使用 jiedaidan step18 原始工作笔记生成工作笔记。" })
+    expect(noted.stage).toBe("笔记已生成")
+
+    const reviewed = await action("检查笔记充分性", {
+      sufficient: true,
+      summary: "step18 原始笔记包含知识梳理方案、验证结果和目标影响，足以生成图操作。",
+    })
+    expect(reviewed.stage).toBe("笔记已生成")
+
+    const drafted = await action("生成图操作草案", { command })
+    expect(drafted.stage).toBe("图操作已生成")
+
+    const validated = await action("校验图操作")
+    expect(validated.stage).toBe("校验已通过")
+
+    const previewed = await action("生成预览")
+    expect(previewed.stage).toBe("预览已生成")
+    expect(previewed.data?.preview).toMatchObject({
+      change_id: "step18_knowledge_scheme",
+      operationCount: 7,
+    })
+    expect(previewed.availableActions.map((item) => item.action)).toContain("应用图操作")
+
+    const stateRaw = await fs.readFile(path.join(directory, "workflows", "active", "state.json"), "utf8")
+    expect(stateRaw).toContain("预览已生成")
+  })
+
+  test("uses a truncated jiedaidan note to cover note-needs-supplement then returns to note-ready", async () => {
+    await action("开始或恢复")
+    const note = await readOriginalNote("improvement_plan.txt")
+    await action("更新工作笔记", {
+      content: note.slice(0, 260),
+      summary: "只记录了标签推荐改进的一小段背景。",
+    })
+
+    const reviewed = await action("检查笔记充分性", {
+      sufficient: false,
+      summary: "缺少图操作判断需要的影响目标、工作归属和结果关系。",
+      blockingQuestions: [
+        "这次改进方案应归入哪个已有工作块？",
+        "它影响知识梳理目标、低延时目标，还是两者都影响？",
+      ],
+      missingFields: ["linked_work_block", "affected_goals", "result_edges"],
+    })
+
+    expect(reviewed.stage).toBe("笔记需补充")
+    expect(reviewed.data?.review).toMatchObject({
+      sufficient: false,
+      canDraftOperations: false,
+    })
+    expect(reviewed.recommendations.join("\n")).toContain("笔记不足")
+
+    const completed = await action("更新工作笔记", {
+      content: await readOriginalNote("improvement_plan.txt"),
+      summary: "补充完整 step19 原始工作笔记。",
+    })
+    expect(completed.stage).toBe("笔记已生成")
+  })
+
+  test("uses jiedaidan step17 material and a damaged command to enter graph-operation revision", async () => {
+    await replayStepsBefore(17)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("distinction_sort.txt"),
+      summary: "使用 step17 对应原始工作笔记生成工作笔记。",
+    })
+    const command = await readStepCommand(17)
+    const damaged = structuredClone(command)
+    damaged.operations = damaged.operations.map((operation: any) => {
+      if (operation.type === "create_node" && operation.data?.type === "work_item") {
+        const data = { ...operation.data }
+        delete data.linked_work_block_id
+        return { ...operation, data }
+      }
+      return operation
+    })
+    await action("生成图操作草案", { command: damaged })
+
+    const validated = await action("校验图操作")
+    expect(validated.stage).toBe("图操作需修订")
+    expect(validated.data?.validation).toMatchObject({ passed: false })
+    expect(validated.recommendations.join("\n")).toContain("修订图操作")
+    expect(validated.availableActions.map((item) => item.action)).toContain("生成图操作草案")
+    expect(validated.availableActions.map((item) => item.action)).toContain("更新工作笔记")
+  })
+
+  test("uses jiedaidan step19 multi-source plan material for operations-only review feedback", async () => {
+    await replayStepsBefore(19)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("improvement_plan.txt"),
+      summary: "使用 step19 对应原始工作笔记生成工作笔记。",
+    })
+    await action("检查笔记充分性", {
+      sufficient: true,
+      summary: "step19 包含工作归属、前序来源、结果和目标影响，足以生成图操作。",
+    })
+    await action("生成图操作草案", { command: await readStepCommand(19) })
+    await action("校验图操作")
+    await action("生成预览")
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).resolves.toBeTruthy()
+
+    const revised = await action("提出修订意见", {
+      target: "图操作",
+      comment: "不要新增目标，改为更新已有目标。",
+    })
+
+    expect(revised.stage).toBe("图操作需修订")
+    await expect(fs.stat(path.join(directory, "workflows", "active", "note.md"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
+  })
+
+  test("regenerating operations invalidates validation and preview artifacts", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", { content: await readOriginalNote("knowledge_entry_point.txt"), summary: "使用 step18 对应原始工作笔记。" })
+    const command = await readStepCommand(18)
+    await action("生成图操作草案", { command })
+    await action("校验图操作")
+    await action("生成预览")
+
+    const regenerated = await action("生成图操作草案", {
+      command: {
+        ...command,
+        change_id: "step18_knowledge_scheme_revised",
+        description: "根据审核意见重新生成 step18 图操作草案。",
+      },
+    })
+    expect(regenerated.stage).toBe("图操作已生成")
+    await expect(fs.stat(path.join(directory, "workflows", "active", "operations.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "validation.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
+  })
+
+  test("blocks unsafe actions but allows flexible non-destructive actions", async () => {
+    await action("开始或恢复")
+
+    await expect(action("生成图操作草案", { command: await readStepCommand(18) })).rejects.toThrow("尚未生成工作笔记")
+    await expect(action("校验图操作")).rejects.toThrow("尚未生成图操作草案")
+
+    const messaged = await action("追加消息", {
+      role: "用户",
+      text: "我先补充一些背景，不急着生成图操作。",
+    })
+    expect(messaged.stage).toBe("收集材料")
+  })
+})
