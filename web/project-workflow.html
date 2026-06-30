@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>工作推进</title>
+  <link rel="stylesheet" href="/web/project-workflow.css">
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div>
+        <h1>工作推进</h1>
+        <p id="subtitle">新建项目，或进入已有项目的工作推进流程。</p>
+      </div>
+      <div id="actions">
+        <select id="project-select" aria-label="当前项目"></select>
+        <button id="btn-new-project" type="button">新建项目</button>
+        <button id="btn-detail" type="button" class="btn-secondary">项目详情</button>
+        <button id="btn-graph" type="button" class="btn-secondary">项目图谱</button>
+        <button id="btn-debug" type="button" class="btn-secondary">调试页</button>
+      </div>
+    </header>
+
+    <main id="layout">
+      <section id="workspace-panel" class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>推进材料</h2>
+            <p id="workspace-subtitle">等待选择项目</p>
+          </div>
+          <div id="project-status"></div>
+        </div>
+        <div id="workspace-tabs">
+          <button type="button" class="tab-button active" data-tab="graph">图谱变更</button>
+          <button type="button" class="tab-button" data-tab="notes">工作笔记</button>
+          <button type="button" class="tab-button" data-tab="resources">项目资源</button>
+        </div>
+
+        <div id="workspace-body">
+          <section id="graph-tab" class="workspace-tab active" data-tab-panel="graph">
+            <div class="preview-main">
+              <div class="preview-header">
+                <h3>图谱预览</h3>
+                <p>后续展示当前图谱和草案变更，高亮新增/更新节点与边。</p>
+              </div>
+              <div id="graph-preview" class="preview-content">
+                <div class="placeholder">等待图谱草案。</div>
+              </div>
+            </div>
+            <aside class="side-index">
+              <div class="side-header">
+                <h3>图操作索引</h3>
+                <p>自然语言展示将要写入图数据的操作。</p>
+              </div>
+              <div id="operation-list" class="side-list"></div>
+              <div id="operation-actions">
+                <button id="btn-save-draft" type="button" class="btn-secondary" disabled>保存草案</button>
+                <button id="btn-validate" type="button" class="btn-secondary" disabled>校验</button>
+                <button id="btn-apply" type="button" disabled>确认提交</button>
+              </div>
+            </aside>
+          </section>
+
+          <section id="notes-tab" class="workspace-tab" data-tab-panel="notes">
+            <div class="preview-main">
+              <div class="preview-header">
+                <h3>工作笔记预览</h3>
+                <p>后续展示 AI 辅助生成或编辑后的本次工作笔记。</p>
+              </div>
+              <div id="note-preview" class="preview-content">
+                <div class="placeholder">等待生成工作笔记。</div>
+              </div>
+            </div>
+            <aside class="side-index">
+              <div class="side-header">
+                <h3>历史工作笔记</h3>
+                <p>后续列出 notes 下的项目笔记。</p>
+              </div>
+              <div id="note-list" class="side-list"></div>
+            </aside>
+          </section>
+
+          <section id="resources-tab" class="workspace-tab" data-tab-panel="resources">
+            <div class="preview-main">
+              <div class="preview-header">
+                <h3>资源文档预览</h3>
+                <p>后续预览架构设计、需求文档、会议纪要等项目资源。</p>
+              </div>
+              <div id="resource-preview" class="preview-content">
+                <div class="placeholder">等待选择项目资源文档。</div>
+              </div>
+            </div>
+            <aside class="side-index">
+              <div class="side-header">
+                <h3>资源文档</h3>
+                <p>后续列出可引用的项目资源。</p>
+              </div>
+              <div id="resource-list" class="side-list"></div>
+            </aside>
+          </section>
+        </div>
+      </section>
+
+      <section id="chat-panel" class="panel">
+        <div class="panel-header compact">
+          <div>
+            <h2>推进对话</h2>
+            <p>和大模型沟通项目背景、工作笔记、图数据更新和项目资源引用。</p>
+          </div>
+        </div>
+        <div id="chat-log">
+          <div class="placeholder">新建项目后，先在这里描述项目背景；下一步将接入项目初始化 Skill。</div>
+        </div>
+        <div id="chat-composer">
+          <textarea id="chat-input" rows="3" placeholder="后续这里输入补充信息或修改意见" disabled></textarea>
+          <button id="btn-chat-send" type="button" disabled>发送</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="new-project-modal" class="modal hidden">
+    <section class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2>新建项目</h2>
+          <p>先创建项目目录和基础结构，项目背景稍后在推进对话里补充。</p>
+        </div>
+      </div>
+      <label for="project-name">项目名</label>
+      <input id="project-name" type="text" placeholder="例如：M银行坐席助手项目">
+      <div id="modal-error" class="modal-error hidden"></div>
+      <div class="modal-actions">
+        <button id="btn-cancel-project" type="button" class="btn-secondary">取消</button>
+        <button id="btn-create-project" type="button">创建项目</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="/web/project-workflow.js"></script>
+</body>
+</html>

@@ -12,6 +12,7 @@ button:disabled { background: #1f2937; color: #6b7280; cursor: not-allowed; }
 .btn-secondary { background: #374151; }
 .btn-secondary:hover { background: #4b5563; }
 .btn-secondary:disabled { background: #1f2937; color: #6b7280; }
+select { background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 8px; padding: 8px 10px; font-size: 13px; min-width: 180px; }
 #layout { display: grid; grid-template-columns: 500px minmax(760px, 1fr); gap: 16px; min-height: calc(100vh - 100px); align-items: start; }
 #summary-panel, #qa-panel { background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 12px; min-height: 0; }
 #qa-panel { position: sticky; top: 20px; max-height: calc(100vh - 40px); }

@@ -31,6 +31,14 @@ body {
   gap: 10px;
   flex-wrap: wrap;
 }
+select {
+  border: 1px solid #334155;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  min-width: 180px;
+}
 button {
   border: 1px solid #334155;
   background: #0f172a;

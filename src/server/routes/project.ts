@@ -1,6 +1,7 @@
 import fs from "fs/promises"
 import type { Dirent } from "fs"
 import path from "path"
+import { ulid } from "ulid"
 import { Hono } from "hono"
 import { describeRoute, validator, resolver } from "hono-openapi"
 import z from "zod"
@@ -15,10 +16,13 @@ import { loadExpandedGraph, loadGraph, saveLayout } from "../../../standalone-gr
 const ProjectDirectory = z.object({
   name: z.string(),
   directory: z.string(),
+  graphInitialized: z.boolean().default(false),
+  initialWorkflowID: z.string().optional(),
 }).meta({ ref: "ProjectDirectory" })
 
 const CreateProjectInput = z.object({
   name: z.string(),
+  background: z.string().optional(),
 })
 
 const ProjectDirectoryQuery = z.object({
@@ -56,6 +60,12 @@ const SavedLayoutInput = z.object({
   edges: z.record(z.string(), z.object({ dx: z.number(), dy: z.number() })),
 })
 
+const ProjectStateFile = z.object({
+  graphInitialized: z.boolean().default(false),
+  createdAt: z.number().optional(),
+  initialWorkflowID: z.string().optional(),
+})
+
 function badRequest(message: string): never {
   throw new HTTPException(400, { message })
 }
@@ -71,16 +81,97 @@ function validateProjectName(input: string) {
   return name
 }
 
+function projectStatePath(directory: string) {
+  return path.join(directory, "metadata", "project_state.json")
+}
+
+async function readProjectState(directory: string) {
+  const raw = await fs.readFile(projectStatePath(directory), "utf8").catch(() => undefined)
+  if (!raw) return ProjectStateFile.parse({ graphInitialized: await inferGraphInitialized(directory) })
+  return ProjectStateFile.parse(JSON.parse(raw))
+}
+
+async function hasJsonFiles(dir: string): Promise<boolean> {
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as Dirent[])
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory() && await hasJsonFiles(full)) return true
+    if (entry.isFile() && entry.name.endsWith(".json")) return true
+  }
+  return false
+}
+
+async function inferGraphInitialized(directory: string) {
+  const [hasSnapshots, hasNodes, hasEdges] = await Promise.all([
+    hasJsonFiles(path.join(directory, "snapshots")),
+    hasJsonFiles(path.join(directory, "nodes")),
+    hasJsonFiles(path.join(directory, "edges")),
+  ])
+  return hasSnapshots || (hasNodes && hasEdges)
+}
+
+async function writeProjectState(directory: string, state: z.infer<typeof ProjectStateFile>) {
+  await fs.mkdir(path.join(directory, "metadata"), { recursive: true })
+  await fs.writeFile(projectStatePath(directory), JSON.stringify(ProjectStateFile.parse(state), null, 2) + "\n", "utf8")
+}
+
+async function ensureProjectStructure(directory: string) {
+  const dirs = [
+    "nodes/event",
+    "nodes/goal",
+    "nodes/issue",
+    "nodes/result",
+    "nodes/work_block",
+    "nodes/work_item",
+    "edges",
+    "metadata",
+    "notes",
+    "source",
+    "workflows",
+    "changes",
+    "snapshots",
+    "report_output",
+  ]
+  await Promise.all(dirs.map((dir) => fs.mkdir(path.join(directory, dir), { recursive: true })))
+}
+
+async function createInitialWorkflow(directory: string, background: string | undefined, now: number) {
+  const text = background?.trim()
+  if (!text) return undefined
+  const workflowID = ulid(now)
+  const workflowDir = path.join(directory, "workflows", workflowID)
+  await fs.mkdir(workflowDir, { recursive: true })
+  await fs.writeFile(path.join(workflowDir, "input.md"), text + "\n", "utf8")
+  await fs.writeFile(
+    path.join(workflowDir, "state.json"),
+    JSON.stringify({
+      id: workflowID,
+      type: "project_initialization",
+      status: "drafting_input",
+      createdAt: now,
+      updatedAt: now,
+    }, null, 2) + "\n",
+    "utf8",
+  )
+  return workflowID
+}
+
 async function listDirectories() {
   const root = projectGraphRoot()
   const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => [] as Dirent[])
-  return entries
+  const directories = entries
     .filter((entry) => entry.isDirectory() && entry.name !== ".agents")
-    .map((entry) => ({
-      name: entry.name,
-      directory: path.join(root, entry.name),
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((entry) => path.join(root, entry.name))
+    .sort((a, b) => path.basename(a).localeCompare(path.basename(b)))
+  return Promise.all(directories.map(async (directory) => {
+    const state = await readProjectState(directory).catch(() => ProjectStateFile.parse({ graphInitialized: false }))
+    return {
+      name: path.basename(directory),
+      directory,
+      graphInitialized: !!state.graphInitialized,
+      initialWorkflowID: state.initialWorkflowID,
+    }
+  }))
 }
 
 function projectDirectoryForName(project: string) {
@@ -199,11 +290,21 @@ export const ProjectRoutes = lazy(() =>
       async (c) => {
         const input = c.req.valid("json")
         const name = validateProjectName(input.name)
-        const directory = path.join(projectGraphRoot(), name)
+        const root = projectGraphRoot()
+        const directory = path.join(root, name)
         const exists = await fs.stat(directory).then(() => true).catch(() => false)
         if (exists) badRequest(`Project already exists: ${name}`)
+        const now = Date.now()
+        await fs.mkdir(root, { recursive: true })
         await fs.mkdir(directory, { recursive: false })
-        return c.json({ name, directory })
+        await ensureProjectStructure(directory)
+        const initialWorkflowID = await createInitialWorkflow(directory, input.background, now)
+        await writeProjectState(directory, {
+          graphInitialized: false,
+          createdAt: now,
+          initialWorkflowID,
+        })
+        return c.json({ name, directory, graphInitialized: false, initialWorkflowID })
       },
     )
     .get(

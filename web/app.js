@@ -19,6 +19,7 @@ const input = document.getElementById('input')
 const btnSend = document.getElementById('btn-send')
 const btnAbort = document.getElementById('btn-abort')
 const btnNew = document.getElementById('btn-new')
+const btnWorkflow = document.getElementById('btn-workflow')
 const projectSelect = document.getElementById('project-select')
 const newSessionModal = document.getElementById('new-session-modal')
 const newSessionProject = document.getElementById('new-session-project')
@@ -291,6 +292,10 @@ async function createSessionForDirectory(directory) {
 }
 
 btnNew.onclick = openNewSessionModal
+btnWorkflow.onclick = () => {
+  const selected = projects.find((project) => project.directory === selectedProjectDir)
+  location.href = selected ? `/web/project-workflow.html?project=${encodeURIComponent(selected.name)}` : '/web/project-workflow.html'
+}
 btnNewSessionCancel.onclick = closeNewSessionModal
 newSessionProject.onchange = updateNewProjectInputVisibility
 newSessionModal.onclick = (e) => {
@@ -765,10 +770,6 @@ async function replyQuestion(id, questionIndex, label, totalQuestions) {
   const answers = Array.from({ length: totalQuestions }, (_, i) => i === questionIndex ? [label] : [])
   await api('POST', `/question/${id}/reply`, { answers })
   document.querySelector(`[data-req-id="${id}"]`)?.remove()
-}
-
-function escHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 // ── Init ──────────────────────────────────────────────────

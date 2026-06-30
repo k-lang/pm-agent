@@ -20,6 +20,8 @@ const btnRerun = document.getElementById('btn-rerun')
 const btnEditSummary = document.getElementById('btn-edit-summary')
 const btnSaveSummary = document.getElementById('btn-save-summary')
 const btnCancelSummary = document.getElementById('btn-cancel-summary')
+const projectSelect = document.getElementById('project-select')
+const btnWorkflow = document.getElementById('btn-workflow')
 const btnBack = document.getElementById('btn-back')
 const btnFiles = document.getElementById('btn-files')
 const btnGraph = document.getElementById('btn-graph')
@@ -40,6 +42,7 @@ let isEditingSummary = false
 let refreshPromise = null
 let refreshQueued = false
 let shouldScrollMessagesToBottom = false
+let projects = []
 const SOURCE_ROOTS = ['notes/', 'nodes/', 'descriptions_output/', 'changes/', 'snapshots/', 'edges/', 'metadata/', 'report_output/']
 
 function esc(s) {
@@ -80,6 +83,23 @@ async function resolveProjectDirectory() {
   if (!project) throw new Error(`项目不存在: ${projectName}`)
   projectDir = project.directory
   replaceProjectUrl()
+}
+
+async function loadProjects() {
+  projects = await fetchJson(API + '/project/directories') || []
+  renderProjectSelect()
+}
+
+function renderProjectSelect() {
+  projectSelect.innerHTML = ''
+  for (const project of projects) {
+    const opt = document.createElement('option')
+    opt.value = project.name
+    opt.textContent = project.name
+    opt.disabled = !project.graphInitialized && project.name !== projectName
+    projectSelect.append(opt)
+  }
+  projectSelect.value = projectName
 }
 
 function formatDuration(ms) {
@@ -589,15 +609,25 @@ btnEditSummary.onclick = startSummaryEdit
 btnSaveSummary.onclick = saveSummary
 btnCancelSummary.onclick = cancelSummaryEdit
 btnBack.onclick = () => { location.href = '/web' }
+btnWorkflow.onclick = () => {
+  location.href = `/web/project-workflow.html?project=${encodeURIComponent(projectName)}`
+}
 btnFiles.onclick = () => {
   location.href = `/web/project-files.html?project=${encodeURIComponent(projectName)}`
 }
 btnGraph.onclick = () => {
   location.href = `/web/project-graph.html?project=${encodeURIComponent(projectName)}&view=expanded`
 }
+projectSelect.onchange = () => {
+  const next = projectSelect.value
+  if (!next || next === projectName) return
+  location.href = `/web/project.html?project=${encodeURIComponent(next)}`
+}
 
-resolveProjectDirectory()
+loadProjects()
+  .then(resolveProjectDirectory)
   .then(() => {
+    renderProjectSelect()
     connectSSE()
     return loadDetail()
   })

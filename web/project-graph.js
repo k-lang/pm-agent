@@ -1,10 +1,8 @@
 const SVG_NS = 'http://www.w3.org/2000/svg'
 const params = new URLSearchParams(location.search)
 const legacyDirectory = params.get('directory') || ''
-const projectName = params.get('project') || projectNameFromDirectory(legacyDirectory)
+let projectName = params.get('project') || projectNameFromDirectory(legacyDirectory)
 const view = params.get('view') === 'expanded' ? 'expanded' : 'collapsed'
-const API = `/project/graph?project=${encodeURIComponent(projectName)}&view=${encodeURIComponent(view)}`
-const LAYOUT_API = `/project/graph/layout?project=${encodeURIComponent(projectName)}&view=${encodeURIComponent(view)}`
 const INITIAL_SCALE = 1 / 3
 const NODE_SIZE = {
   event: { width: 480, height: 135 },
@@ -18,6 +16,7 @@ const NODE_SIZE = {
 const pageTitleEl = document.getElementById('page-title')
 const projectDirEl = document.getElementById('project-dir')
 const metaEl = document.getElementById('meta')
+const projectSelect = document.getElementById('project-select')
 const svg = document.getElementById('graph')
 const graphScroll = document.getElementById('graph-scroll')
 const containerLayer = document.getElementById('container-layer')
@@ -25,6 +24,7 @@ const nodeLayer = document.getElementById('node-layer')
 const edgeLayer = document.getElementById('edge-layer')
 const handleLayer = document.getElementById('handle-layer')
 const btnBack = document.getElementById('btn-back')
+const btnWorkflow = document.getElementById('btn-workflow')
 const btnFiles = document.getElementById('btn-files')
 const btnCollapsed = document.getElementById('btn-collapsed')
 const btnExpanded = document.getElementById('btn-expanded')
@@ -51,6 +51,15 @@ const state = {
   containers: {},
   savingLayout: false,
   saveQueued: false,
+}
+let projects = []
+
+function graphApi() {
+  return `/project/graph?project=${encodeURIComponent(projectName)}&view=${encodeURIComponent(view)}`
+}
+
+function layoutApi() {
+  return `/project/graph/layout?project=${encodeURIComponent(projectName)}&view=${encodeURIComponent(view)}`
 }
 
 const LAYOUT = {
@@ -95,6 +104,24 @@ function replaceProjectUrl() {
   url.searchParams.set('project', projectName)
   url.searchParams.set('view', view)
   history.replaceState(null, '', url.toString())
+}
+
+async function loadProjects() {
+  projects = await fetchJson('/project/directories') || []
+  if (!projectName && projects.length) projectName = projects.find((project) => project.graphInitialized)?.name || projects[0].name
+  renderProjectSelect()
+}
+
+function renderProjectSelect() {
+  projectSelect.innerHTML = ''
+  for (const project of projects) {
+    const opt = document.createElement('option')
+    opt.value = project.name
+    opt.textContent = project.name
+    opt.disabled = !project.graphInitialized && project.name !== projectName
+    projectSelect.append(opt)
+  }
+  projectSelect.value = projectName
 }
 
 function midpoint(a, b) {
@@ -850,7 +877,7 @@ function zoomBy(factor) {
 async function fetchJson(url, options) {
   const res = await fetch(url, options)
   if (!res.ok) throw new Error(await res.text())
-  if (res.status === 204) return null
+  if (res.status === 204 || res.headers.get('content-length') === '0') return null
   return res.json()
 }
 
@@ -862,7 +889,7 @@ async function saveLayout() {
   }
   state.savingLayout = true
   try {
-    await fetchJson(LAYOUT_API, {
+    await fetchJson(layoutApi(), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ nodes: state.positions, edges: state.bends }),
@@ -889,6 +916,10 @@ function projectFilesHref() {
   return `/web/project-files.html?project=${encodeURIComponent(projectName)}`
 }
 
+function projectWorkflowHref() {
+  return `/web/project-workflow.html?project=${encodeURIComponent(projectName)}`
+}
+
 function graphHref(nextView) {
   return `/web/project-graph.html?project=${encodeURIComponent(projectName)}&view=${encodeURIComponent(nextView)}`
 }
@@ -900,7 +931,7 @@ async function load() {
   projectDirEl.textContent = `${projectName}/`
   setModeButtons()
 
-  const payload = normalizePayload(await fetchJson(API))
+  const payload = normalizePayload(await fetchJson(graphApi()))
   state.payload = payload
   state.positions = { ...defaultPositions(payload.nodes, payload.edges), ...(payload.layout?.nodes || {}) }
   state.bends = { ...(payload.layout?.edges || {}) }
@@ -920,8 +951,16 @@ hideNodeCard()
 btnBack.addEventListener('click', () => {
   location.href = projectDetailHref()
 })
+btnWorkflow.addEventListener('click', () => {
+  location.href = projectWorkflowHref()
+})
 btnFiles.addEventListener('click', () => {
   location.href = projectFilesHref()
+})
+projectSelect.addEventListener('change', () => {
+  const next = projectSelect.value
+  if (!next || next === projectName) return
+  location.href = `/web/project-graph.html?project=${encodeURIComponent(next)}&view=${encodeURIComponent(view)}`
 })
 btnCollapsed.addEventListener('click', () => {
   if (view !== 'collapsed') location.href = graphHref('collapsed')
@@ -979,9 +1018,9 @@ svg.addEventListener('pointerup', (event) => {
 })
 
 window.addEventListener('beforeunload', () => {
-  if (state.payload) navigator.sendBeacon(LAYOUT_API, new Blob([JSON.stringify({ nodes: state.positions, edges: state.bends })], { type: 'application/json' }))
+  if (state.payload) navigator.sendBeacon(layoutApi(), new Blob([JSON.stringify({ nodes: state.positions, edges: state.bends })], { type: 'application/json' }))
 })
 
-load().catch((error) => {
+loadProjects().then(load).catch((error) => {
   metaEl.textContent = error.message || String(error)
 })
