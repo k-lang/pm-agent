@@ -17,6 +17,8 @@ const chatLog = document.getElementById('chat-log')
 const operationList = document.getElementById('operation-list')
 const noteList = document.getElementById('note-list')
 const resourceList = document.getElementById('resource-list')
+const btnUploadResource = document.getElementById('btn-upload-resource')
+const resourceFile = document.getElementById('resource-file')
 const tabButtons = Array.from(document.querySelectorAll('.tab-button'))
 const tabPanels = Array.from(document.querySelectorAll('[data-tab-panel]'))
 const modal = document.getElementById('new-project-modal')
@@ -25,6 +27,9 @@ const modalError = document.getElementById('modal-error')
 const btnCancelProject = document.getElementById('btn-cancel-project')
 const btnCreateProject = document.getElementById('btn-create-project')
 let activeTab = 'graph'
+let resources = []
+let selectedResourcePath = ''
+let resourceLoading = false
 
 function esc(s) {
   return String(s)
@@ -65,6 +70,31 @@ async function loadProjects() {
   if (projectName && !projects.some((project) => project.name === projectName)) projectName = ''
   if (!projectName && projects.length) projectName = projects[0].name
   render()
+  await loadResources()
+}
+
+async function loadResources() {
+  const project = selectedProject()
+  const previousResourcePath = selectedResourcePath
+  resources = []
+  selectedResourcePath = ''
+  if (!project) {
+    renderResources()
+    return
+  }
+  resourceLoading = true
+  renderResources()
+  try {
+    resources = await fetchJson(API + `/project/source?project=${encodeURIComponent(project.name)}`) || []
+    if (previousResourcePath && resources.some((resource) => resource.path === previousResourcePath)) {
+      selectedResourcePath = previousResourcePath
+    }
+  } catch (error) {
+    resourcePreview.innerHTML = `<div class="placeholder">${esc(error.message || '资源加载失败')}</div>`
+  } finally {
+    resourceLoading = false
+    renderResources()
+  }
 }
 
 function renderProjectSelect() {
@@ -106,6 +136,41 @@ function emptyMaterialState(message) {
   resourceList.innerHTML = '<div class="placeholder">还没有登记项目资源文档。</div>'
 }
 
+function formatBytes(size) {
+  if (!Number.isFinite(size)) return ''
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+function renderResources() {
+  const project = selectedProject()
+  if (btnUploadResource) btnUploadResource.disabled = !project || resourceLoading
+  if (!project) {
+    resourcePreview.innerHTML = '<div class="placeholder">选择项目后可以上传和预览资源。</div>'
+    resourceList.innerHTML = '<div class="placeholder">还没有项目。</div>'
+    return
+  }
+  if (resourceLoading) {
+    resourceList.innerHTML = '<div class="placeholder">正在加载资源...</div>'
+    return
+  }
+  if (!resources.length) {
+    resourcePreview.innerHTML = '<div class="placeholder">可以上传 txt、md 或其他附件；当前只支持预览 txt 和 markdown。</div>'
+    resourceList.innerHTML = '<div class="placeholder">还没有项目资源。</div>'
+    return
+  }
+  resourceList.innerHTML = resources.map((resource) => `
+    <button type="button" class="resource-item ${resource.path === selectedResourcePath ? 'active' : ''}" data-path="${esc(resource.path)}">
+      <span class="resource-name">${esc(resource.originalName || resource.name)}</span>
+      <span class="resource-meta">${esc(formatBytes(resource.size))}${resource.previewable ? ' / 可预览' : ' / 附件'}</span>
+    </button>
+  `).join('')
+  for (const item of Array.from(resourceList.querySelectorAll('.resource-item'))) {
+    item.onclick = () => previewResource(item.dataset.path)
+  }
+}
+
 function renderWorkspace() {
   const project = selectedProject()
   if (!project) {
@@ -115,6 +180,7 @@ function renderWorkspace() {
     chatLog.innerHTML = '<div class="placeholder">新建项目后，这里会承载和项目初始化 Skill 的对话。</div>'
     btnDetail.disabled = true
     btnGraph.disabled = true
+    renderResources()
     return
   }
   const ready = !!project.graphInitialized
@@ -144,8 +210,7 @@ function renderWorkspace() {
     ? '<div class="placeholder">后续这里预览 AI 辅助生成或人工修订后的本次工作笔记。</div>'
     : '<div class="placeholder">第一次图数据提交前，工作笔记会先围绕项目背景和初始化草案生成。</div>'
   noteList.innerHTML = '<div class="placeholder">后续这里列出历史工作笔记，点击后在左侧预览。</div>'
-  resourcePreview.innerHTML = '<div class="placeholder">后续这里预览架构设计、需求文档、会议纪要等资源文档。</div>'
-  resourceList.innerHTML = '<div class="placeholder">后续这里列出已登记或可引用的项目资源文档。</div>'
+  renderResources()
 }
 
 function render() {
@@ -202,6 +267,7 @@ async function createProject() {
 projectSelect.onchange = () => {
   projectName = projectSelect.value
   render()
+  loadResources()
 }
 for (const button of tabButtons) {
   button.onclick = () => setActiveTab(button.dataset.tab)
@@ -218,8 +284,61 @@ btnGraph.onclick = () => {
 btnDebug.onclick = () => { location.href = '/web' }
 btnCancelProject.onclick = closeModal
 btnCreateProject.onclick = createProject
+btnUploadResource.onclick = () => {
+  const project = selectedProject()
+  if (!project) return
+  resourceFile.click()
+}
+resourceFile.onchange = async () => {
+  const project = selectedProject()
+  const file = resourceFile.files?.[0]
+  if (!project || !file) return
+  const form = new FormData()
+  form.append('file', file)
+  btnUploadResource.disabled = true
+  resourcePreview.innerHTML = '<div class="placeholder">正在上传资源...</div>'
+  try {
+    const uploaded = await fetchJson(API + `/project/source?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      body: form,
+    })
+    selectedResourcePath = uploaded.path
+    await loadResources()
+    await previewResource(uploaded.path)
+    setActiveTab('resources')
+  } catch (error) {
+    resourcePreview.innerHTML = `<div class="placeholder">${esc(error.message || '上传失败')}</div>`
+  } finally {
+    resourceFile.value = ''
+    btnUploadResource.disabled = false
+  }
+}
 modal.onclick = (event) => {
   if (event.target === modal) closeModal()
+}
+
+async function previewResource(resourcePath) {
+  const project = selectedProject()
+  if (!project || !resourcePath) return
+  selectedResourcePath = resourcePath
+  renderResources()
+  resourcePreview.innerHTML = '<div class="placeholder">正在读取预览...</div>'
+  try {
+    const preview = await fetchJson(API + `/project/source/preview?project=${encodeURIComponent(project.name)}&path=${encodeURIComponent(resourcePath)}`)
+    if (preview.type === 'text') {
+      resourcePreview.innerHTML = `<pre class="resource-preview-text">${esc(preview.content)}</pre>`
+      return
+    }
+    resourcePreview.innerHTML = `
+      <div class="resource-preview-message">
+        <div class="operation-kind">${esc(preview.name || resourcePath)}</div>
+        <div class="operation-title">${esc(preview.message || '当前文件不可预览。')}</div>
+        <div class="operation-history">${esc(preview.path || resourcePath)}${preview.size ? ` / ${esc(formatBytes(preview.size))}` : ''}</div>
+      </div>
+    `
+  } catch (error) {
+    resourcePreview.innerHTML = `<div class="placeholder">${esc(error.message || '预览失败')}</div>`
+  }
 }
 
 loadProjects().catch((error) => {

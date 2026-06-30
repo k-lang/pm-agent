@@ -1,6 +1,7 @@
 import fs from "fs/promises"
 import type { Dirent } from "fs"
 import path from "path"
+import { Buffer } from "buffer"
 import { ulid } from "ulid"
 import { Hono } from "hono"
 import { describeRoute, validator, resolver } from "hono-openapi"
@@ -41,6 +42,11 @@ const ProjectOnlyQuery = z.object({
   project: z.string(),
 })
 
+const ProjectSourceQuery = z.object({
+  project: z.string(),
+  path: z.string().optional().default(""),
+})
+
 const UpdateSummaryInput = z.object({
   summaryText: z.string(),
 })
@@ -71,6 +77,21 @@ const ProjectStateFile = z.object({
   initialWorkflowID: z.string().optional(),
 })
 
+const SourceResource = z.object({
+  id: z.string(),
+  name: z.string(),
+  originalName: z.string(),
+  path: z.string(),
+  size: z.number(),
+  mimeType: z.string().optional(),
+  uploadedAt: z.string().optional(),
+  previewable: z.boolean().default(false),
+})
+
+const SourceResourceRegistry = z.object({
+  resources: z.array(SourceResource).default([]),
+})
+
 function badRequest(message: string): never {
   throw new HTTPException(400, { message })
 }
@@ -88,6 +109,10 @@ function validateProjectName(input: string) {
 
 function projectStatePath(directory: string) {
   return path.join(directory, "metadata", "project_state.json")
+}
+
+function sourceRegistryPath(directory: string) {
+  return path.join(directory, "metadata", "source_resources.json")
 }
 
 async function readProjectState(directory: string) {
@@ -118,6 +143,11 @@ async function inferGraphInitialized(directory: string) {
 async function writeProjectState(directory: string, state: z.infer<typeof ProjectStateFile>) {
   await fs.mkdir(path.join(directory, "metadata"), { recursive: true })
   await fs.writeFile(projectStatePath(directory), JSON.stringify(ProjectStateFile.parse(state), null, 2) + "\n", "utf8")
+}
+
+async function ensureExistingProject(directory: string) {
+  const stats = await fs.stat(directory).catch(() => undefined)
+  if (!stats?.isDirectory()) badRequest("Project not found")
 }
 
 async function ensureProjectStructure(directory: string) {
@@ -227,6 +257,89 @@ function resolveProjectFilePath(project: string, relativePath = "") {
   return { directory, relativePath: clean, resolved }
 }
 
+function sanitizeSourceFileName(input: string) {
+  const name = path.basename(input || "resource").replaceAll("\0", "").trim()
+  const cleaned = name.replace(/[\\/]/g, "_").replace(/\s+/g, " ")
+  if (!cleaned || cleaned === "." || cleaned === "..") return "resource"
+  if (cleaned.startsWith(".")) return `resource${cleaned}`
+  return cleaned
+}
+
+function isPreviewableSourcePath(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase()
+  return ext === ".txt" || ext === ".md" || ext === ".markdown"
+}
+
+function resolveSourcePath(project: string, relativePath = "") {
+  const directory = projectDirectoryForName(project)
+  const sourceRoot = path.resolve(directory, "source")
+  const clean = relativePath.replace(/^\/+/, "").replace(/^source\/+/, "")
+  const resolved = path.resolve(sourceRoot, clean)
+  if (resolved !== sourceRoot && !resolved.startsWith(sourceRoot + path.sep)) {
+    badRequest("Path escapes project source directory")
+  }
+  return {
+    directory,
+    sourceRoot,
+    sourceRelativePath: clean,
+    projectRelativePath: clean ? `source/${clean}` : "source",
+    resolved,
+  }
+}
+
+async function readSourceRegistry(directory: string) {
+  const raw = await fs.readFile(sourceRegistryPath(directory), "utf8").catch(() => undefined)
+  if (!raw) return SourceResourceRegistry.parse({})
+  return SourceResourceRegistry.parse(JSON.parse(raw))
+}
+
+async function writeSourceRegistry(directory: string, registry: z.infer<typeof SourceResourceRegistry>) {
+  await fs.mkdir(path.join(directory, "metadata"), { recursive: true })
+  await fs.writeFile(sourceRegistryPath(directory), JSON.stringify(SourceResourceRegistry.parse(registry), null, 2) + "\n", "utf8")
+}
+
+async function uniqueSourceFilePath(project: string, originalName: string) {
+  const safeName = sanitizeSourceFileName(originalName)
+  const parsed = path.parse(safeName)
+  const base = parsed.name || "resource"
+  const ext = parsed.ext
+  const initial = resolveSourcePath(project, safeName)
+  if (!await fs.stat(initial.resolved).catch(() => undefined)) return initial
+  const nextName = `${base}-${ulid()}${ext}`
+  return resolveSourcePath(project, nextName)
+}
+
+async function listSourceResources(project: string) {
+  const { directory, sourceRoot } = resolveSourcePath(project)
+  await ensureExistingProject(directory)
+  await fs.mkdir(sourceRoot, { recursive: true })
+  const registry = await readSourceRegistry(directory)
+  const byPath = new Map(registry.resources.map((resource) => [resource.path, resource]))
+  const entries = await fs.readdir(sourceRoot, { withFileTypes: true }).catch(() => [] as Dirent[])
+  const resources: z.infer<typeof SourceResource>[] = []
+
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.name === ".DS_Store") continue
+    const full = path.join(sourceRoot, entry.name)
+    const stats = await fs.stat(full)
+    const resourcePath = `source/${entry.name}`
+    const recorded = byPath.get(resourcePath)
+    resources.push(SourceResource.parse({
+      id: recorded?.id ?? ulid(stats.mtimeMs),
+      name: entry.name,
+      originalName: recorded?.originalName ?? entry.name,
+      path: resourcePath,
+      size: stats.size,
+      mimeType: recorded?.mimeType,
+      uploadedAt: recorded?.uploadedAt ?? stats.birthtime.toISOString(),
+      previewable: isPreviewableSourcePath(entry.name),
+    }))
+  }
+
+  resources.sort((a, b) => (b.uploadedAt || "").localeCompare(a.uploadedAt || "") || a.name.localeCompare(b.name))
+  return resources
+}
+
 function contentTypeForPath(filePath: string) {
   const ext = path.extname(filePath).toLowerCase()
   if (ext === ".json") return "application/json"
@@ -265,6 +378,45 @@ async function readProjectFile(project: string, relativePath?: string) {
     type: "text" as const,
     content: content.trim(),
     mimeType: contentTypeForPath(resolved),
+  }
+}
+
+async function previewSourceResource(project: string, relativePath: string) {
+  const { directory, resolved, projectRelativePath, sourceRelativePath } = resolveSourcePath(project, relativePath)
+  await ensureExistingProject(directory)
+  if (!sourceRelativePath) badRequest("Source file path is required")
+  const stats = await fs.stat(resolved).catch(() => undefined)
+  if (!stats || !stats.isFile()) badRequest("Source file not found")
+  const previewable = isPreviewableSourcePath(resolved)
+  const resource = {
+    name: path.basename(resolved),
+    path: projectRelativePath,
+    size: stats.size,
+    mimeType: contentTypeForPath(resolved),
+    previewable,
+  }
+  if (!previewable) {
+    return {
+      ...resource,
+      type: "unsupported" as const,
+      content: "",
+      message: "当前只支持预览 .txt、.md、.markdown 文件；该文件已保存，可作为附件引用。",
+    }
+  }
+  const maxPreviewBytes = 512 * 1024
+  if (stats.size > maxPreviewBytes) {
+    return {
+      ...resource,
+      type: "too_large" as const,
+      content: "",
+      message: "文件超过 512KB，当前版本暂不预览大文本文件。",
+    }
+  }
+  const content = await fs.readFile(resolved, "utf8")
+  return {
+    ...resource,
+    type: "text" as const,
+    content,
   }
 }
 
@@ -357,6 +509,91 @@ export const ProjectRoutes = lazy(() =>
       async (c) => {
         const query = c.req.valid("query")
         return c.json(await ProjectWorkflow.runAction({ project: query.project, ...c.req.valid("json") }))
+      },
+    )
+    .get(
+      "/source",
+      describeRoute({
+        summary: "List project source resources",
+        operationId: "project.sourceList",
+        responses: {
+          200: { description: "Project source resources", content: { "application/json": { schema: resolver(SourceResource.array()) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      async (c) => c.json(await listSourceResources(c.req.valid("query").project)),
+    )
+    .post(
+      "/source",
+      describeRoute({
+        summary: "Upload project source resource",
+        operationId: "project.sourceUpload",
+        responses: {
+          200: { description: "Uploaded project source resource", content: { "application/json": { schema: resolver(SourceResource) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      async (c) => {
+        const { project } = c.req.valid("query")
+        const directory = projectDirectoryForName(project)
+        await ensureExistingProject(directory)
+        const body = await c.req.parseBody({ all: true })
+        const file = Array.isArray(body.file) ? body.file[0] : body.file
+        if (!(file instanceof File)) badRequest("Upload field 'file' is required")
+
+        const target = await uniqueSourceFilePath(project, file.name)
+        await fs.mkdir(target.sourceRoot, { recursive: true })
+        const buffer = Buffer.from(await file.arrayBuffer())
+        await fs.writeFile(target.resolved, buffer)
+
+        const now = new Date().toISOString()
+        const resource = SourceResource.parse({
+          id: ulid(),
+          name: path.basename(target.resolved),
+          originalName: file.name,
+          path: target.projectRelativePath,
+          size: buffer.byteLength,
+          mimeType: file.type || undefined,
+          uploadedAt: now,
+          previewable: isPreviewableSourcePath(target.resolved),
+        })
+
+        const registry = await readSourceRegistry(target.directory)
+        const resources = [
+          resource,
+          ...registry.resources.filter((item) => item.path !== resource.path),
+        ]
+        await writeSourceRegistry(target.directory, { resources })
+
+        await ProjectWorkflow.runAction({
+          project,
+          action: "登记资源",
+          payload: {
+            path: resource.path,
+            title: resource.originalName,
+            note: resource.previewable ? "上传的文本资源，可在工作推进页预览。" : "上传的附件资源，当前版本不支持内容预览。",
+          },
+        }).catch(() => undefined)
+
+        return c.json(resource)
+      },
+    )
+    .get(
+      "/source/preview",
+      describeRoute({
+        summary: "Preview project source resource",
+        operationId: "project.sourcePreview",
+        responses: {
+          200: { description: "Project source preview", content: { "application/json": { schema: resolver(z.any()) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectSourceQuery),
+      async (c) => {
+        const query = c.req.valid("query")
+        return c.json(await previewSourceResource(query.project, query.path))
       },
     )
     .get(

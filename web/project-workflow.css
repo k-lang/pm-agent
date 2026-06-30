@@ -221,6 +221,59 @@ button:disabled {
   padding-top: 10px;
 }
 #operation-actions button { width: 100%; }
+#resource-actions {
+  padding-bottom: 10px;
+}
+#resource-actions button { width: 100%; }
+.resource-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  text-align: left;
+  border: 1px solid #374151;
+  border-radius: 8px;
+  background: #0f172a;
+  padding: 10px;
+  color: #e5e7eb;
+}
+.resource-item:hover {
+  background: #111827;
+  border-color: #4b5563;
+}
+.resource-item.active {
+  border-color: #60a5fa;
+  background: #172554;
+}
+.resource-name {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.resource-meta {
+  color: #9ca3af;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.resource-preview-text {
+  width: 100%;
+  height: 100%;
+  padding: 16px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #d1d5db;
+  font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.resource-preview-message {
+  max-width: 560px;
+  border: 1px solid #374151;
+  border-radius: 10px;
+  background: #0f172a;
+  padding: 14px;
+}
 .empty { color: #6b7280; font-size: 13px; }
 .modal {
   position: fixed;
