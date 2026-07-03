@@ -27,8 +27,10 @@ const DESCRIPTION = `
 - 提出修订意见：记录用户审核意见并进入对应修订状态。payload: { "target": "工作笔记|图操作|两者", "comment": "..." }
 - 应用图操作：当前版本保留动作入口，但不执行真实写图；必须等待用户明确确认。
 
-涉及放弃草案或应用图操作时，必须先得到用户明确确认。
+放弃草案、应用图操作这类终态或准终态动作不能通过聊天工具执行，必须由工作推进页醒目的专用按钮触发后端接口。聊天中只能解释影响、提醒用户去点击对应按钮。
 `.trim()
+
+const UI_ONLY_ACTIONS = new Set<ProjectWorkflow.Action>(["放弃草案", "应用图操作"])
 
 export const WorkflowActionTool = Tool.define("workflow_action", {
   description: DESCRIPTION,
@@ -36,6 +38,9 @@ export const WorkflowActionTool = Tool.define("workflow_action", {
   async execute(args, ctx) {
     if (ctx.agent !== "project_workflow") {
       throw new Error("workflow_action 只能由 project_workflow agent 调用。")
+    }
+    if (UI_ONLY_ACTIONS.has(args.action)) {
+      throw new Error(`「${args.action}」不能通过聊天工具执行，必须由工作推进页的专用确认按钮触发。`)
     }
     const result = await ProjectWorkflow.runAction(args)
     return {

@@ -240,4 +240,65 @@ describe("ProjectWorkflow", () => {
     })
     expect(messaged.stage).toBe("收集材料")
   })
+
+  test("exposes terminal actions for dedicated UI buttons with state-machine guards", async () => {
+    const started = await action("开始或恢复")
+    const discard = started.availableActions.find((item) => item.action === "放弃草案")
+    expect(discard).toMatchObject({
+      action: "放弃草案",
+      requiresUserConfirmation: true,
+    })
+    expect(started.blockedActions.find((item) => item.action === "应用图操作")?.reason).toContain("尚未生成可审核的预览")
+
+    await replayStepsBefore(18)
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await action("生成图操作草案", { command: await readStepCommand(18) })
+    await action("校验图操作")
+    const previewed = await action("生成预览")
+    const apply = previewed.availableActions.find((item) => item.action === "应用图操作")
+    expect(apply).toMatchObject({
+      action: "应用图操作",
+      requiresUserConfirmation: true,
+    })
+  })
+
+  test("dedicated discard action clears the active draft and allows a fresh workflow", async () => {
+    await action("开始或恢复")
+    await action("追加消息", {
+      role: "用户",
+      text: "这轮先记录一段还没形成图操作的推进背景。",
+    })
+    await expect(fs.stat(path.join(directory, "workflows", "active", "state.json"))).resolves.toBeTruthy()
+
+    const discarded = await action("放弃草案")
+    expect(discarded.stage).toBeUndefined()
+    expect(discarded.availableActions).toEqual([
+      { action: "开始或恢复", reason: "当前没有 active 草案，可以创建或恢复工作推进。" },
+    ])
+    await expect(fs.stat(path.join(directory, "workflows", "active", "state.json"))).rejects.toThrow()
+
+    const restarted = await action("开始或恢复")
+    expect(restarted.stage).toBe("收集材料")
+    expect(restarted.data).toMatchObject({ restored: false })
+  })
+
+  test("dedicated apply action is guarded before and after preview generation", async () => {
+    await action("开始或恢复")
+    await expect(action("应用图操作", { confirm: true })).rejects.toThrow("尚未生成可审核的预览")
+
+    await replayStepsBefore(18)
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await action("生成图操作草案", { command: await readStepCommand(18) })
+    await action("校验图操作")
+    await action("生成预览")
+
+    await expect(action("应用图操作", { confirm: false })).rejects.toThrow("应用图操作需要 payload.confirm = true")
+    await expect(action("应用图操作", { confirm: true })).rejects.toThrow("当前版本只实现状态机、草案文件和校验/预览")
+  })
 })

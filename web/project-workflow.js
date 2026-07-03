@@ -22,6 +22,8 @@ const noteList = document.getElementById('note-list')
 const resourceList = document.getElementById('resource-list')
 const btnUploadResource = document.getElementById('btn-upload-resource')
 const resourceFile = document.getElementById('resource-file')
+const btnApply = document.getElementById('btn-apply')
+const btnDiscardWorkflow = document.getElementById('btn-discard-workflow')
 const tabButtons = Array.from(document.querySelectorAll('.tab-button'))
 const tabPanels = Array.from(document.querySelectorAll('[data-tab-panel]'))
 const modal = document.getElementById('new-project-modal')
@@ -287,6 +289,55 @@ function hasUnfinishedActiveWorkflow(state) {
   return !!state && !TERMINAL_STAGES.has(state.stage)
 }
 
+function workflowActionEntry(action) {
+  const available = workflow?.availableActions || []
+  const blocked = workflow?.blockedActions || []
+  return {
+    available: available.find((item) => item.action === action),
+    blocked: blocked.find((item) => item.action === action),
+  }
+}
+
+function workflowActionBlockedReason(action) {
+  const project = selectedProject()
+  const state = currentWorkflowState()
+  if (!project) return '请先选择项目。'
+  if (workflowLoading) return '工作推进状态仍在加载，请稍后再试。'
+  if (!state) return '当前项目还没有 active 工作推进草案。'
+  if (TERMINAL_STAGES.has(state.stage)) return `当前草案已处于终态「${state.stage}」，不能执行「${action}」。`
+  const entry = workflowActionEntry(action)
+  if (entry.blocked?.reason) return entry.blocked.reason
+  if (!entry.available) return `当前阶段「${state.stage}」不支持「${action}」。`
+  return ''
+}
+
+function updateTerminalActionButtons() {
+  const project = selectedProject()
+  const state = currentWorkflowState()
+  const hasProject = !!project && !workflowLoading
+  if (btnDiscardWorkflow) {
+    btnDiscardWorkflow.disabled = !hasProject
+    btnDiscardWorkflow.title = state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
+  }
+  if (btnApply) {
+    btnApply.disabled = !hasProject
+    btnApply.classList.toggle('pending-action', state?.stage === '预览已生成')
+    btnApply.title = state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
+  }
+}
+
+async function refreshWorkflowStateOnly(project) {
+  if (!project) return
+  workflowLoading = true
+  updateTerminalActionButtons()
+  try {
+    workflow = await fetchJson(API + `/project/workflow/state?project=${encodeURIComponent(project.name)}`)
+  } finally {
+    workflowLoading = false
+    renderWorkspace()
+  }
+}
+
 async function maybeAskRestoreWorkflow() {
   const project = selectedProject()
   const state = currentWorkflowState()
@@ -489,6 +540,7 @@ function renderWorkspace() {
     emptyMaterialState('点击“新建项目”创建项目目录和基础结构。')
     btnDetail.disabled = true
     btnGraph.disabled = true
+    updateTerminalActionButtons()
     renderResources()
     renderChat()
     return
@@ -502,6 +554,7 @@ function renderWorkspace() {
   `
   btnDetail.disabled = !ready
   btnGraph.disabled = !ready
+  updateTerminalActionButtons()
   graphPreview.innerHTML = ready
     ? '<div class="placeholder">后续这里显示当前项目图谱，并叠加本次工作推进草案的新增/更新节点和边。</div>'
     : '<div class="placeholder">项目目录已创建。第一次图数据提交前，这里将展示项目初始化 Skill 生成的初始图草案。</div>'
@@ -614,6 +667,57 @@ btnUploadResource.onclick = () => {
   if (!project) return
   resourceFile.click()
 }
+
+async function discardWorkflowFromButton() {
+  const project = selectedProject()
+  await refreshWorkflowStateOnly(project)
+  const reason = workflowActionBlockedReason('放弃草案')
+  if (reason) {
+    alert(reason)
+    return
+  }
+  const state = currentWorkflowState()
+  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n这会清空 workflows/active 草案和本轮聊天会话，但不会删除已经写入的正式图数据。`)
+  if (!ok) return
+  btnDiscardWorkflow.disabled = true
+  try {
+    await fetchJson(API + `/project/workflow/action?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: '放弃草案', payload: {} }),
+    })
+    clearWorkflowView()
+    restorePromptProject = project.name
+    await loadWorkflow({ askRestore: false })
+  } catch (error) {
+    alert(error.message || '放弃草案失败')
+  } finally {
+    updateTerminalActionButtons()
+  }
+}
+
+async function applyWorkflowFromButton() {
+  const project = selectedProject()
+  try {
+    await refreshWorkflowStateOnly(project)
+  } catch (error) {
+    alert(error.message || '读取工作推进状态失败')
+    return
+  }
+  const reason = workflowActionBlockedReason('应用图操作')
+  if (reason) {
+    alert(reason)
+    return
+  }
+  const state = currentWorkflowState()
+  const ok = confirm(`确认提交项目「${project.name}」的本轮图操作吗？\n\n当前阶段：${state.stage}\n\n提交后将进入正式图数据写入流程。`)
+  if (!ok) return
+  alert('确认提交入口已预留。当前版本尚未实现正式写入图数据，请先继续审核图操作草案。')
+}
+
+btnDiscardWorkflow.onclick = () => discardWorkflowFromButton()
+btnApply.onclick = () => applyWorkflowFromButton()
+
 resourceFile.onchange = async () => {
   const project = selectedProject()
   const file = resourceFile.files?.[0]
