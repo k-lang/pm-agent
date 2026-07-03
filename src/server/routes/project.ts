@@ -12,6 +12,10 @@ import { projectGraphRoot } from "@/project/root"
 import { HTTPException } from "hono/http-exception"
 import { ProjectDetail } from "@/project/detail"
 import { SessionID } from "@/session/schema"
+import { Session } from "@/session"
+import { SessionPrompt } from "@/session/prompt"
+import { Instance } from "@/project/instance"
+import { MessageV2 } from "@/session/message-v2"
 import { ProjectWorkflow } from "@/workflow/state"
 import { loadExpandedGraph, loadGraph, saveLayout } from "../../../standalone-graph/transform"
 
@@ -56,6 +60,14 @@ const AskQuestionInput = z.object({
   mode: ProjectDetail.QuestionMode,
   questionID: z.string().optional(),
   questionSessionID: SessionID.zod.optional(),
+})
+
+const WorkflowChatInput = z.object({
+  text: z.string().min(1),
+})
+
+const WorkflowWarmupInput = z.object({
+  force: z.boolean().default(false),
 })
 
 const GraphView = z.enum(["collapsed", "expanded"]).default("collapsed")
@@ -420,6 +432,131 @@ async function previewSourceResource(project: string, relativePath: string) {
   }
 }
 
+function visibleMessageText(message: MessageV2.WithParts) {
+  return message.parts.reduce((result, part) => {
+    if (part.type !== "text" || part.synthetic || part.ignored) return result
+    return result + part.text
+  }, "").trim()
+}
+
+async function latestAssistantText(sessionID: SessionID) {
+  const messages = await Session.messages({ sessionID })
+  const assistant = [...messages].reverse().find((message) => message.info.role === "assistant")
+  return assistant ? visibleMessageText(assistant) : ""
+}
+
+function warmupPrompt(project: string) {
+  return [
+    "请进入工作推进的项目上下文预热模式。",
+    "",
+    `项目名：${project}`,
+    "",
+    "要求：",
+    "- 使用 project-workflow-context-warmup Skill。",
+    "- 只建立项目主干上下文，供后续 workflow chat session fork 使用。",
+    "- 不要调用 workflow_action。",
+    "- 不要生成正式项目总结报告，不要写 report_output。",
+    "- 输出 Markdown，覆盖项目主线、当前目标状态、关键工作线、关键问题与结果、最近变化、关键来源和后续推进需要确认的上下文缺口。",
+  ].join("\n")
+}
+
+async function createWorkflowChatSession(directory: string, warmupSessionID?: SessionID) {
+  return Instance.provide({
+    directory,
+    fn: async () => {
+      if (warmupSessionID) {
+        const forked = await Session.fork({ sessionID: warmupSessionID })
+        await Session.setTitle({ sessionID: forked.id, title: "工作推进" })
+        return forked
+      }
+      return Session.create({ title: "工作推进" })
+    },
+  })
+}
+
+async function ensureWorkflowChatSession(project: string, directory: string, graphInitialized: boolean) {
+  let active = await ProjectWorkflow.getActive({ project, directory })
+  let state = active.state
+  if (!state) {
+    active = await ProjectWorkflow.runAction({ project, directory, action: "开始或恢复", payload: {} })
+    state = active.state
+  }
+  if (!state) throw new Error("无法创建工作推进草案。")
+  if (graphInitialized && state.warmupStatus !== "completed") {
+    throw new HTTPException(409, { message: "项目上下文预热尚未完成，暂不能开始工作推进对话。" })
+  }
+  if (state.sessionID) return state.sessionID as SessionID
+  const session = await createWorkflowChatSession(directory, state.warmupSessionID as SessionID | undefined)
+  const bound = await ProjectWorkflow.bindSessions({
+    project,
+    directory,
+    sessionID: session.id,
+    warmupSessionID: state.warmupSessionID,
+    warmupStatus: state.warmupStatus,
+  })
+  if (!bound.state?.sessionID) throw new Error("工作推进会话绑定失败。")
+  return bound.state.sessionID as SessionID
+}
+
+async function runWorkflowWarmup(project: string, directory: string, carry: ProjectWorkflow.ActiveArtifactSnapshot) {
+  let warmupSessionID: SessionID | undefined
+  try {
+    const warmupSession = await Instance.provide({
+      directory,
+      fn: () => Session.create({ title: "工作推进上下文预热" }),
+    })
+    warmupSessionID = warmupSession.id
+    await ProjectWorkflow.bindSessions({
+      project,
+      directory,
+      warmupSessionID,
+      warmupStatus: "running",
+    })
+    await Instance.provide({
+      directory,
+      fn: () => SessionPrompt.prompt({
+        sessionID: warmupSession.id,
+        agent: "project_workflow",
+        noReply: true,
+        parts: [{ type: "text", text: warmupPrompt(project) }],
+      }),
+    })
+    await Instance.provide({
+      directory,
+      fn: () => SessionPrompt.loop({ sessionID: warmupSession.id }),
+    })
+    const context = await Instance.provide({
+      directory,
+      fn: () => latestAssistantText(warmupSession.id),
+    })
+    const chatSession = await createWorkflowChatSession(directory, warmupSession.id)
+    const replaced = await ProjectWorkflow.replaceActiveForWarmup({
+      project,
+      directory,
+      sessionID: chatSession.id,
+      warmupSessionID: warmupSession.id,
+      warmupStatus: "completed",
+      carry,
+    })
+    if (context.trim()) {
+      await fs.writeFile(
+        path.join(directory, "workflows", "active", "context_warmup.md"),
+        context.trimEnd() + "\n",
+        "utf8",
+      )
+    }
+    return replaced
+  } catch (error) {
+    await ProjectWorkflow.bindSessions({
+      project,
+      directory,
+      ...(warmupSessionID ? { warmupSessionID } : {}),
+      warmupStatus: "failed",
+    }).catch(() => undefined)
+    throw error
+  }
+}
+
 export const ProjectRoutes = lazy(() =>
   new Hono()
     .get(
@@ -509,6 +646,102 @@ export const ProjectRoutes = lazy(() =>
       async (c) => {
         const query = c.req.valid("query")
         return c.json(await ProjectWorkflow.runAction({ project: query.project, ...c.req.valid("json") }))
+      },
+    )
+    .post(
+      "/workflow/warmup",
+      describeRoute({
+        summary: "Start project workflow context warmup",
+        operationId: "project.workflowWarmup",
+        responses: {
+          200: { description: "Workflow state", content: { "application/json": { schema: resolver(ProjectWorkflow.ActionResult) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      validator("json", WorkflowWarmupInput),
+      async (c) => {
+        const { project } = c.req.valid("query")
+        const input = c.req.valid("json")
+        const directory = projectDirectoryForName(project)
+        await ensureExistingProject(directory)
+        const projectState = await readProjectState(directory)
+        if (!projectState.graphInitialized) badRequest("未初始化项目不需要项目上下文预热。")
+        const current = await ProjectWorkflow.getActive({ project, directory })
+        if (current.state?.warmupStatus === "running") return c.json(current)
+        if (current.state && !input.force) {
+          throw new HTTPException(409, { message: "当前已有 active 工作推进草案；重新预热需要 force=true。" })
+        }
+        const carry = await ProjectWorkflow.readActiveArtifacts({ project, directory })
+        let active = current
+        if (!active.state) active = await ProjectWorkflow.runAction({ project, directory, action: "开始或恢复", payload: {} })
+        await ProjectWorkflow.bindSessions({ project, directory, warmupStatus: "running" })
+        void runWorkflowWarmup(project, directory, carry).catch(() => undefined)
+        return c.json(await ProjectWorkflow.getActive({ project, directory }))
+      },
+    )
+    .post(
+      "/workflow/chat",
+      describeRoute({
+        summary: "Send project workflow chat message",
+        operationId: "project.workflowChat",
+        responses: {
+          200: { description: "Workflow chat state", content: { "application/json": { schema: resolver(z.any()) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      validator("json", WorkflowChatInput),
+      async (c) => {
+        const { project } = c.req.valid("query")
+        const input = c.req.valid("json")
+        const directory = projectDirectoryForName(project)
+        await ensureExistingProject(directory)
+        const projectState = await readProjectState(directory)
+        const sessionID = await ensureWorkflowChatSession(project, directory, !!projectState.graphInitialized)
+        const userMessage = await Instance.provide({
+          directory,
+          fn: () => SessionPrompt.prompt({
+            sessionID,
+            agent: "project_workflow",
+            noReply: true,
+            parts: [{ type: "text", text: input.text }],
+          }),
+        })
+        void Instance.provide({
+          directory,
+          fn: () => SessionPrompt.loop({ sessionID }),
+        }).catch(() => undefined)
+        return c.json({
+          sessionID,
+          userMessageID: userMessage.info.id,
+          workflow: await ProjectWorkflow.getActive({ project, directory }),
+        })
+      },
+    )
+    .get(
+      "/workflow/messages",
+      describeRoute({
+        summary: "List project workflow chat messages",
+        operationId: "project.workflowMessages",
+        responses: {
+          200: { description: "Workflow chat messages", content: { "application/json": { schema: resolver(z.any()) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      async (c) => {
+        const { project } = c.req.valid("query")
+        const directory = projectDirectoryForName(project)
+        await ensureExistingProject(directory)
+        const active = await ProjectWorkflow.getActive({ project, directory })
+        const sessionID = active.state?.sessionID
+        if (!sessionID) return c.json({ sessionID: undefined, messages: [], workflow: active })
+        const messages = await Instance.provide({
+          directory,
+          fn: () => Session.messages({ sessionID: sessionID as SessionID }),
+        })
+        return c.json({ sessionID, messages, workflow: active })
       },
     )
     .get(

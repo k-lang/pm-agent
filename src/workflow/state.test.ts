@@ -187,6 +187,47 @@ describe("ProjectWorkflow", () => {
     await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
   })
 
+  test("replacing active workflow for warmup carries note and resources but clears graph draft artifacts", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    const note = await readOriginalNote("knowledge_entry_point.txt")
+    const command = await readStepCommand(18)
+    await action("登记资源", {
+      path: "source/knowledge.md",
+      title: "知识梳理材料",
+      note: "用于本次预热迁移校验。",
+    })
+    await action("更新工作笔记", { content: note, summary: "使用 step18 对应原始工作笔记。" })
+    await action("生成图操作草案", { command })
+    await action("校验图操作")
+    await action("生成预览")
+
+    const activeDir = path.join(directory, "workflows", "active")
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).resolves.toBeTruthy()
+
+    const replaced = await ProjectWorkflow.replaceActiveForWarmup({
+      project: "demo",
+      directory,
+      sessionID: "ses_workflow_after_warmup",
+      warmupSessionID: "ses_warmup",
+      warmupStatus: "completed",
+    })
+
+    expect(replaced.stage).toBe("笔记已生成")
+    expect(replaced.state).toMatchObject({
+      sessionID: "ses_workflow_after_warmup",
+      warmupSessionID: "ses_warmup",
+      warmupStatus: "completed",
+    })
+    await expect(fs.readFile(path.join(activeDir, "note.md"), "utf8")).resolves.toContain(note.trim().slice(0, 120))
+    await expect(fs.readFile(path.join(activeDir, "resources.json"), "utf8")).resolves.toContain("source/knowledge.md")
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+  })
+
   test("blocks unsafe actions but allows flexible non-destructive actions", async () => {
     await action("开始或恢复")
 

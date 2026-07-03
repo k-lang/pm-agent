@@ -14,6 +14,9 @@ const graphPreview = document.getElementById('graph-preview')
 const notePreview = document.getElementById('note-preview')
 const resourcePreview = document.getElementById('resource-preview')
 const chatLog = document.getElementById('chat-log')
+const chatInput = document.getElementById('chat-input')
+const btnChatSend = document.getElementById('btn-chat-send')
+const btnWarmup = document.getElementById('btn-warmup')
 const operationList = document.getElementById('operation-list')
 const noteList = document.getElementById('note-list')
 const resourceList = document.getElementById('resource-list')
@@ -30,6 +33,21 @@ let activeTab = 'graph'
 let resources = []
 let selectedResourcePath = ''
 let resourceLoading = false
+let workflow = null
+let workflowMessages = []
+let workflowLoading = false
+let chatSending = false
+let warmupStarting = false
+let workflowPollTimer = null
+let currentSSE = null
+let refreshWorkflowTimer = null
+let restorePromptProject = ''
+let suppressRestorePrompt = false
+let workflowAwaitingReply = false
+let pendingUserText = ''
+const workflowStatusById = new Map()
+
+const TERMINAL_STAGES = new Set(['已应用', '已取消'])
 
 function esc(s) {
   return String(s)
@@ -48,6 +66,14 @@ async function fetchJson(url, options) {
 
 function selectedProject() {
   return projects.find((project) => project.name === projectName) || projects[0] || null
+}
+
+function clearWorkflowView() {
+  workflow = null
+  workflowMessages = []
+  pendingUserText = ''
+  workflowAwaitingReply = false
+  workflowStatusById.clear()
 }
 
 function replaceUrl() {
@@ -70,7 +96,8 @@ async function loadProjects() {
   if (projectName && !projects.some((project) => project.name === projectName)) projectName = ''
   if (!projectName && projects.length) projectName = projects[0].name
   render()
-  await loadResources()
+  connectWorkflowSSE()
+  await Promise.all([loadWorkflow({ askRestore: true }), loadResources()])
 }
 
 async function loadResources() {
@@ -94,6 +121,122 @@ async function loadResources() {
   } finally {
     resourceLoading = false
     renderResources()
+  }
+}
+
+async function loadWorkflow(options = {}) {
+  const project = selectedProject()
+  if (!project) {
+    workflow = null
+    workflowMessages = []
+    renderChat()
+    return
+  }
+  workflowLoading = true
+  renderChat()
+  try {
+    const [result, statuses] = await Promise.all([
+      fetchJson(API + `/project/workflow/messages?project=${encodeURIComponent(project.name)}`),
+      fetchJson(API + `/session/status?directory=${encodeURIComponent(project.directory)}`).catch(() => ({})),
+    ])
+    workflow = result?.workflow || null
+    workflowMessages = result?.messages || []
+    syncWorkflowStatuses(statuses || {})
+    if (pendingUserText && workflowMessages.some((message) => visibleUserText(message) === pendingUserText)) {
+      pendingUserText = ''
+    }
+    if (!workflowHasUnansweredUser()) workflowAwaitingReply = false
+  } catch (error) {
+    workflow = { ok: false, message: error.message || '工作推进状态加载失败' }
+    workflowMessages = []
+  } finally {
+    workflowLoading = false
+    renderWorkspace()
+    maybePollWorkflow()
+    if (options.askRestore) await maybeAskRestoreWorkflow()
+  }
+}
+
+function scheduleWorkflowRefresh() {
+  if (refreshWorkflowTimer) return
+  refreshWorkflowTimer = setTimeout(async () => {
+    refreshWorkflowTimer = null
+    await loadWorkflow({ askRestore: false })
+  }, 250)
+}
+
+function connectWorkflowSSE() {
+  if (currentSSE) {
+    currentSSE.close()
+    currentSSE = null
+  }
+  const project = selectedProject()
+  if (!project) return
+  const es = new EventSource(API + '/event?directory=' + encodeURIComponent(project.directory))
+  es.onmessage = (event) => {
+    try {
+      handleWorkflowBusEvent(JSON.parse(event.data))
+    } catch {}
+  }
+  es.onerror = () => {
+    es.close()
+    currentSSE = null
+    setTimeout(() => {
+      if (selectedProject()?.name === project.name) connectWorkflowSSE()
+    }, 3000)
+  }
+  currentSSE = es
+}
+
+function workflowSessionIDs() {
+  const state = currentWorkflowState()
+  return new Set([state?.sessionID, state?.warmupSessionID].filter(Boolean))
+}
+
+function syncWorkflowStatuses(statuses) {
+  const ids = workflowSessionIDs()
+  for (const id of Array.from(workflowStatusById.keys())) {
+    if (!ids.has(id)) workflowStatusById.delete(id)
+  }
+  for (const id of ids) {
+    const status = statuses[id]
+    if (status && status.type !== 'idle') workflowStatusById.set(id, status)
+    else workflowStatusById.delete(id)
+  }
+}
+
+function updateWorkflowStatus(sessionID, status) {
+  if (!sessionID) return
+  if (status?.type === 'busy' || status?.type === 'retry') workflowStatusById.set(sessionID, status)
+  else workflowStatusById.delete(sessionID)
+}
+
+function handleWorkflowBusEvent(event) {
+  if (!event?.type) return
+  const ids = workflowSessionIDs()
+  if (!ids.size) {
+    if (currentWorkflowState()?.warmupStatus === 'running') scheduleWorkflowRefresh()
+    return
+  }
+  if (event.type === 'session.updated') {
+    const sessionID = event.properties?.info?.id
+    if (sessionID && ids.has(sessionID)) scheduleWorkflowRefresh()
+  }
+  if (event.type === 'session.status') {
+    const sessionID = event.properties?.sessionID
+    if (sessionID && ids.has(sessionID)) {
+      updateWorkflowStatus(sessionID, event.properties?.status || { type: 'idle' })
+      renderChat()
+      scheduleWorkflowRefresh()
+    }
+  }
+  if (event.type === 'message.updated') {
+    const sessionID = event.properties?.info?.sessionID
+    if (sessionID && ids.has(sessionID)) scheduleWorkflowRefresh()
+  }
+  if (event.type === 'message.part.updated' || event.type === 'message.part.delta') {
+    const sessionID = event.properties?.part?.sessionID || event.properties?.sessionID
+    if (sessionID && ids.has(sessionID)) scheduleWorkflowRefresh()
   }
 }
 
@@ -134,6 +277,173 @@ function emptyMaterialState(message) {
   noteList.innerHTML = '<div class="placeholder">还没有历史工作笔记。</div>'
   resourcePreview.innerHTML = '<div class="placeholder">还没有可预览的项目资源。</div>'
   resourceList.innerHTML = '<div class="placeholder">还没有登记项目资源文档。</div>'
+}
+
+function currentWorkflowState() {
+  return workflow?.state || null
+}
+
+function hasUnfinishedActiveWorkflow(state) {
+  return !!state && !TERMINAL_STAGES.has(state.stage)
+}
+
+async function maybeAskRestoreWorkflow() {
+  const project = selectedProject()
+  const state = currentWorkflowState()
+  if (!project || !hasUnfinishedActiveWorkflow(state)) return
+  if (suppressRestorePrompt) return
+  if (restorePromptProject === project.name) return
+  restorePromptProject = project.name
+
+  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“取消”会放弃当前 active workflow，保留已写入的正式图数据。`)
+  if (ok) return
+
+  suppressRestorePrompt = true
+  try {
+    await fetchJson(API + `/project/workflow/action?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: '放弃草案', payload: {} }),
+    })
+    await loadWorkflow({ askRestore: false })
+  } catch (error) {
+    chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '放弃草案失败')}</div>`
+  } finally {
+    suppressRestorePrompt = false
+  }
+}
+
+function warmupStatusText(status) {
+  if (status === 'completed') return '项目上下文预热已完成'
+  if (status === 'running') return '项目上下文预热中'
+  if (status === 'failed') return '项目上下文预热失败'
+  if (status === 'stale') return '项目上下文需要重新预热'
+  return '项目上下文尚未预热'
+}
+
+function visibleMessageText(message) {
+  return (message.parts || []).reduce((result, part) => {
+    if (part.type !== 'text' || part.synthetic || part.ignored) return result
+    return result + (part.text || '')
+  }, '').trim()
+}
+
+function visibleUserText(message) {
+  if ((message.info?.role || message.role) !== 'user') return ''
+  return visibleMessageText(message)
+}
+
+function assistantReplies(userMessageID) {
+  return workflowMessages.filter((message) =>
+    (message.info?.role || message.role) === 'assistant' && message.info?.parentID === userMessageID)
+}
+
+function workflowHasUnansweredUser() {
+  const users = workflowMessages.filter((message) => visibleUserText(message))
+  const latestUser = users[users.length - 1]
+  if (!latestUser?.info?.id) return false
+  const assistants = assistantReplies(latestUser.info.id)
+  if (!assistants.length) return true
+  return assistants.some((assistant) => !assistant.info?.time?.completed)
+}
+
+function renderMessagePart(part) {
+  if (part.type === 'text' && !part.synthetic && !part.ignored) {
+    return `<div class="message-text">${esc(part.text || '')}</div>`
+  }
+  if (part.type === 'tool') {
+    const status = part.state?.status || 'pending'
+    const title = part.state?.title || part.tool || 'tool'
+    return `<div class="message-tool">${esc(title)} · ${esc(status)}</div>`
+  }
+  return ''
+}
+
+function renderWorkflowMessage(message) {
+  const role = message.info?.role || message.role || 'assistant'
+  if (role !== 'user' && role !== 'assistant') return ''
+  const parts = (message.parts || []).map(renderMessagePart).filter(Boolean).join('')
+  const fallback = visibleMessageText(message)
+  if (!parts && !fallback) return ''
+  const label = role === 'user' ? '你' : '大模型'
+  return `
+    <div class="workflow-message ${role === 'user' ? 'user' : 'assistant'}">
+      <div class="message-role">${label}</div>
+      <div class="message-body">${parts || `<div class="message-text">${esc(fallback)}</div>`}</div>
+    </div>
+  `
+}
+
+function workflowIsRunning() {
+  const state = currentWorkflowState()
+  if (state?.warmupStatus === 'running') return true
+  if ([...workflowStatusById.values()].some((status) => status.type === 'busy' || status.type === 'retry')) return true
+  if (chatSending || workflowAwaitingReply || workflowHasUnansweredUser()) return true
+  return workflowMessages.some((message) =>
+    (message.parts || []).some((part) => {
+      const status = part.state?.status
+      return status === 'pending' || status === 'running'
+    }))
+}
+
+function chatLockReason(project, state) {
+  if (!project) return '选择或新建项目后可以开始工作推进。'
+  if (!project.graphInitialized) return ''
+  if (workflowLoading) return '正在加载工作推进状态。'
+  if (!state) return '已有图数据的项目需要先完成项目上下文预热。'
+  if (state.warmupStatus === 'running') return '项目上下文预热中，完成后会自动开放推进对话。'
+  if (state.warmupStatus === 'failed') return '项目上下文预热失败，请重新预热后再继续。'
+  if (state.warmupStatus !== 'completed') return '请先预热项目上下文，让大模型掌握当前项目主线。'
+  return ''
+}
+
+function renderChat() {
+  const project = selectedProject()
+  const state = currentWorkflowState()
+  const lockReason = chatLockReason(project, state)
+  const running = workflowIsRunning()
+  const canChat = !!project && !running && !lockReason
+  const canWarmup = !!project?.graphInitialized && !warmupStarting && state?.warmupStatus !== 'running'
+
+  btnChatSend.disabled = !canChat || !chatInput.value.trim()
+  chatInput.disabled = !canChat
+  chatInput.placeholder = !project
+    ? '先选择或新建项目'
+    : project.graphInitialized
+      ? lockReason || '描述本次工作推进、补充材料、修改工作笔记或图操作'
+      : '描述项目背景、当前目标、已知问题、已有资料和希望先推进的工作'
+
+  btnWarmup.classList.toggle('hidden', !project?.graphInitialized)
+  btnWarmup.disabled = !canWarmup
+  btnWarmup.textContent = state?.warmupStatus === 'completed' ? '重新预热项目上下文' : '开始项目上下文预热'
+
+  if (workflowLoading && !workflowMessages.length) {
+    chatLog.innerHTML = '<div class="placeholder">正在加载工作推进会话...</div>'
+    return
+  }
+
+  if (!project) {
+    chatLog.innerHTML = '<div class="placeholder">新建或选择项目后，这里会承载工作推进对话。</div>'
+    return
+  }
+
+  const messages = workflowMessages.map(renderWorkflowMessage).filter(Boolean)
+  if (pendingUserText) {
+    messages.push(`
+      <div class="workflow-message user local-pending">
+        <div class="message-role">你</div>
+        <div class="message-body"><div class="message-text">${esc(pendingUserText)}</div></div>
+      </div>
+    `)
+  }
+  if (running) messages.push('<div class="output-cursor">运行中</div>')
+  const messagesHtml = messages.join('')
+  const guide = project.graphInitialized
+    ? `<div class="chat-guide">${esc(lockReason || `${warmupStatusText(state?.warmupStatus)}。可以开始描述本次推进事项、引用资源，并让大模型生成或修订工作笔记和图操作草案。`)}</div>`
+    : '<div class="chat-guide">这是一个尚未第一次提交图数据的新项目。请直接描述项目背景、目标、现状、已知问题和已有资料，大模型会先辅助形成初始化工作笔记与初始图操作草案。</div>'
+
+  chatLog.innerHTML = messagesHtml || guide
+  chatLog.scrollTop = chatLog.scrollHeight
 }
 
 function formatBytes(size) {
@@ -177,32 +487,24 @@ function renderWorkspace() {
     workspaceSubtitle.textContent = '还没有项目'
     projectStatus.textContent = ''
     emptyMaterialState('点击“新建项目”创建项目目录和基础结构。')
-    chatLog.innerHTML = '<div class="placeholder">新建项目后，这里会承载和项目初始化 Skill 的对话。</div>'
     btnDetail.disabled = true
     btnGraph.disabled = true
     renderResources()
+    renderChat()
     return
   }
   const ready = !!project.graphInitialized
+  const state = currentWorkflowState()
   workspaceSubtitle.textContent = `${project.name} / ${project.directory}`
-  projectStatus.innerHTML = `<span class="badge ${ready ? 'ready' : 'pending'}">${ready ? '图数据已初始化' : '等待第一次图提交'}</span>`
+  projectStatus.innerHTML = `
+    <span class="badge ${ready ? 'ready' : 'pending'}">${ready ? '图数据已初始化' : '等待第一次图提交'}</span>
+    ${state ? `<span class="badge workflow-stage">${esc(state.stage)}</span>` : ''}
+  `
   btnDetail.disabled = !ready
   btnGraph.disabled = !ready
   graphPreview.innerHTML = ready
     ? '<div class="placeholder">后续这里显示当前项目图谱，并叠加本次工作推进草案的新增/更新节点和边。</div>'
     : '<div class="placeholder">项目目录已创建。第一次图数据提交前，这里将展示项目初始化 Skill 生成的初始图草案。</div>'
-  chatLog.innerHTML = `
-    <div class="operation-item">
-      <div class="operation-kind">当前项目</div>
-      <div class="operation-title">${esc(project.name)}</div>
-      <div class="operation-history">${ready ? '可以继续工作推进。' : '已创建项目目录结构；下一步在聊天区补充项目背景并生成初始图数据草案。'}</div>
-    </div>
-    <div class="operation-item">
-      <div class="operation-kind">初始化状态</div>
-      <div class="operation-title">${esc(project.initialWorkflowID || '等待背景输入')}</div>
-      <div class="operation-history">${ready ? '项目已完成第一次图提交。' : '后续聊天区会用于描述背景、修改初始化草案和确认图更新方向。'}</div>
-    </div>
-  `
   operationList.innerHTML = ready
     ? '<div class="placeholder">后续这里显示本次推进生成的图操作索引，点击后图谱预览会定位到对应节点或边。</div>'
     : '<div class="placeholder">等待项目初始化 Skill 生成第一批图操作：初始事件/目标/工作块/工作项等。</div>'
@@ -211,6 +513,7 @@ function renderWorkspace() {
     : '<div class="placeholder">第一次图数据提交前，工作笔记会先围绕项目背景和初始化草案生成。</div>'
   noteList.innerHTML = '<div class="placeholder">后续这里列出历史工作笔记，点击后在左侧预览。</div>'
   renderResources()
+  renderChat()
 }
 
 function render() {
@@ -255,6 +558,8 @@ async function createProject() {
       body: JSON.stringify({ name }),
     })
     projectName = created.name
+    restorePromptProject = created.name
+    clearWorkflowView()
     closeModal()
     await loadProjects()
   } catch (error) {
@@ -266,8 +571,13 @@ async function createProject() {
 
 projectSelect.onchange = () => {
   projectName = projectSelect.value
+  restorePromptProject = ''
+  clearWorkflowView()
   render()
-  loadResources()
+  connectWorkflowSSE()
+  Promise.all([loadWorkflow({ askRestore: true }), loadResources()]).catch((error) => {
+    chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '加载失败')}</div>`
+  })
 }
 for (const button of tabButtons) {
   button.onclick = () => setActiveTab(button.dataset.tab)
@@ -284,6 +594,21 @@ btnGraph.onclick = () => {
 btnDebug.onclick = () => { location.href = '/web' }
 btnCancelProject.onclick = closeModal
 btnCreateProject.onclick = createProject
+chatInput.oninput = renderChat
+chatInput.onkeydown = (event) => {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault()
+    sendChat().catch((error) => {
+      chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '发送失败')}</div>`
+    })
+  }
+}
+btnChatSend.onclick = () => sendChat().catch((error) => {
+  chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '发送失败')}</div>`
+})
+btnWarmup.onclick = () => startWarmup().catch((error) => {
+  chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '预热失败')}</div>`
+})
 btnUploadResource.onclick = () => {
   const project = selectedProject()
   if (!project) return
@@ -339,6 +664,70 @@ async function previewResource(resourcePath) {
   } catch (error) {
     resourcePreview.innerHTML = `<div class="placeholder">${esc(error.message || '预览失败')}</div>`
   }
+}
+
+async function sendChat() {
+  const project = selectedProject()
+  const text = chatInput.value.trim()
+  if (!project || !text || chatSending) return
+  chatSending = true
+  workflowAwaitingReply = true
+  pendingUserText = text
+  renderChat()
+  try {
+    await fetchJson(API + `/project/workflow/chat?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    chatInput.value = ''
+    await loadWorkflow({ askRestore: false })
+    startWorkflowPolling()
+  } catch (error) {
+    workflowAwaitingReply = false
+    pendingUserText = ''
+    throw error
+  } finally {
+    chatSending = false
+    renderChat()
+  }
+}
+
+async function startWarmup() {
+  const project = selectedProject()
+  if (!project?.graphInitialized || warmupStarting) return
+  const state = currentWorkflowState()
+  const force = !!state
+  if (force) {
+    const ok = confirm('重新预热会创建新的 active workflow 和新的聊天会话；会保留当前工作笔记和资源登记，但清空图操作草案、校验和预览。是否继续？')
+    if (!ok) return
+  }
+  warmupStarting = true
+  renderChat()
+  try {
+    await fetchJson(API + `/project/workflow/warmup?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    })
+    await loadWorkflow({ askRestore: false })
+    startWorkflowPolling()
+  } finally {
+    warmupStarting = false
+    renderChat()
+  }
+}
+
+function startWorkflowPolling() {
+  if (workflowPollTimer) clearTimeout(workflowPollTimer)
+  workflowPollTimer = setTimeout(async () => {
+    workflowPollTimer = null
+    await loadWorkflow({ askRestore: false })
+  }, 1600)
+}
+
+function maybePollWorkflow() {
+  if (workflowIsRunning()) startWorkflowPolling()
 }
 
 loadProjects().catch((error) => {

@@ -38,6 +38,9 @@ export namespace ProjectWorkflow {
   ])
   export type Action = z.infer<typeof Action>
 
+  export const BaselineStatus = z.enum(["missing", "running", "completed", "failed", "stale"])
+  export type BaselineStatus = z.infer<typeof BaselineStatus>
+
   const ArtifactPaths = z.object({
     messages: z.string().default("messages.jsonl"),
     resources: z.string().default("resources.json"),
@@ -52,6 +55,9 @@ export namespace ProjectWorkflow {
     id: z.string(),
     project: z.string(),
     stage: Stage,
+    sessionID: z.string().optional(),
+    warmupSessionID: z.string().optional(),
+    warmupStatus: BaselineStatus.optional(),
     createdAt: z.number(),
     updatedAt: z.number(),
     base: z.object({
@@ -110,6 +116,12 @@ export namespace ProjectWorkflow {
     data: z.record(z.string(), z.unknown()).optional(),
   })
   export type ActionResult = z.infer<typeof ActionResult>
+
+  export const ActiveArtifactSnapshot = z.object({
+    note: z.string().optional(),
+    resources: z.string().optional(),
+  })
+  export type ActiveArtifactSnapshot = z.infer<typeof ActiveArtifactSnapshot>
 
   const MessagePayload = z.object({
     role: z.enum(["用户", "助手", "系统"]).default("用户"),
@@ -194,6 +206,10 @@ export namespace ProjectWorkflow {
     return State.parse(JSON.parse(raw))
   }
 
+  async function readOptionalText(file: string) {
+    return fs.readFile(file, "utf8").catch(() => undefined)
+  }
+
   async function writeState(directory: string, state: State) {
     await fs.mkdir(activeDir(directory), { recursive: true })
     await fs.writeFile(activeStatePath(directory), JSON.stringify(State.parse(state), null, 2) + "\n", "utf8")
@@ -225,6 +241,26 @@ export namespace ProjectWorkflow {
       summary: "创建工作推进草案。",
     })
     return state
+  }
+
+  function withSessionBinding(state: State, input: { sessionID?: string; warmupSessionID?: string; warmupStatus?: BaselineStatus }) {
+    return State.parse({
+      ...state,
+      sessionID: input.sessionID ?? state.sessionID,
+      warmupSessionID: input.warmupSessionID ?? state.warmupSessionID,
+      warmupStatus: input.warmupStatus ?? state.warmupStatus,
+      updatedAt: Date.now(),
+    })
+  }
+
+  async function cleanupWorkflowChatSession(state?: State) {
+    if (!state?.sessionID) return
+    const [{ Session }, { SessionPrompt }] = await Promise.all([
+      import("@/session"),
+      import("@/session/prompt"),
+    ])
+    await SessionPrompt.cancel(state.sessionID as any).catch(() => undefined)
+    await Session.remove(state.sessionID as any).catch(() => undefined)
   }
 
   function transition(state: State, action: Action, to: Stage, summary: string): State {
@@ -370,10 +406,88 @@ export namespace ProjectWorkflow {
     return ok(project, directory, state, "已创建新的工作推进草案。", { restored: false })
   }
 
+  export async function bindSessions(input: {
+    project: string
+    directory?: string
+    sessionID?: string
+    warmupSessionID?: string
+    warmupStatus?: BaselineStatus
+  }) {
+    const project = validateProjectName(input.project)
+    const directory = input.directory ?? projectDirectory(project)
+    await ensureProject(directory)
+    const existing = await readState(directory)
+    if (!existing) throw new Error("当前项目没有 active 工作推进草案，请先执行「开始或恢复」。")
+    const next = withSessionBinding(existing, {
+      sessionID: input.sessionID,
+      warmupSessionID: input.warmupSessionID,
+      warmupStatus: input.warmupStatus,
+    })
+    await writeState(directory, next)
+    return ok(project, directory, next, "已绑定工作推进会话。")
+  }
+
+  export async function readActiveArtifacts(input: { project: string; directory?: string }): Promise<ActiveArtifactSnapshot> {
+    const project = validateProjectName(input.project)
+    const directory = input.directory ?? projectDirectory(project)
+    await ensureProject(directory)
+    const state = await readState(directory)
+    if (!state) return {}
+    const [note, resources] = await Promise.all([
+      readOptionalText(artifactPath(directory, state, "note")),
+      readOptionalText(artifactPath(directory, state, "resources")),
+    ])
+    return ActiveArtifactSnapshot.parse({ note, resources })
+  }
+
+  export async function replaceActiveForWarmup(input: {
+    project: string
+    directory?: string
+    sessionID: string
+    warmupSessionID: string
+    warmupStatus?: BaselineStatus
+    carry?: ActiveArtifactSnapshot
+  }) {
+    const project = validateProjectName(input.project)
+    const directory = input.directory ?? projectDirectory(project)
+    await ensureProject(directory)
+    const existing = await readState(directory)
+    const carry = input.carry ?? await readActiveArtifacts({ project, directory })
+    await fs.rm(activeDir(directory), { recursive: true, force: true })
+    await fs.mkdir(activeDir(directory), { recursive: true })
+    let state = createState(project)
+    state = State.parse({
+      ...state,
+      sessionID: input.sessionID,
+      warmupSessionID: input.warmupSessionID,
+      warmupStatus: input.warmupStatus ?? "completed",
+    })
+
+    if (carry.resources) {
+      await fs.writeFile(artifactPath(directory, state, "resources"), carry.resources, "utf8")
+    }
+    if (carry.note?.trim()) {
+      await fs.writeFile(artifactPath(directory, state, "note"), carry.note.trimEnd() + "\n", "utf8")
+      state = transition(
+        state,
+        "更新工作笔记",
+        "笔记已生成",
+        "重新预热后沿用上一版工作笔记，已清空图操作草案、校验和预览。",
+      )
+    }
+    await writeState(directory, state)
+    return ok(project, directory, state, "已创建重新预热后的 active 工作推进草案。", {
+      carriedNote: !!carry.note?.trim(),
+      carriedResources: !!carry.resources?.trim(),
+    })
+      .finally(() => cleanupWorkflowChatSession(existing))
+  }
+
   async function discard(project: string, directory: string, state: State) {
     const next = transition(state, "放弃草案", "已取消", "用户确认放弃 active 草案。")
     await writeState(directory, next)
     await fs.rm(activeDir(directory), { recursive: true, force: true })
+    await cleanupWorkflowChatSession(state)
     return inactive(project, directory, "已清空当前 active 草案。")
   }
 

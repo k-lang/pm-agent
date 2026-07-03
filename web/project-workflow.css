@@ -88,6 +88,19 @@ button:disabled {
 .panel-header h2 { font-size: 16px; }
 .panel-header p, #workspace-subtitle { color: #9ca3af; font-size: 12px; line-height: 1.5; margin-top: 4px; }
 #project-status { color: #9ca3af; font-size: 12px; white-space: nowrap; }
+#project-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.chat-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
 #workspace-tabs {
   display: flex;
   align-items: center;
@@ -163,6 +176,10 @@ button:disabled {
   background: #451a03;
   color: #fcd34d;
 }
+.badge.workflow-stage {
+  background: #172554;
+  color: #bfdbfe;
+}
 .preview-content,
 .side-list,
 #chat-log {
@@ -183,6 +200,9 @@ button:disabled {
   flex: 1;
   overflow: auto;
   padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .side-list {
   flex: 1;
@@ -208,6 +228,75 @@ button:disabled {
 .operation-kind { color: #93c5fd; font-size: 12px; margin-bottom: 6px; }
 .operation-title { font-size: 13px; font-weight: 600; line-height: 1.4; margin-bottom: 4px; word-break: break-word; }
 .operation-history { color: #9ca3af; font-size: 12px; line-height: 1.5; word-break: break-word; }
+.chat-guide {
+  margin: auto;
+  max-width: 680px;
+  color: #9ca3af;
+  font-size: 13px;
+  line-height: 1.7;
+  text-align: center;
+}
+.workflow-message {
+  display: grid;
+  gap: 6px;
+  max-width: 82%;
+}
+.workflow-message.user {
+  align-self: flex-end;
+}
+.workflow-message.assistant {
+  align-self: flex-start;
+}
+.message-role {
+  color: #9ca3af;
+  font-size: 12px;
+}
+.workflow-message.user .message-role {
+  text-align: right;
+}
+.message-body {
+  border: 1px solid #374151;
+  border-radius: 10px;
+  background: #0f172a;
+  padding: 10px 12px;
+  color: #d1d5db;
+  font-size: 13px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+.workflow-message.user .message-body {
+  border-color: #1d4ed8;
+  background: #172554;
+  color: #eff6ff;
+}
+.message-text {
+  white-space: pre-wrap;
+}
+.message-tool {
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #111827;
+  color: #93c5fd;
+  padding: 6px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  margin-top: 6px;
+}
+.output-cursor {
+  align-self: flex-start;
+  color: #60a5fa;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  animation: cursor-blink 1s steps(1, end) infinite;
+}
+@keyframes cursor-blink { 50% { opacity: 0.35; } }
+.workflow-message.pending .message-body {
+  color: #9ca3af;
+}
+.loading {
+  color: #9ca3af;
+}
 #chat-composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

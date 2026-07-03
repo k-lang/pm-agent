@@ -4,4 +4,9 @@ node_modules/
 *.db
 *.sqlite
 *.sqlite3
-project_graph_data/
+project_graph_data/*
+!project_graph_data/.agents/
+project_graph_data/.agents/*
+!project_graph_data/.agents/skills/
+!project_graph_data/.agents/skills/**
+project_graph_data/.agents/skills/*.tgz

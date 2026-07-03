@@ -205,6 +205,19 @@ function selectedQuestion() {
     || null
 }
 
+function qaBaselineReady() {
+  return detail?.currentSummary?.status === 'completed'
+}
+
+function qaBaselineMessage() {
+  const current = detail?.currentSummary
+  if (!current) return '项目总结尚未生成，请先生成项目总结后再提问。'
+  if (current.status === 'running') return '项目总结正在生成，完成后会开放项目问答。'
+  if (current.status === 'failed') return '项目总结生成失败，请重新生成项目总结后再提问。'
+  if (current.status !== 'completed') return `项目总结当前状态为 ${current.status}，暂不能提问。`
+  return ''
+}
+
 function projectDetailUrl(questionId = selectedQuestionId) {
   const url = new URL(API + '/project/detail', location.origin)
   url.searchParams.set('project', projectName)
@@ -348,7 +361,11 @@ async function renderQuestionList() {
 
 function updateQuestionSelectionUI() {
   const question = selectedQuestion()
-  btnFollowup.disabled = !question?.id || !question?.sessionID
+  const ready = qaBaselineReady()
+  questionInput.disabled = !ready
+  btnAsk.disabled = !ready
+  btnFollowup.disabled = !ready || !question?.id || !question?.sessionID
+  questionInput.placeholder = ready ? '输入一个项目问题' : qaBaselineMessage()
 }
 
 function renderPartNode(part) {
@@ -436,6 +453,14 @@ function renderToolPart(el, part) {
 async function renderQuestions() {
   await renderQuestionList()
   updateQuestionSelectionUI()
+
+  if (!qaBaselineReady()) {
+    currentQuestionSessionId = null
+    currentQuestionUserMessageId = null
+    qaMeta.textContent = '项目问答未就绪'
+    messagesEl.innerHTML = `<div class="empty">${esc(qaBaselineMessage())}</div>`
+    return
+  }
 
   const question = selectedQuestion()
   if (!question) {
@@ -541,6 +566,7 @@ async function saveSummary() {
 }
 
 async function ask(mode) {
+  if (!qaBaselineReady()) return
   const text = questionInput.value.trim()
   if (!text) return
   const body = { text, mode }

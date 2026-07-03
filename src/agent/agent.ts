@@ -214,7 +214,10 @@ export namespace Agent {
           Permission.fromConfig({
             "*": "deny",
             workflow_action: "allow",
-            skill: "allow",
+            skill: {
+              "*": "deny",
+              "project-workflow-context-warmup": "allow",
+            },
             read: "allow",
           }),
           user,
