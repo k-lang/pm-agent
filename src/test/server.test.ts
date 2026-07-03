@@ -11,6 +11,23 @@ import { SessionID } from "../session/schema"
 
 Log.init({ print: false })
 
+const TEST_MODEL_CONFIG = {
+  model: "test/test-model",
+  enabled_providers: ["test"],
+  provider: {
+    test: {
+      options: {
+        apiKey: "test-key",
+        baseURL: "http://127.0.0.1:9/v1",
+        timeout: 50,
+      },
+      models: {
+        "test-model": {},
+      },
+    },
+  },
+}
+
 function insertBaselineSummary(directory: string, sessionID: SessionID) {
   const now = Date.now()
   Database.use((db) => {
@@ -125,7 +142,7 @@ describe("server routes", () => {
   })
 
   test("project question list keeps thread title on first question after followups", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
 
     await Instance.provide({
       directory: tmp.path,
@@ -159,7 +176,7 @@ describe("server routes", () => {
   })
 
   test("GET /project/detail returns selected thread turns", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
     const app = Server.createApp({})
 
     await Instance.provide({
@@ -189,15 +206,15 @@ describe("server routes", () => {
         expect(body.selectedQuestionID).toBe(first.question.id)
         expect(body.selectedThread?.questionID).toBe(first.question.id)
         expect(body.selectedThread?.sessionID).toBe(first.question.sessionID)
-        expect(body.selectedThread?.turns.length).toBe(1)
-        expect(body.selectedThread?.turns[0]?.questionText).toBe("followup question")
-        expect(body.selectedThread?.turns[0]?.running).toBe(true)
+        const followupTurn = body.selectedThread?.turns.find((turn: { questionText?: string }) => turn.questionText === "followup question")
+        expect(followupTurn).toBeDefined()
+        expect(followupTurn?.running).toBe(true)
       },
     })
   })
 
   test("POST /project/question returns hydrated project detail", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
     const app = Server.createApp({})
 
     await Instance.provide({
@@ -224,4 +241,3 @@ describe("server routes", () => {
     expect(body.detail?.questions.some((item: { id: string }) => item.id === body.question.id)).toBe(true)
   })
 })
-

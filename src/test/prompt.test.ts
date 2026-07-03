@@ -11,6 +11,22 @@ import { tmpdir } from "./fixture/fixture"
 
 Log.init({ print: false })
 
+const TEST_MODEL_CONFIG = {
+  model: "test/test-model",
+  enabled_providers: ["test"],
+  provider: {
+    test: {
+      options: {
+        apiKey: "test-key",
+        baseURL: "http://127.0.0.1:9/v1",
+      },
+      models: {
+        "test-model": {},
+      },
+    },
+  },
+}
+
 describe("session.prompt missing file", () => {
   test("does not fail the prompt when a file part is missing", async () => {
     await using tmp = await tmpdir({
@@ -112,6 +128,7 @@ describe("session.prompt special characters", () => {
   test("handles filenames with # character", async () => {
     await using tmp = await tmpdir({
       git: true,
+      config: TEST_MODEL_CONFIG,
       init: async (dir) => {
         await Bun.write(path.join(dir, "file#name.txt"), "special content\n")
       },

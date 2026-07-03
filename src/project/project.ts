@@ -95,6 +95,7 @@ export namespace Project {
           cwd: sandbox,
         })
           .then(async (result) => {
+            if (result.exitCode !== 0) return undefined
             const common = gitpath(sandbox, await result.text())
             // Avoid going to parent of sandbox when git-common-dir is empty.
             return common === sandbox ? sandbox : path.dirname(common)
@@ -103,9 +104,9 @@ export namespace Project {
 
         if (!worktree) {
           return {
-            id: id ?? ProjectID.global,
-            worktree: sandbox,
-            sandbox,
+            id: ProjectID.global,
+            worktree: "/",
+            sandbox: "/",
           }
         }
 
@@ -121,13 +122,14 @@ export namespace Project {
           const roots = await git(["rev-list", "--max-parents=0", "HEAD"], {
             cwd: sandbox,
           })
-            .then(async (result) =>
-              (await result.text())
+            .then(async (result) => {
+              if (result.exitCode !== 0) return undefined
+              return (await result.text())
                 .split("\n")
                 .filter(Boolean)
                 .map((x) => x.trim())
-                .toSorted(),
-            )
+                .toSorted()
+            })
             .catch(() => undefined)
 
           if (!roots) {
@@ -156,7 +158,10 @@ export namespace Project {
         const top = await git(["rev-parse", "--show-toplevel"], {
           cwd: sandbox,
         })
-          .then(async (result) => gitpath(sandbox, await result.text()))
+          .then(async (result) => {
+            if (result.exitCode !== 0) return undefined
+            return gitpath(sandbox, await result.text())
+          })
           .catch(() => undefined)
 
         if (!top) {

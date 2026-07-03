@@ -542,7 +542,7 @@ describe("session.llm.stream", () => {
     }
 
     const providerID = "anthropic"
-    const modelID = "claude-3-5-sonnet-20241022"
+    const modelID = "claude-sonnet-4-5"
     const fixture = await loadFixture(providerID, modelID)
     const provider = fixture.provider
     const model = fixture.model
@@ -594,6 +594,9 @@ describe("session.llm.stream", () => {
             enabled_providers: [providerID],
             provider: {
               [providerID]: {
+                npm: provider.npm,
+                api: provider.api,
+                whitelist: [modelID],
                 options: {
                   apiKey: "test-anthropic-key",
                   baseURL: `${server.url.origin}/v1`,

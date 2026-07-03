@@ -123,6 +123,10 @@ function projectStatePath(directory: string) {
   return path.join(directory, "metadata", "project_state.json")
 }
 
+function projectReadmeTemplatePath() {
+  return path.join(import.meta.dirname, "../../project/template/project-readme.md")
+}
+
 function sourceRegistryPath(directory: string) {
   return path.join(directory, "metadata", "source_resources.json")
 }
@@ -177,9 +181,17 @@ async function ensureProjectStructure(directory: string) {
     "workflows",
     "changes",
     "snapshots",
+    "descriptions_output/description_summary",
+    "descriptions_output/history",
     "report_output",
   ]
   await Promise.all(dirs.map((dir) => fs.mkdir(path.join(directory, dir), { recursive: true })))
+  const readmePath = path.join(directory, "README.md")
+  const exists = await fs.stat(readmePath).then(() => true).catch(() => false)
+  if (!exists) {
+    const template = await fs.readFile(projectReadmeTemplatePath(), "utf8")
+    await fs.writeFile(readmePath, template.endsWith("\n") ? template : `${template}\n`, "utf8")
+  }
 }
 
 async function createInitialWorkflow(directory: string, background: string | undefined, now: number) {

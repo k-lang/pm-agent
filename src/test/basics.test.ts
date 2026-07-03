@@ -32,7 +32,8 @@ describe("Filesystem", () => {
 describe("Glob", () => {
   test("scan finds files matching pattern", async () => {
     const { Glob } = await import("../util/glob")
-    const files = await Glob.scan("**/*.ts", { cwd: "/workspace/pm-agent/src/util", absolute: true, include: "file" })
+    const utilDir = path.join(import.meta.dirname, "../util")
+    const files = await Glob.scan("**/*.ts", { cwd: utilDir, absolute: true, include: "file" })
     expect(files.length).toBeGreaterThan(0)
     expect(files.every((f) => f.endsWith(".ts"))).toBe(true)
   })

@@ -1,6 +1,7 @@
 node_modules/
 .claude/
 *.md
+!src/project/template/project-readme.md
 *.db
 *.sqlite
 *.sqlite3
