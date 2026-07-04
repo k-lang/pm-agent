@@ -29,6 +29,7 @@ export namespace ProjectWorkflow {
     "追加消息",
     "登记资源",
     "更新工作笔记",
+    "同步工作笔记变更",
     "检查笔记充分性",
     "生成图操作草案",
     "校验图操作",
@@ -137,6 +138,14 @@ export namespace ProjectWorkflow {
   const NotePayload = z.object({
     content: z.string(),
     summary: z.string().optional(),
+    source: z.enum(["llm_draft", "manual_import", "manual_edit", "llm_revision"]).optional(),
+    sourcePath: z.string().optional(),
+  })
+
+  const NoteSyncPayload = z.object({
+    summary: z.string().optional(),
+    source: z.enum(["llm_draft", "manual_import", "manual_edit", "llm_revision"]).optional(),
+    sourcePath: z.string().optional(),
   })
 
   const OperationsPayload = z.object({
@@ -325,14 +334,18 @@ export namespace ProjectWorkflow {
     const availableActions: { action: Action; reason: string; requiresUserConfirmation?: boolean }[] = [
       { action: "追加消息", reason: "继续记录用户输入、模型回应或审核意见。" },
       { action: "登记资源", reason: "登记上传附件或项目资源，供工作笔记引用。" },
-      { action: "更新工作笔记", reason: "创建或修订 note.md；用户可随时回到笔记层。" },
       { action: "提出修订意见", reason: "记录用户对工作笔记、图操作或两者的审核意见。" },
       { action: "放弃草案", reason: "清空当前 active 草案。", requiresUserConfirmation: true },
     ]
     const blockedActions: { action: Action; reason: string }[] = []
 
-    if (artifacts.note) availableActions.push({ action: "检查笔记充分性", reason: "判断当前工作笔记是否足以支撑图操作生成。" })
-    else blockedActions.push({ action: "检查笔记充分性", reason: "尚未生成工作笔记。" })
+    if (artifacts.note) {
+      availableActions.push({ action: "同步工作笔记变更", reason: "note.md 已由人工导入或原版编辑工具更新后，同步状态并清理过期下游产物。" })
+      availableActions.push({ action: "检查笔记充分性", reason: "判断当前工作笔记是否足以支撑图操作生成。" })
+    } else {
+      blockedActions.push({ action: "同步工作笔记变更", reason: "尚未生成工作笔记，无法同步笔记变更。" })
+      blockedActions.push({ action: "检查笔记充分性", reason: "尚未生成工作笔记。" })
+    }
 
     if (artifacts.note) availableActions.push({ action: "生成图操作草案", reason: "基于当前工作笔记和审核意见生成或重生成 operations.json。" })
     else blockedActions.push({ action: "生成图操作草案", reason: "尚未生成工作笔记。" })
@@ -363,6 +376,7 @@ export namespace ProjectWorkflow {
       throw new Error(`当前草案处于终态「${state.stage}」，不能执行「${action}」。`)
     }
     const artifacts = await artifactStatus(directory, state)
+    if (action === "同步工作笔记变更" && !artifacts.note) throw new Error("尚未生成工作笔记，不能同步工作笔记变更。")
     if (action === "检查笔记充分性" && !artifacts.note) throw new Error("尚未生成工作笔记，不能检查笔记充分性。")
     if (action === "生成图操作草案" && !artifacts.note) throw new Error("尚未生成工作笔记，不能生成图操作草案。")
     if (action === "校验图操作" && !artifacts.operations) throw new Error("尚未生成图操作草案，不能校验。")
@@ -470,7 +484,7 @@ export namespace ProjectWorkflow {
       await fs.writeFile(artifactPath(directory, state, "note"), carry.note.trimEnd() + "\n", "utf8")
       state = transition(
         state,
-        "更新工作笔记",
+        "同步工作笔记变更",
         "笔记已生成",
         "重新预热后沿用上一版工作笔记，已清空图操作草案、校验和预览。",
       )
@@ -571,12 +585,40 @@ export namespace ProjectWorkflow {
       await fs.writeFile(artifactPath(directory, state, "note"), payload.content.trimEnd() + "\n", "utf8")
       await Promise.all([
         fs.rm(artifactPath(directory, state, "noteReview"), { force: true }),
+        fs.rm(artifactPath(directory, state, "operations"), { force: true }),
         fs.rm(artifactPath(directory, state, "validation"), { force: true }),
         fs.rm(artifactPath(directory, state, "preview"), { force: true }),
       ])
-      const next = transition(state, "更新工作笔记", "笔记已生成", payload.summary || "创建或修订工作笔记。")
+      const sourceSummary = payload.source
+        ? `来源：${payload.source}${payload.sourcePath ? ` (${payload.sourcePath})` : ""}。`
+        : ""
+      const next = transition(state, "更新工作笔记", "笔记已生成", payload.summary || `${sourceSummary}创建或修订工作笔记。`)
       await writeState(directory, next)
-      return ok(project, directory, next, "已更新工作笔记。", { notePath: next.artifacts.note })
+      return ok(project, directory, next, "已更新工作笔记。", {
+        notePath: next.artifacts.note,
+        source: payload.source,
+        sourcePath: payload.sourcePath,
+      })
+    }
+
+    if (request.action === "同步工作笔记变更") {
+      const payload = NoteSyncPayload.parse(request.payload)
+      await Promise.all([
+        fs.rm(artifactPath(directory, state, "noteReview"), { force: true }),
+        fs.rm(artifactPath(directory, state, "operations"), { force: true }),
+        fs.rm(artifactPath(directory, state, "validation"), { force: true }),
+        fs.rm(artifactPath(directory, state, "preview"), { force: true }),
+      ])
+      const sourceSummary = payload.source
+        ? `来源：${payload.source}${payload.sourcePath ? ` (${payload.sourcePath})` : ""}。`
+        : ""
+      const next = transition(state, "同步工作笔记变更", "笔记已生成", payload.summary || `${sourceSummary}工作笔记已更新，下游图操作草案已清空。`)
+      await writeState(directory, next)
+      return ok(project, directory, next, "已同步工作笔记变更。", {
+        notePath: next.artifacts.note,
+        source: payload.source,
+        sourcePath: payload.sourcePath,
+      })
     }
 
     if (request.action === "检查笔记充分性") {

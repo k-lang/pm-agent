@@ -24,11 +24,8 @@
 
     <main id="layout">
       <section id="workspace-panel" class="panel">
-        <div class="panel-header">
-          <div>
-            <h2>推进材料</h2>
-            <p id="workspace-subtitle">等待选择项目</p>
-          </div>
+        <div class="workspace-topline">
+          <div id="workspace-subtitle">等待选择项目</div>
           <div id="project-status"></div>
         </div>
         <div id="workspace-tabs">
@@ -41,8 +38,7 @@
           <section id="graph-tab" class="workspace-tab active" data-tab-panel="graph">
             <div class="preview-main">
               <div class="preview-header">
-                <h3>图谱预览</h3>
-                <p>后续展示当前图谱和草案变更，高亮新增/更新节点与边。</p>
+                <h3>图谱预览 <span>展示当前图谱和草案变更</span></h3>
               </div>
               <div id="graph-preview" class="preview-content">
                 <div class="placeholder">等待图谱草案。</div>
@@ -50,13 +46,10 @@
             </div>
             <aside class="side-index">
               <div class="side-header">
-                <h3>图操作索引</h3>
-                <p>自然语言展示将要写入图数据的操作。</p>
+                <h3>图操作索引 <span>自然语言展示图操作</span></h3>
               </div>
               <div id="operation-list" class="side-list"></div>
               <div id="operation-actions">
-                <button id="btn-save-draft" type="button" class="btn-secondary" disabled>保存草案</button>
-                <button id="btn-validate" type="button" class="btn-secondary" disabled>校验</button>
                 <button id="btn-apply" type="button" class="btn-primary-action">确认提交图操作</button>
                 <button id="btn-discard-workflow" type="button" class="btn-danger">放弃本轮草案</button>
               </div>
@@ -66,8 +59,7 @@
           <section id="notes-tab" class="workspace-tab" data-tab-panel="notes">
             <div class="preview-main">
               <div class="preview-header">
-                <h3>工作笔记预览</h3>
-                <p>后续展示 AI 辅助生成或编辑后的本次工作笔记。</p>
+                <h3>工作笔记预览 <span>人工导入、人工修改或 AI 生成</span></h3>
               </div>
               <div id="note-preview" class="preview-content">
                 <div class="placeholder">等待生成工作笔记。</div>
@@ -75,8 +67,12 @@
             </div>
             <aside class="side-index">
               <div class="side-header">
-                <h3>历史工作笔记</h3>
-                <p>后续列出 notes 下的项目笔记。</p>
+                <h3>工作笔记 <span>可人工和 AI 混合维护</span></h3>
+              </div>
+              <div id="note-actions">
+                <button id="btn-import-note-file" type="button" class="btn-secondary">导入笔记</button>
+                <button id="btn-paste-note" type="button" class="btn-secondary">人工修改</button>
+                <input id="note-file" type="file" class="hidden" accept=".txt,.md,.markdown,text/plain,text/markdown">
               </div>
               <div id="note-list" class="side-list"></div>
             </aside>
@@ -85,8 +81,7 @@
           <section id="resources-tab" class="workspace-tab" data-tab-panel="resources">
             <div class="preview-main">
               <div class="preview-header">
-                <h3>资源文档预览</h3>
-                <p>后续预览架构设计、需求文档、会议纪要等项目资源。</p>
+                <h3>资源文档预览 <span>预览项目资源</span></h3>
               </div>
               <div id="resource-preview" class="preview-content">
                 <div class="placeholder">等待选择项目资源文档。</div>
@@ -94,8 +89,7 @@
             </div>
             <aside class="side-index">
               <div class="side-header">
-                <h3>资源文档</h3>
-                <p>上传附件到 source；当前只预览 txt 和 markdown。</p>
+                <h3>资源文档 <span>上传到 source</span></h3>
               </div>
               <div id="resource-actions">
                 <button id="btn-upload-resource" type="button" class="btn-secondary">上传资源</button>
@@ -107,19 +101,20 @@
         </div>
       </section>
 
+      <div id="layout-resizer" role="separator" aria-label="调整推进材料和对话区域高度" aria-orientation="horizontal" tabindex="0"></div>
+
       <section id="chat-panel" class="panel">
         <div class="panel-header compact">
           <div>
-            <h2>推进对话</h2>
-            <p>和大模型沟通项目背景、工作笔记、图数据更新和项目资源引用。</p>
+            <h2>推进对话 <span>沟通背景、笔记和图数据更新</span></h2>
           </div>
           <div class="chat-actions">
             <button id="btn-warmup" type="button" class="btn-secondary hidden">项目上下文预热</button>
           </div>
         </div>
         <div id="chat-log">
-          <div class="placeholder">新建项目后，先在这里描述项目背景；下一步将接入项目初始化 Skill。</div>
         </div>
+        <div id="chat-hint"></div>
         <div id="chat-composer">
           <textarea id="chat-input" rows="3" placeholder="后续这里输入补充信息或修改意见" disabled></textarea>
           <button id="btn-chat-send" type="button" disabled>发送</button>
@@ -146,6 +141,45 @@
     </section>
   </div>
 
-  <script src="/web/project-workflow.js"></script>
+  <div id="note-import-modal" class="modal hidden">
+    <section class="modal-card note-modal-card">
+      <div class="modal-header">
+        <div>
+          <h2>人工修改工作笔记</h2>
+          <p>可以直接粘贴新笔记，也可以在当前笔记基础上修改；保存后会清空旧图操作、校验和预览，之后仍可让 AI 继续修改。</p>
+        </div>
+      </div>
+      <label for="note-import-title">标题</label>
+      <input id="note-import-title" type="text" placeholder="可选，例如：本轮推进笔记">
+      <label for="note-import-content">笔记内容</label>
+      <textarea id="note-import-content" rows="12" placeholder="编辑 markdown 或纯文本工作笔记"></textarea>
+      <div id="note-import-error" class="modal-error hidden"></div>
+      <div class="modal-actions">
+        <button id="btn-cancel-note-import" type="button" class="btn-secondary">取消</button>
+        <button id="btn-confirm-note-import" type="button">保存修改</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="permission-review-modal" class="modal hidden">
+    <section class="modal-card permission-modal-card">
+      <div class="modal-header permission-modal-header">
+        <div>
+          <h2 id="permission-review-title">工作笔记修改审核</h2>
+          <p id="permission-review-file">workflows/active/note.md</p>
+        </div>
+        <span id="permission-review-status" class="permission-status">待审核</span>
+      </div>
+      <pre id="permission-review-diff" class="permission-review-diff"></pre>
+      <div id="permission-review-error" class="modal-error hidden"></div>
+      <div class="modal-actions">
+        <button id="btn-close-permission-review" type="button" class="btn-secondary">关闭</button>
+        <button id="btn-reject-permission-review" type="button" class="btn-danger">拒绝</button>
+        <button id="btn-approve-permission-review" type="button">允许本次修改</button>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="/web/project-workflow.js"></script>
 </body>
 </html>

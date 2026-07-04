@@ -70,6 +70,18 @@ const WorkflowWarmupInput = z.object({
   force: z.boolean().default(false),
 })
 
+const WorkflowNoteImportInput = z.object({
+  content: z.string().min(1),
+  title: z.string().optional(),
+})
+
+const WorkflowNote = z.object({
+  exists: z.boolean(),
+  content: z.string(),
+  path: z.string().optional(),
+  workflow: ProjectWorkflow.ActionResult,
+})
+
 const GraphView = z.enum(["collapsed", "expanded"]).default("collapsed")
 
 const GraphQuery = z.object({
@@ -364,6 +376,20 @@ async function listSourceResources(project: string) {
   return resources
 }
 
+async function deleteSourceResource(project: string, relativePath: string) {
+  const { directory, resolved, projectRelativePath, sourceRelativePath } = resolveSourcePath(project, relativePath)
+  await ensureExistingProject(directory)
+  if (!sourceRelativePath) badRequest("Source file path is required")
+  const stats = await fs.stat(resolved).catch(() => undefined)
+  if (!stats || !stats.isFile()) badRequest("Source file not found")
+  await fs.unlink(resolved)
+  const registry = await readSourceRegistry(directory)
+  await writeSourceRegistry(directory, {
+    resources: registry.resources.filter((resource) => resource.path !== projectRelativePath),
+  })
+  return { ok: true, path: projectRelativePath }
+}
+
 function contentTypeForPath(filePath: string) {
   const ext = path.extname(filePath).toLowerCase()
   if (ext === ".json") return "application/json"
@@ -442,6 +468,100 @@ async function previewSourceResource(project: string, relativePath: string) {
     type: "text" as const,
     content,
   }
+}
+
+async function readWorkflowNote(project: string) {
+  const directory = projectDirectoryForName(project)
+  await ensureExistingProject(directory)
+  const workflow = await ProjectWorkflow.getActive({ project, directory })
+  const artifacts = await ProjectWorkflow.readActiveArtifacts({ project, directory })
+  return WorkflowNote.parse({
+    exists: !!artifacts.note,
+    content: artifacts.note ?? "",
+    path: artifacts.note ? "workflows/active/note.md" : undefined,
+    workflow,
+  })
+}
+
+async function importWorkflowNote(input: {
+  project: string
+  content: string
+  title?: string
+  sourcePath?: string
+  sourceName?: string
+}) {
+  const directory = projectDirectoryForName(input.project)
+  await ensureExistingProject(directory)
+  await ProjectWorkflow.runAction({ project: input.project, directory, action: "开始或恢复", payload: {} })
+  if (input.sourcePath) {
+    await ProjectWorkflow.runAction({
+      project: input.project,
+      directory,
+      action: "登记资源",
+      payload: {
+        path: input.sourcePath,
+        title: input.sourceName ?? input.title ?? input.sourcePath,
+        note: "人工导入工作笔记时保留的原始文件。",
+      },
+    })
+  }
+  const workflow = await ProjectWorkflow.runAction({
+    project: input.project,
+    directory,
+    action: "更新工作笔记",
+    payload: {
+      content: input.content,
+      summary: input.sourcePath ? `人工导入工作笔记：${input.sourceName ?? input.sourcePath}` : "人工修改工作笔记。",
+      source: input.sourcePath ? "manual_import" : "manual_edit",
+      sourcePath: input.sourcePath,
+    },
+  })
+  return WorkflowNote.parse({
+    exists: true,
+    content: input.content.trimEnd() + "\n",
+    path: "workflows/active/note.md",
+    workflow,
+  })
+}
+
+async function importWorkflowNoteFromFile(project: string, file: File) {
+  if (!isPreviewableSourcePath(file.name)) badRequest("工作笔记导入只支持 .txt、.md、.markdown 文件")
+  const maxBytes = 1024 * 1024
+  const buffer = Buffer.from(await file.arrayBuffer())
+  if (buffer.byteLength > maxBytes) badRequest("工作笔记文件不能超过 1MB")
+  const content = buffer.toString("utf8")
+  if (!content.trim()) badRequest("工作笔记内容不能为空")
+
+  const target = await uniqueSourceFilePath(project, file.name)
+  await fs.mkdir(target.sourceRoot, { recursive: true })
+  await fs.writeFile(target.resolved, buffer)
+
+  const now = new Date().toISOString()
+  const resource = SourceResource.parse({
+    id: ulid(),
+    name: path.basename(target.resolved),
+    originalName: file.name,
+    path: target.projectRelativePath,
+    size: buffer.byteLength,
+    mimeType: file.type || contentTypeForPath(target.resolved),
+    uploadedAt: now,
+    previewable: true,
+  })
+  const registry = await readSourceRegistry(target.directory)
+  await writeSourceRegistry(target.directory, {
+    resources: [
+      resource,
+      ...registry.resources.filter((item) => item.path !== resource.path),
+    ],
+  })
+
+  return importWorkflowNote({
+    project,
+    content,
+    title: file.name,
+    sourcePath: resource.path,
+    sourceName: resource.originalName,
+  })
 }
 
 function visibleMessageText(message: MessageV2.WithParts) {
@@ -757,6 +877,47 @@ export const ProjectRoutes = lazy(() =>
       },
     )
     .get(
+      "/workflow/note",
+      describeRoute({
+        summary: "Get active workflow note",
+        operationId: "project.workflowNote",
+        responses: {
+          200: { description: "Active workflow note", content: { "application/json": { schema: resolver(WorkflowNote) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      async (c) => c.json(await readWorkflowNote(c.req.valid("query").project)),
+    )
+    .post(
+      "/workflow/note/import",
+      describeRoute({
+        summary: "Import active workflow note",
+        operationId: "project.workflowNoteImport",
+        responses: {
+          200: { description: "Imported workflow note", content: { "application/json": { schema: resolver(WorkflowNote) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      async (c) => {
+        const { project } = c.req.valid("query")
+        const contentType = c.req.header("content-type") || ""
+        if (contentType.includes("multipart/form-data")) {
+          const body = await c.req.parseBody({ all: true })
+          const file = Array.isArray(body.file) ? body.file[0] : body.file
+          if (!(file instanceof File)) badRequest("Upload field 'file' is required")
+          return c.json(await importWorkflowNoteFromFile(project, file))
+        }
+        const input = WorkflowNoteImportInput.parse(await c.req.json())
+        return c.json(await importWorkflowNote({
+          project,
+          content: input.content,
+          title: input.title,
+        }))
+      },
+    )
+    .get(
       "/source",
       describeRoute({
         summary: "List project source resources",
@@ -823,6 +984,22 @@ export const ProjectRoutes = lazy(() =>
         }).catch(() => undefined)
 
         return c.json(resource)
+      },
+    )
+    .delete(
+      "/source",
+      describeRoute({
+        summary: "Delete project source resource",
+        operationId: "project.sourceDelete",
+        responses: {
+          200: { description: "Deleted project source resource", content: { "application/json": { schema: resolver(z.object({ ok: z.boolean(), path: z.string() })) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectSourceQuery),
+      async (c) => {
+        const query = c.req.valid("query")
+        return c.json(await deleteSourceResource(query.project, query.path))
       },
     )
     .get(

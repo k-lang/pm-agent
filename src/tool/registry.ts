@@ -172,6 +172,7 @@ export namespace ToolRegistry {
                 // use apply tool in same format as codex
                 const usePatch =
                   model.modelID.includes("gpt-") && !model.modelID.includes("oss") && !model.modelID.includes("gpt-4")
+                if (agent?.name === "project_workflow" && (tool.id === "apply_patch" || tool.id === "edit" || tool.id === "write")) return true
                 if (tool.id === "apply_patch") return usePatch
                 if (tool.id === "edit" || tool.id === "write") return !usePatch
                 if (tool.id === "workflow_action") return agent?.name === "project_workflow"

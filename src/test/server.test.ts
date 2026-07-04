@@ -1,4 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test"
+import fs from "fs/promises"
+import path from "path"
 import { Instance } from "../project/instance"
 import { Server } from "../server/server"
 import { tmpdir } from "./fixture/fixture"
@@ -239,5 +241,188 @@ describe("server routes", () => {
     expect(body.detail?.selectedThread?.questionID).toBe(body.question.id)
     expect(body.detail?.selectedThread?.turns[0]?.questionText).toBe("fresh question")
     expect(body.detail?.questions.some((item: { id: string }) => item.id === body.question.id)).toBe(true)
+  })
+
+  test("POST /project/workflow/note/import stores manual note and invalidates stale workflow artifacts", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      const activeDir = path.join(projectDir, "workflows", "active")
+      await fs.mkdir(activeDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+
+      const first = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "first note", title: "manual" }),
+      }))
+      expect(first.status).toBe(200)
+      const firstBody = await first.json()
+      expect(firstBody).toMatchObject({ exists: true, content: "first note\n", path: "workflows/active/note.md" })
+      await fs.writeFile(path.join(activeDir, "operations.json"), "{}\n", "utf8")
+      await fs.writeFile(path.join(activeDir, "validation.json"), "{}\n", "utf8")
+      await fs.writeFile(path.join(activeDir, "preview.json"), "{}\n", "utf8")
+
+      const second = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "second note" }),
+      }))
+      expect(second.status).toBe(200)
+      const secondBody = await second.json()
+      expect(secondBody).toMatchObject({ exists: true, content: "second note\n" })
+      await expect(fs.readFile(path.join(activeDir, "note.md"), "utf8")).resolves.toBe("second note\n")
+      await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
+      await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
+      await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("POST /project/workflow/note/import accepts markdown file and registers source resource", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      const form = new FormData()
+      form.append("file", new File(["# Imported\n\nbody\n"], "note.md", { type: "text/markdown" }))
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
+        method: "POST",
+        body: form,
+      }))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body).toMatchObject({ exists: true, content: "# Imported\n\nbody\n", path: "workflows/active/note.md" })
+      await expect(fs.readFile(path.join(projectDir, "workflows", "active", "note.md"), "utf8")).resolves.toBe("# Imported\n\nbody\n")
+      const registry = JSON.parse(await fs.readFile(path.join(projectDir, "metadata", "source_resources.json"), "utf8"))
+      expect(registry.resources).toHaveLength(1)
+      expect(registry.resources[0]).toMatchObject({
+        originalName: "note.md",
+        path: "source/note.md",
+        previewable: true,
+      })
+      await expect(fs.readFile(path.join(projectDir, "source", "note.md"), "utf8")).resolves.toBe("# Imported\n\nbody\n")
+      const resourcesRaw = await fs.readFile(path.join(projectDir, "workflows", "active", "resources.json"), "utf8")
+      expect(resourcesRaw).toContain("source/note.md")
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("POST /project/workflow/note/import rejects non-text note files", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      const form = new FormData()
+      form.append("file", new File(["binary"], "note.pdf", { type: "application/pdf" }))
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
+        method: "POST",
+        body: form,
+      }))
+      expect(res.status).toBe(400)
+      await expect(fs.stat(path.join(projectDir, "workflows", "active", "note.md"))).rejects.toThrow()
+      await expect(fs.stat(path.join(projectDir, "source", "note.pdf"))).rejects.toThrow()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("DELETE /project/source removes source file and registry entry", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      const sourceDir = path.join(projectDir, "source")
+      const metadataDir = path.join(projectDir, "metadata")
+      await fs.mkdir(sourceDir, { recursive: true })
+      await fs.mkdir(metadataDir, { recursive: true })
+      await fs.writeFile(path.join(sourceDir, "keep.md"), "keep\n", "utf8")
+      await fs.writeFile(path.join(sourceDir, "delete.md"), "delete\n", "utf8")
+      await fs.writeFile(
+        path.join(metadataDir, "source_resources.json"),
+        JSON.stringify({
+          resources: [
+            {
+              id: "res_keep",
+              name: "keep.md",
+              originalName: "keep.md",
+              path: "source/keep.md",
+              size: 5,
+              uploadedAt: "2026-01-01T00:00:00.000Z",
+              previewable: true,
+            },
+            {
+              id: "res_delete",
+              name: "delete.md",
+              originalName: "delete.md",
+              path: "source/delete.md",
+              size: 7,
+              uploadedAt: "2026-01-02T00:00:00.000Z",
+              previewable: true,
+            },
+          ],
+        }),
+        "utf8",
+      )
+
+      const res = await app.fetch(
+        new Request("http://localhost/project/source?project=demo&path=source%2Fdelete.md", {
+          method: "DELETE",
+        }),
+      )
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ ok: true, path: "source/delete.md" })
+      await expect(fs.stat(path.join(sourceDir, "delete.md"))).rejects.toThrow()
+      await expect(fs.readFile(path.join(sourceDir, "keep.md"), "utf8")).resolves.toBe("keep\n")
+
+      const registry = JSON.parse(await fs.readFile(path.join(metadataDir, "source_resources.json"), "utf8"))
+      expect(registry.resources.map((item: { path: string }) => item.path)).toEqual(["source/keep.md"])
+
+      const listRes = await app.fetch(new Request("http://localhost/project/source?project=demo"))
+      expect(listRes.status).toBe(200)
+      const list = await listRes.json()
+      expect(list.map((item: { path: string }) => item.path)).toEqual(["source/keep.md"])
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("DELETE /project/source rejects paths outside source directory", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "source"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "readme\n", "utf8")
+
+      const res = await app.fetch(
+        new Request("http://localhost/project/source?project=demo&path=source%2F..%2FREADME.md", {
+          method: "DELETE",
+        }),
+      )
+      expect(res.status).toBe(400)
+      await expect(fs.readFile(path.join(projectDir, "README.md"), "utf8")).resolves.toBe("readme\n")
+    } finally {
+      process.chdir(originalCwd)
+    }
   })
 })

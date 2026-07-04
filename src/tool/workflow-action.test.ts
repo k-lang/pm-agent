@@ -40,4 +40,14 @@ describe("workflow_action tool", () => {
       payload: { confirm: true },
     }, context("project_workflow"))).rejects.toThrow("必须由工作推进页的专用确认按钮触发")
   })
+
+  test("does not allow chat to write full note content through workflow_action", async () => {
+    const tool = await WorkflowActionTool.init()
+
+    await expect(tool.execute({
+      project: "demo",
+      action: "更新工作笔记",
+      payload: { content: "完整工作笔记内容" },
+    }, context("project_workflow"))).rejects.toThrow("不能通过聊天工具执行")
+  })
 })

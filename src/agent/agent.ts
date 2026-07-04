@@ -214,6 +214,10 @@ export namespace Agent {
           Permission.fromConfig({
             "*": "deny",
             workflow_action: "allow",
+            edit: {
+              "*": "deny",
+              [path.relative(Instance.worktree, path.join(Instance.directory, "workflows", "active", "note.md")).replaceAll("\\", "/")]: "ask",
+            },
             skill: {
               "*": "deny",
               "project-workflow-context-warmup": "allow",

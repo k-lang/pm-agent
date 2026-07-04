@@ -19,7 +19,8 @@ const DESCRIPTION = `
 - 放弃草案：仅当用户明确要求放弃时调用，清空 active 草案。
 - 追加消息：记录用户或助手消息。payload: { "role": "用户|助手|系统", "text": "..." }
 - 登记资源：登记已上传或可引用资源。payload: { "path": "...", "title": "...", "note": "..." }
-- 更新工作笔记：保存 note.md。payload: { "content": "...", "summary": "..." }
+- 同步工作笔记变更：在 note.md 已通过人工导入或原版 write/edit/apply_patch 创建或更新后，同步状态并清空旧图操作草案、校验和预览。payload: { "summary": "...", "source": "llm_draft|manual_import|manual_edit|llm_revision" }
+- 更新工作笔记：仅供页面人工导入/人工修改接口直接调用；聊天工具不能执行该动作，避免大模型把整篇 note.md 作为 tool input 传入。
 - 检查笔记充分性：判断 note.md 是否足以支撑图操作。payload: { "sufficient": true|false, "blockingQuestions": [], "missingFields": [], "summary": "..." }
 - 生成图操作草案：保存 operations.json。payload 可提供完整 command，或 operations/change_id/description/history_descriptions。
 - 校验图操作：执行图引擎基础校验和语义布局校验。
@@ -31,6 +32,7 @@ const DESCRIPTION = `
 `.trim()
 
 const UI_ONLY_ACTIONS = new Set<ProjectWorkflow.Action>(["放弃草案", "应用图操作"])
+const NON_CHAT_ACTIONS = new Set<ProjectWorkflow.Action>(["更新工作笔记"])
 
 export const WorkflowActionTool = Tool.define("workflow_action", {
   description: DESCRIPTION,
@@ -41,6 +43,9 @@ export const WorkflowActionTool = Tool.define("workflow_action", {
     }
     if (UI_ONLY_ACTIONS.has(args.action)) {
       throw new Error(`「${args.action}」不能通过聊天工具执行，必须由工作推进页的专用确认按钮触发。`)
+    }
+    if (NON_CHAT_ACTIONS.has(args.action)) {
+      throw new Error(`「${args.action}」不能通过聊天工具执行。请使用原版 write/edit/apply_patch 创建或修改 note.md 后，再调用「同步工作笔记变更」。`)
     }
     const result = await ProjectWorkflow.runAction(args)
     return {

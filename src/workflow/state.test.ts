@@ -47,7 +47,7 @@ describe("ProjectWorkflow", () => {
     await replayStepsBefore(18)
     const started = await action("开始或恢复")
     expect(started.stage).toBe("收集材料")
-    expect(started.availableActions.map((item) => item.action)).toContain("更新工作笔记")
+    expect(started.blockedActions.map((item) => item.action)).toContain("同步工作笔记变更")
     expect(started.blockedActions.map((item) => item.action)).toContain("生成图操作草案")
     expect(started.recommendations.join("\n")).toContain("工作笔记")
 
@@ -136,7 +136,7 @@ describe("ProjectWorkflow", () => {
     expect(validated.data?.validation).toMatchObject({ passed: false })
     expect(validated.recommendations.join("\n")).toContain("修订图操作")
     expect(validated.availableActions.map((item) => item.action)).toContain("生成图操作草案")
-    expect(validated.availableActions.map((item) => item.action)).toContain("更新工作笔记")
+    expect(validated.availableActions.map((item) => item.action)).toContain("同步工作笔记变更")
   })
 
   test("uses jiedaidan step19 multi-source plan material for operations-only review feedback", async () => {
@@ -185,6 +185,67 @@ describe("ProjectWorkflow", () => {
     await expect(fs.stat(path.join(directory, "workflows", "active", "operations.json"))).resolves.toBeTruthy()
     await expect(fs.stat(path.join(directory, "workflows", "active", "validation.json"))).rejects.toThrow()
     await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
+  })
+
+  test("updating note invalidates graph operation draft and downstream artifacts", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+      source: "manual_import",
+      sourcePath: "source/knowledge_entry_point.txt",
+    })
+    await action("生成图操作草案", { command: await readStepCommand(18) })
+    await action("校验图操作")
+    await action("生成预览")
+
+    const activeDir = path.join(directory, "workflows", "active")
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).resolves.toBeTruthy()
+
+    const updated = await action("更新工作笔记", {
+      content: `${await readOriginalNote("knowledge_entry_point.txt")}\n\n补充：人工修订后需要重生成图操作。\n`,
+      summary: "人工修订工作笔记，旧图操作草案过期。",
+      source: "manual_edit",
+    })
+
+    expect(updated.stage).toBe("笔记已生成")
+    await expect(fs.stat(path.join(activeDir, "note.md"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "note_review.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+  })
+
+  test("syncing an externally edited note invalidates graph operation draft without rewriting note content", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await action("生成图操作草案", { command: await readStepCommand(18) })
+    await action("校验图操作")
+    await action("生成预览")
+
+    const activeDir = path.join(directory, "workflows", "active")
+    const notePath = path.join(activeDir, "note.md")
+    const externallyEdited = `${await fs.readFile(notePath, "utf8")}\n补充：通过原版 edit 工具追加的事实。\n`
+    await fs.writeFile(notePath, externallyEdited, "utf8")
+
+    const synced = await action("同步工作笔记变更", {
+      summary: "原版 edit 修改工作笔记后同步状态。",
+      source: "llm_revision",
+    })
+
+    expect(synced.stage).toBe("笔记已生成")
+    await expect(fs.readFile(notePath, "utf8")).resolves.toBe(externallyEdited)
+    await expect(fs.stat(path.join(activeDir, "note_review.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
   })
 
   test("replacing active workflow for warmup carries note and resources but clears graph draft artifacts", async () => {
@@ -283,6 +344,46 @@ describe("ProjectWorkflow", () => {
     const restarted = await action("开始或恢复")
     expect(restarted.stage).toBe("收集材料")
     expect(restarted.data).toMatchObject({ restored: false })
+  })
+
+  test("discard removes the forked workflow chat session but keeps the warmup baseline session", async () => {
+    const { Instance } = await import("@/project/instance")
+    const { Session } = await import("@/session")
+    let warmupSessionID = ""
+    let workflowChatSessionID = ""
+
+    await Instance.provide({
+      directory,
+      fn: async () => {
+        const warmup = await Session.create({ title: "工作推进上下文预热" })
+        const chat = await Session.fork({ sessionID: warmup.id })
+        warmupSessionID = warmup.id
+        workflowChatSessionID = chat.id
+
+        await action("开始或恢复")
+        await ProjectWorkflow.bindSessions({
+          project: "demo",
+          directory,
+          sessionID: workflowChatSessionID,
+          warmupSessionID,
+          warmupStatus: "completed",
+        })
+
+        await action("放弃草案")
+      },
+    })
+
+    await Instance.provide({
+      directory,
+      fn: async () => {
+        await expect(Session.get(workflowChatSessionID as any)).rejects.toThrow()
+        await expect(Session.get(warmupSessionID as any)).resolves.toMatchObject({
+          id: warmupSessionID,
+          title: "工作推进上下文预热",
+        })
+        await Session.remove(warmupSessionID as any)
+      },
+    })
   })
 
   test("dedicated apply action is guarded before and after preview generation", async () => {

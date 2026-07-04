@@ -1,8 +1,27 @@
+import {
+  allWorkflowDiffRecords as collectWorkflowDiffRecords,
+  esc,
+  markWorkflowPermissionRecord as markWorkflowPermissionRecords,
+  mergeWorkflowPermissionRecords as mergeWorkflowPermissionRecordList,
+  permissionListUrl,
+  permissionReplyUrl,
+  renderResourceItem,
+  renderWorkflowToolPart,
+  resetWorkflowViewState,
+  upsertWorkflowPermissionRecord as upsertWorkflowPermissionRecordList,
+  workflowPermissionDiff,
+  workflowPermissionFile,
+  workflowPermissionStatusText,
+  workflowPermissionTitle,
+} from './project-workflow-view.js'
+
 const API = ''
 const params = new URLSearchParams(location.search)
 let projectName = params.get('project') || ''
 let projects = []
 
+const layout = document.getElementById('layout')
+const layoutResizer = document.getElementById('layout-resizer')
 const projectSelect = document.getElementById('project-select')
 const btnNewProject = document.getElementById('btn-new-project')
 const btnDetail = document.getElementById('btn-detail')
@@ -14,6 +33,7 @@ const graphPreview = document.getElementById('graph-preview')
 const notePreview = document.getElementById('note-preview')
 const resourcePreview = document.getElementById('resource-preview')
 const chatLog = document.getElementById('chat-log')
+const chatHint = document.getElementById('chat-hint')
 const chatInput = document.getElementById('chat-input')
 const btnChatSend = document.getElementById('btn-chat-send')
 const btnWarmup = document.getElementById('btn-warmup')
@@ -22,6 +42,9 @@ const noteList = document.getElementById('note-list')
 const resourceList = document.getElementById('resource-list')
 const btnUploadResource = document.getElementById('btn-upload-resource')
 const resourceFile = document.getElementById('resource-file')
+const btnImportNoteFile = document.getElementById('btn-import-note-file')
+const btnPasteNote = document.getElementById('btn-paste-note')
+const noteFile = document.getElementById('note-file')
 const btnApply = document.getElementById('btn-apply')
 const btnDiscardWorkflow = document.getElementById('btn-discard-workflow')
 const tabButtons = Array.from(document.querySelectorAll('.tab-button'))
@@ -31,12 +54,32 @@ const projectNameInput = document.getElementById('project-name')
 const modalError = document.getElementById('modal-error')
 const btnCancelProject = document.getElementById('btn-cancel-project')
 const btnCreateProject = document.getElementById('btn-create-project')
+const noteImportModal = document.getElementById('note-import-modal')
+const noteImportTitle = document.getElementById('note-import-title')
+const noteImportContent = document.getElementById('note-import-content')
+const noteImportError = document.getElementById('note-import-error')
+const btnCancelNoteImport = document.getElementById('btn-cancel-note-import')
+const btnConfirmNoteImport = document.getElementById('btn-confirm-note-import')
+const permissionReviewModal = document.getElementById('permission-review-modal')
+const permissionReviewTitle = document.getElementById('permission-review-title')
+const permissionReviewFile = document.getElementById('permission-review-file')
+const permissionReviewStatus = document.getElementById('permission-review-status')
+const permissionReviewDiff = document.getElementById('permission-review-diff')
+const permissionReviewError = document.getElementById('permission-review-error')
+const btnClosePermissionReview = document.getElementById('btn-close-permission-review')
+const btnRejectPermissionReview = document.getElementById('btn-reject-permission-review')
+const btnApprovePermissionReview = document.getElementById('btn-approve-permission-review')
 let activeTab = 'graph'
 let resources = []
+let workflowNote = null
 let selectedResourcePath = ''
 let resourceLoading = false
+let noteLoading = false
+let noteImporting = false
 let workflow = null
 let workflowMessages = []
+let workflowPermissions = []
+let workflowPermissionRecords = []
 let workflowLoading = false
 let chatSending = false
 let warmupStarting = false
@@ -47,17 +90,13 @@ let restorePromptProject = ''
 let suppressRestorePrompt = false
 let workflowAwaitingReply = false
 let pendingUserText = ''
+let activePermissionReviewID = ''
+let permissionReplying = false
 const workflowStatusById = new Map()
+const shownPermissionModalIds = new Set()
 
 const TERMINAL_STAGES = new Set(['已应用', '已取消'])
-
-function esc(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
+const CHAT_HEIGHT_KEY = 'pm-agent.workflow.chatHeight.v2'
 
 async function fetchJson(url, options) {
   const res = await fetch(url, options)
@@ -71,10 +110,16 @@ function selectedProject() {
 }
 
 function clearWorkflowView() {
-  workflow = null
-  workflowMessages = []
-  pendingUserText = ''
-  workflowAwaitingReply = false
+  const reset = resetWorkflowViewState()
+  workflow = reset.workflow
+  workflowNote = reset.workflowNote
+  workflowMessages = reset.workflowMessages
+  workflowPermissions = reset.workflowPermissions
+  workflowPermissionRecords = reset.workflowPermissionRecords
+  pendingUserText = reset.pendingUserText
+  activePermissionReviewID = reset.activePermissionReviewID
+  shownPermissionModalIds.clear()
+  workflowAwaitingReply = reset.workflowAwaitingReply
   workflowStatusById.clear()
 }
 
@@ -93,13 +138,89 @@ function projectGraphUrl(project) {
   return `/web/project-graph.html?project=${encodeURIComponent(project.name)}&view=expanded`
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function applyChatHeight(height) {
+  if (!layout) return
+  const total = layout.clientHeight
+  if (!total) return
+  const resizerHeight = layoutResizer?.offsetHeight || 10
+  const minChat = 280
+  const minWorkspace = 420
+  const maxChat = Math.max(minChat, total - resizerHeight - minWorkspace)
+  const next = clamp(height, minChat, maxChat)
+  layout.style.gridTemplateRows = `minmax(${minWorkspace}px, 1fr) ${resizerHeight}px ${next}px`
+}
+
+function restoreChatHeight() {
+  if (window.matchMedia('(max-width: 760px)').matches) {
+    layout.style.gridTemplateRows = ''
+    return
+  }
+  const saved = Number(localStorage.getItem(CHAT_HEIGHT_KEY))
+  applyChatHeight(Number.isFinite(saved) && saved > 0 ? saved : 320)
+}
+
+function setupLayoutResizer() {
+  if (!layout || !layoutResizer) return
+  restoreChatHeight()
+  window.addEventListener('resize', restoreChatHeight)
+  let dragging = false
+  const onMove = (event) => {
+    if (!dragging) return
+    const rect = layout.getBoundingClientRect()
+    const next = rect.bottom - event.clientY
+    applyChatHeight(next)
+  }
+  const onUp = () => {
+    if (!dragging) return
+    dragging = false
+    layout.classList.remove('resizing')
+    const rows = getComputedStyle(layout).gridTemplateRows.split(' ')
+    const chatHeight = parseFloat(rows[2])
+    if (Number.isFinite(chatHeight)) localStorage.setItem(CHAT_HEIGHT_KEY, String(Math.round(chatHeight)))
+    window.removeEventListener('pointermove', onMove)
+    window.removeEventListener('pointerup', onUp)
+  }
+  layoutResizer.addEventListener('pointerdown', (event) => {
+    event.preventDefault()
+    dragging = true
+    layout.classList.add('resizing')
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  })
+}
+
 async function loadProjects() {
   projects = await fetchJson(API + '/project/directories') || []
   if (projectName && !projects.some((project) => project.name === projectName)) projectName = ''
   if (!projectName && projects.length) projectName = projects[0].name
   render()
   connectWorkflowSSE()
-  await Promise.all([loadWorkflow({ askRestore: true }), loadResources()])
+  await Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote()])
+}
+
+async function loadWorkflowNote() {
+  const project = selectedProject()
+  workflowNote = null
+  if (!project) {
+    renderNotes()
+    return
+  }
+  noteLoading = true
+  renderNotes()
+  try {
+    const result = await fetchJson(API + `/project/workflow/note?project=${encodeURIComponent(project.name)}`)
+    workflowNote = result || null
+    if (result?.workflow) workflow = result.workflow
+  } catch (error) {
+    workflowNote = { exists: false, content: '', error: error.message || '工作笔记加载失败' }
+  } finally {
+    noteLoading = false
+    renderWorkspace()
+  }
 }
 
 async function loadResources() {
@@ -144,6 +265,7 @@ async function loadWorkflow(options = {}) {
     workflow = result?.workflow || null
     workflowMessages = result?.messages || []
     syncWorkflowStatuses(statuses || {})
+    await loadPendingWorkflowPermissions()
     if (pendingUserText && workflowMessages.some((message) => visibleUserText(message) === pendingUserText)) {
       pendingUserText = ''
     }
@@ -157,6 +279,46 @@ async function loadWorkflow(options = {}) {
     maybePollWorkflow()
     if (options.askRestore) await maybeAskRestoreWorkflow()
   }
+}
+
+async function loadPendingWorkflowPermissions() {
+  const ids = workflowSessionIDs()
+  if (!ids.size) {
+    workflowPermissions = []
+    workflowPermissionRecords = workflowPermissionRecords.filter((record) => record.status !== 'pending')
+    return
+  }
+  const project = selectedProject()
+  const permissions = await fetchJson(API + permissionListUrl(project)).catch(() => [])
+  workflowPermissions = (permissions || []).filter((permission) => ids.has(permission.sessionID))
+  mergeWorkflowPermissionRecords(workflowPermissions)
+  openFirstPendingPermissionReview()
+}
+
+function mergeWorkflowPermissionRecords(pending) {
+  workflowPermissionRecords = mergeWorkflowPermissionRecordList(workflowPermissionRecords, pending)
+}
+
+function upsertWorkflowPermissionRecord(req, status = 'pending') {
+  workflowPermissionRecords = upsertWorkflowPermissionRecordList(workflowPermissionRecords, req, status)
+  workflowPermissions = workflowPermissionRecords.filter((item) => item.status === 'pending')
+  return workflowPermissionRecords[0]
+}
+
+function markWorkflowPermissionRecord(id, reply) {
+  workflowPermissionRecords = markWorkflowPermissionRecords(workflowPermissionRecords, id, reply)
+  workflowPermissions = workflowPermissions.filter((item) => item.id !== id)
+  if (activePermissionReviewID === id) renderPermissionReviewModal()
+}
+
+function openFirstPendingPermissionReview() {
+  const pending = workflowPermissionRecords.find((item) => item.status === 'pending' && !shownPermissionModalIds.has(item.id))
+  if (!pending) return
+  openPermissionReviewModal(pending.id)
+}
+
+function allWorkflowDiffRecords() {
+  return collectWorkflowDiffRecords(workflowPermissionRecords, workflowMessages)
 }
 
 function scheduleWorkflowRefresh() {
@@ -240,6 +402,23 @@ function handleWorkflowBusEvent(event) {
     const sessionID = event.properties?.part?.sessionID || event.properties?.sessionID
     if (sessionID && ids.has(sessionID)) scheduleWorkflowRefresh()
   }
+  if (event.type === 'permission.asked') {
+    const sessionID = event.properties?.sessionID
+    if (sessionID && ids.has(sessionID)) {
+      upsertWorkflowPermissionRecord(event.properties, 'pending')
+      openPermissionReviewModal(event.properties.id)
+      renderChat()
+    }
+  }
+  if (event.type === 'permission.replied') {
+    const requestID = event.properties?.requestID
+    if (requestID) {
+      markWorkflowPermissionRecord(requestID, event.properties?.reply)
+      renderChat()
+      scheduleWorkflowRefresh()
+      loadWorkflowNote().catch(() => {})
+    }
+  }
 }
 
 function renderProjectSelect() {
@@ -275,8 +454,8 @@ function setActiveTab(tab) {
 function emptyMaterialState(message) {
   graphPreview.innerHTML = `<div class="placeholder">${message}</div>`
   operationList.innerHTML = '<div class="placeholder">还没有图操作草案。</div>'
-  notePreview.innerHTML = '<div class="placeholder">还没有工作笔记草案。</div>'
-  noteList.innerHTML = '<div class="placeholder">还没有历史工作笔记。</div>'
+  notePreview.innerHTML = '<div class="placeholder">还没有工作笔记。可以人工导入，也可以在下方对话中让 AI 帮你整理生成。</div>'
+  noteList.innerHTML = '<div class="placeholder">还没有项目。</div>'
   resourcePreview.innerHTML = '<div class="placeholder">还没有可预览的项目资源。</div>'
   resourceList.innerHTML = '<div class="placeholder">还没有登记项目资源文档。</div>'
 }
@@ -346,7 +525,7 @@ async function maybeAskRestoreWorkflow() {
   if (restorePromptProject === project.name) return
   restorePromptProject = project.name
 
-  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“取消”会放弃当前 active workflow，保留已写入的正式图数据。`)
+  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“确定”会恢复本轮 active workflow。\n选择“取消”会放弃并删除 workflows/active 草案，包括本轮工作笔记、图操作草案、校验、预览和聊天会话；已写入的正式图数据不会删除。`)
   if (ok) return
 
   suppressRestorePrompt = true
@@ -356,7 +535,9 @@ async function maybeAskRestoreWorkflow() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: '放弃草案', payload: {} }),
     })
+    clearWorkflowView()
     await loadWorkflow({ askRestore: false })
+    await loadWorkflowNote()
   } catch (error) {
     chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '放弃草案失败')}</div>`
   } finally {
@@ -398,14 +579,12 @@ function workflowHasUnansweredUser() {
   return assistants.some((assistant) => !assistant.info?.time?.completed)
 }
 
-function renderMessagePart(part) {
+function renderMessagePart(part, message) {
   if (part.type === 'text' && !part.synthetic && !part.ignored) {
     return `<div class="message-text">${esc(part.text || '')}</div>`
   }
   if (part.type === 'tool') {
-    const status = part.state?.status || 'pending'
-    const title = part.state?.title || part.tool || 'tool'
-    return `<div class="message-tool">${esc(title)} · ${esc(status)}</div>`
+    return renderWorkflowToolPart(part, message)
   }
   return ''
 }
@@ -413,7 +592,7 @@ function renderMessagePart(part) {
 function renderWorkflowMessage(message) {
   const role = message.info?.role || message.role || 'assistant'
   if (role !== 'user' && role !== 'assistant') return ''
-  const parts = (message.parts || []).map(renderMessagePart).filter(Boolean).join('')
+  const parts = (message.parts || []).map((part) => renderMessagePart(part, message)).filter(Boolean).join('')
   const fallback = visibleMessageText(message)
   if (!parts && !fallback) return ''
   const label = role === 'user' ? '你' : '大模型'
@@ -423,6 +602,93 @@ function renderWorkflowMessage(message) {
       <div class="message-body">${parts || `<div class="message-text">${esc(fallback)}</div>`}</div>
     </div>
   `
+}
+
+function currentPermissionReviewRecord() {
+  return allWorkflowDiffRecords().find((item) => item.id === activePermissionReviewID)
+}
+
+function openPermissionReviewModal(id) {
+  const record = allWorkflowDiffRecords().find((item) => item.id === id)
+  if (!record) return
+  activePermissionReviewID = id
+  if (record.status === 'pending') shownPermissionModalIds.add(id)
+  hidePermissionReviewError()
+  renderPermissionReviewModal()
+  permissionReviewModal.classList.remove('hidden')
+}
+
+function closePermissionReviewModal() {
+  permissionReviewModal.classList.add('hidden')
+  activePermissionReviewID = ''
+  hidePermissionReviewError()
+}
+
+function closePermissionReviewModalFromBackdrop() {
+  const record = currentPermissionReviewRecord()
+  if (record?.status === 'pending') {
+    showPermissionReviewError('请先批准或拒绝本次修改请求。')
+    return
+  }
+  closePermissionReviewModal()
+}
+
+function showPermissionReviewError(message) {
+  permissionReviewError.textContent = message
+  permissionReviewError.classList.remove('hidden')
+}
+
+function hidePermissionReviewError() {
+  permissionReviewError.textContent = ''
+  permissionReviewError.classList.add('hidden')
+}
+
+function renderPermissionReviewModal() {
+  const record = currentPermissionReviewRecord()
+  if (!record) return
+  const pending = record.status === 'pending'
+  permissionReviewTitle.textContent = record.title || workflowPermissionTitle(record)
+  permissionReviewFile.textContent = record.file || workflowPermissionFile(record)
+  permissionReviewStatus.textContent = workflowPermissionStatusText(record.status)
+  permissionReviewStatus.className = `permission-status ${record.status || 'pending'}`
+  permissionReviewDiff.textContent = record.diff || workflowPermissionDiff(record)
+  btnClosePermissionReview.classList.toggle('hidden', pending)
+  btnApprovePermissionReview.classList.toggle('hidden', !pending)
+  btnRejectPermissionReview.classList.toggle('hidden', !pending)
+  btnApprovePermissionReview.disabled = permissionReplying
+  btnRejectPermissionReview.disabled = permissionReplying
+  btnClosePermissionReview.disabled = false
+}
+
+async function replyWorkflowPermission(id, reply) {
+  const project = selectedProject()
+  await fetchJson(API + permissionReplyUrl(id, project), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reply }),
+  })
+  markWorkflowPermissionRecord(id, reply)
+  renderChat()
+  await Promise.all([
+    loadWorkflow({ askRestore: false }),
+    loadWorkflowNote(),
+  ]).catch(() => {})
+}
+
+async function replyActivePermissionReview(reply) {
+  const id = activePermissionReviewID
+  if (!id || permissionReplying) return
+  permissionReplying = true
+  renderPermissionReviewModal()
+  try {
+    await replyWorkflowPermission(id, reply)
+    closePermissionReviewModal()
+  } catch (error) {
+    showPermissionReviewError(error.message || '权限处理失败')
+  } finally {
+    permissionReplying = false
+    renderPermissionReviewModal()
+  }
 }
 
 function workflowIsRunning() {
@@ -455,26 +721,36 @@ function renderChat() {
   const running = workflowIsRunning()
   const canChat = !!project && !running && !lockReason
   const canWarmup = !!project?.graphInitialized && !warmupStarting && state?.warmupStatus !== 'running'
+  const hasNote = !!workflowNote?.exists
+  const readyHint = !project
+    ? '选择或新建项目后可以开始工作推进。'
+    : project.graphInitialized
+      ? hasNote
+        ? '基于当前工作笔记继续补充、修改，或要求生成图操作草案。'
+        : '描述本次推进、补充材料，或在工作笔记页签导入/人工修改笔记。'
+      : '描述项目背景、目标、现状或已有笔记；也可以在工作笔记页签导入/人工修改。'
 
   btnChatSend.disabled = !canChat || !chatInput.value.trim()
   chatInput.disabled = !canChat
-  chatInput.placeholder = !project
-    ? '先选择或新建项目'
-    : project.graphInitialized
-      ? lockReason || '描述本次工作推进、补充材料、修改工作笔记或图操作'
-      : '描述项目背景、当前目标、已知问题、已有资料和希望先推进的工作'
+  chatInput.placeholder = lockReason || readyHint
+  chatHint.textContent = lockReason
+    ? lockReason
+    : running
+      ? '大模型正在处理，本轮回复完成后可以继续输入。'
+      : ''
 
   btnWarmup.classList.toggle('hidden', !project?.graphInitialized)
   btnWarmup.disabled = !canWarmup
   btnWarmup.textContent = state?.warmupStatus === 'completed' ? '重新预热项目上下文' : '开始项目上下文预热'
 
   if (workflowLoading && !workflowMessages.length) {
-    chatLog.innerHTML = '<div class="placeholder">正在加载工作推进会话...</div>'
+    chatLog.innerHTML = ''
+    chatHint.textContent = '正在加载工作推进会话...'
     return
   }
 
   if (!project) {
-    chatLog.innerHTML = '<div class="placeholder">新建或选择项目后，这里会承载工作推进对话。</div>'
+    chatLog.innerHTML = ''
     return
   }
 
@@ -489,11 +765,14 @@ function renderChat() {
   }
   if (running) messages.push('<div class="output-cursor">运行中</div>')
   const messagesHtml = messages.join('')
-  const guide = project.graphInitialized
-    ? `<div class="chat-guide">${esc(lockReason || `${warmupStatusText(state?.warmupStatus)}。可以开始描述本次推进事项、引用资源，并让大模型生成或修订工作笔记和图操作草案。`)}</div>`
-    : '<div class="chat-guide">这是一个尚未第一次提交图数据的新项目。请直接描述项目背景、目标、现状、已知问题和已有资料，大模型会先辅助形成初始化工作笔记与初始图操作草案。</div>'
 
-  chatLog.innerHTML = messagesHtml || guide
+  chatLog.innerHTML = messagesHtml
+  for (const button of Array.from(chatLog.querySelectorAll('[data-tool-diff-open]'))) {
+    button.onclick = () => {
+      const id = button.dataset.toolDiffOpen
+      if (id) openPermissionReviewModal(id)
+    }
+  }
   chatLog.scrollTop = chatLog.scrollHeight
 }
 
@@ -522,14 +801,79 @@ function renderResources() {
     return
   }
   resourceList.innerHTML = resources.map((resource) => `
-    <button type="button" class="resource-item ${resource.path === selectedResourcePath ? 'active' : ''}" data-path="${esc(resource.path)}">
-      <span class="resource-name">${esc(resource.originalName || resource.name)}</span>
-      <span class="resource-meta">${esc(formatBytes(resource.size))}${resource.previewable ? ' / 可预览' : ' / 附件'}</span>
-    </button>
+    ${renderResourceItem(resource, selectedResourcePath, `${formatBytes(resource.size)}${resource.previewable ? ' / 可预览' : ' / 附件'}`)}
   `).join('')
   for (const item of Array.from(resourceList.querySelectorAll('.resource-item'))) {
     item.onclick = () => previewResource(item.dataset.path)
+    item.onkeydown = (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return
+      event.preventDefault()
+      previewResource(item.dataset.path)
+    }
   }
+  for (const item of Array.from(resourceList.querySelectorAll('.resource-delete'))) {
+    item.onclick = (event) => {
+      event.stopPropagation()
+      deleteResource(item.dataset.path).catch((error) => {
+        resourcePreview.innerHTML = `<div class="placeholder">${esc(error.message || '删除失败')}</div>`
+      })
+    }
+    item.onkeydown = (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return
+      event.preventDefault()
+      event.stopPropagation()
+      item.click()
+    }
+  }
+}
+
+function renderNotes() {
+  const project = selectedProject()
+  if (btnImportNoteFile) btnImportNoteFile.disabled = !project || noteLoading || noteImporting
+  if (btnPasteNote) btnPasteNote.disabled = !project || noteLoading || noteImporting
+  if (!project) {
+    notePreview.innerHTML = '<div class="placeholder">选择项目后可以导入、粘贴或生成工作笔记。</div>'
+    noteList.innerHTML = '<div class="placeholder">还没有项目。</div>'
+    return
+  }
+  if (noteLoading) {
+    notePreview.innerHTML = '<div class="placeholder">正在加载工作笔记...</div>'
+    noteList.innerHTML = '<div class="placeholder">正在加载...</div>'
+    return
+  }
+  if (workflowNote?.error) {
+    notePreview.innerHTML = `<div class="placeholder">${esc(workflowNote.error)}</div>`
+    noteList.innerHTML = '<div class="placeholder">加载失败。</div>'
+    return
+  }
+  if (!workflowNote?.exists) {
+    notePreview.innerHTML = `
+      <div class="note-empty">
+        <h4>还没有工作笔记</h4>
+        <p>工作笔记可以人工导入，也可以让 AI 根据对话整理生成；导入后仍可继续让 AI 辅助修改。</p>
+      </div>
+    `
+    noteList.innerHTML = `
+      <div class="note-info">
+        <strong>可选方式</strong>
+        <span>导入已有 markdown/txt 笔记</span>
+        <span>手工粘贴或编辑一段工作记录</span>
+        <span>在下方对话中描述背景，让 AI 生成</span>
+      </div>
+    `
+    return
+  }
+  notePreview.innerHTML = `<pre class="note-content">${esc(workflowNote.content || '')}</pre>`
+  const state = currentWorkflowState()
+  noteList.innerHTML = `
+    <div class="note-info">
+      <strong>当前工作笔记</strong>
+      <span>${esc(workflowNote.path || 'workflows/active/note.md')}</span>
+      <span>当前阶段：${esc(state?.stage || '未知')}</span>
+      <span>可人工替换，也可在对话中让 AI 基于这份笔记继续修改。</span>
+      <span>更新笔记会清空旧图操作、校验和预览。</span>
+    </div>
+  `
 }
 
 function renderWorkspace() {
@@ -542,6 +886,7 @@ function renderWorkspace() {
     btnGraph.disabled = true
     updateTerminalActionButtons()
     renderResources()
+    renderNotes()
     renderChat()
     return
   }
@@ -561,11 +906,8 @@ function renderWorkspace() {
   operationList.innerHTML = ready
     ? '<div class="placeholder">后续这里显示本次推进生成的图操作索引，点击后图谱预览会定位到对应节点或边。</div>'
     : '<div class="placeholder">等待项目初始化 Skill 生成第一批图操作：初始事件/目标/工作块/工作项等。</div>'
-  notePreview.innerHTML = ready
-    ? '<div class="placeholder">后续这里预览 AI 辅助生成或人工修订后的本次工作笔记。</div>'
-    : '<div class="placeholder">第一次图数据提交前，工作笔记会先围绕项目背景和初始化草案生成。</div>'
-  noteList.innerHTML = '<div class="placeholder">后续这里列出历史工作笔记，点击后在左侧预览。</div>'
   renderResources()
+  renderNotes()
   renderChat()
 }
 
@@ -596,6 +938,28 @@ function hideError() {
   modalError.classList.add('hidden')
 }
 
+function openNoteImportModal() {
+  noteImportTitle.value = workflowNote?.exists ? '人工修改工作笔记' : ''
+  noteImportContent.value = workflowNote?.content || ''
+  hideNoteImportError()
+  noteImportModal.classList.remove('hidden')
+  noteImportContent.focus()
+}
+
+function closeNoteImportModal() {
+  noteImportModal.classList.add('hidden')
+}
+
+function showNoteImportError(message) {
+  noteImportError.textContent = message
+  noteImportError.classList.remove('hidden')
+}
+
+function hideNoteImportError() {
+  noteImportError.textContent = ''
+  noteImportError.classList.add('hidden')
+}
+
 async function createProject() {
   hideError()
   const name = projectNameInput.value.trim()
@@ -622,13 +986,87 @@ async function createProject() {
   }
 }
 
+async function refreshAfterNoteImport() {
+  await Promise.all([
+    loadWorkflow({ askRestore: false }),
+    loadWorkflowNote(),
+    loadResources(),
+  ])
+  setActiveTab('notes')
+}
+
+function confirmNoteReplacement() {
+  return confirm('保存后会替换当前工作笔记，并清空旧图操作、校验和预览。之后仍可让 AI 继续修改这份笔记。是否继续？')
+}
+
+async function importNoteFile(file) {
+  const project = selectedProject()
+  if (!project || !file) return
+  if (!confirmNoteReplacement()) return
+  const form = new FormData()
+  form.append('file', file)
+  noteImporting = true
+  renderNotes()
+  try {
+    const result = await fetchJson(API + `/project/workflow/note/import?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      body: form,
+    })
+    workflowNote = result
+    if (result?.workflow) workflow = result.workflow
+    await refreshAfterNoteImport()
+  } catch (error) {
+    notePreview.innerHTML = `<div class="placeholder">${esc(error.message || '导入失败')}</div>`
+  } finally {
+    noteImporting = false
+    if (noteFile) noteFile.value = ''
+    renderNotes()
+  }
+}
+
+async function importPastedNote() {
+  hideNoteImportError()
+  const project = selectedProject()
+  const content = noteImportContent.value.trim()
+  const title = noteImportTitle.value.trim()
+  if (!project) {
+    showNoteImportError('请先选择项目')
+    return
+  }
+  if (!content) {
+    showNoteImportError('请输入工作笔记内容')
+    return
+  }
+  if (!confirmNoteReplacement()) return
+  btnConfirmNoteImport.disabled = true
+  noteImporting = true
+  renderNotes()
+  try {
+    const result = await fetchJson(API + `/project/workflow/note/import?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content, title: title || undefined }),
+    })
+    workflowNote = result
+    if (result?.workflow) workflow = result.workflow
+    closeNoteImportModal()
+    await refreshAfterNoteImport()
+  } catch (error) {
+    showNoteImportError(error.message || '保存失败')
+  } finally {
+    noteImporting = false
+    btnConfirmNoteImport.disabled = false
+    renderNotes()
+  }
+}
+
 projectSelect.onchange = () => {
   projectName = projectSelect.value
   restorePromptProject = ''
   clearWorkflowView()
   render()
   connectWorkflowSSE()
-  Promise.all([loadWorkflow({ askRestore: true }), loadResources()]).catch((error) => {
+  Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote()]).catch((error) => {
     chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '加载失败')}</div>`
   })
 }
@@ -647,6 +1085,19 @@ btnGraph.onclick = () => {
 btnDebug.onclick = () => { location.href = '/web' }
 btnCancelProject.onclick = closeModal
 btnCreateProject.onclick = createProject
+btnPasteNote.onclick = openNoteImportModal
+btnImportNoteFile.onclick = () => {
+  const project = selectedProject()
+  if (!project) return
+  noteFile.click()
+}
+btnCancelNoteImport.onclick = closeNoteImportModal
+btnConfirmNoteImport.onclick = () => importPastedNote().catch((error) => {
+  showNoteImportError(error.message || '保存失败')
+})
+btnClosePermissionReview.onclick = closePermissionReviewModal
+btnApprovePermissionReview.onclick = () => replyActivePermissionReview('once')
+btnRejectPermissionReview.onclick = () => replyActivePermissionReview('reject')
 chatInput.oninput = renderChat
 chatInput.onkeydown = (event) => {
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
@@ -677,7 +1128,7 @@ async function discardWorkflowFromButton() {
     return
   }
   const state = currentWorkflowState()
-  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n这会清空 workflows/active 草案和本轮聊天会话，但不会删除已经写入的正式图数据。`)
+  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n这会删除 workflows/active 草案，包括本轮工作笔记、图操作草案、校验、预览和聊天会话；已写入的正式图数据不会删除。`)
   if (!ok) return
   btnDiscardWorkflow.disabled = true
   try {
@@ -689,6 +1140,7 @@ async function discardWorkflowFromButton() {
     clearWorkflowView()
     restorePromptProject = project.name
     await loadWorkflow({ askRestore: false })
+    await loadWorkflowNote()
   } catch (error) {
     alert(error.message || '放弃草案失败')
   } finally {
@@ -744,6 +1196,32 @@ resourceFile.onchange = async () => {
 }
 modal.onclick = (event) => {
   if (event.target === modal) closeModal()
+}
+permissionReviewModal.onclick = (event) => {
+  if (event.target === permissionReviewModal) closePermissionReviewModalFromBackdrop()
+}
+
+noteFile.onchange = async () => {
+  const file = noteFile.files?.[0]
+  if (!file) return
+  await importNoteFile(file)
+}
+
+async function deleteResource(resourcePath) {
+  const project = selectedProject()
+  if (!project || !resourcePath) return
+  const resource = resources.find((item) => item.path === resourcePath)
+  const name = resource?.originalName || resource?.name || resourcePath
+  const ok = confirm(`确认删除资源「${name}」吗？\n\n这会删除 source 目录下的文件；如果工作笔记已引用该资源，需要手动调整引用。`)
+  if (!ok) return
+  await fetchJson(API + `/project/source?project=${encodeURIComponent(project.name)}&path=${encodeURIComponent(resourcePath)}`, {
+    method: 'DELETE',
+  })
+  if (selectedResourcePath === resourcePath) {
+    selectedResourcePath = ''
+    resourcePreview.innerHTML = '<div class="placeholder">资源已删除。</div>'
+  }
+  await loadResources()
 }
 
 async function previewResource(resourcePath) {
@@ -834,6 +1312,7 @@ function maybePollWorkflow() {
   if (workflowIsRunning()) startWorkflowPolling()
 }
 
+setupLayoutResizer()
 loadProjects().catch((error) => {
   graphPreview.innerHTML = `<div class="placeholder">${esc(error.message || '加载失败')}</div>`
 })
