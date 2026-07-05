@@ -229,6 +229,12 @@ button:disabled {
 .side-header {
   margin-bottom: 4px;
 }
+.preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
 .preview-header h3,
 .side-header h3 {
   font-size: 13px;
@@ -283,6 +289,40 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+#graph-preview {
+  display: block;
+  overflow: hidden;
+  padding: 0;
+}
+#graph-preview .placeholder {
+  height: 100%;
+  min-height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto;
+  padding: 24px;
+}
+#graph-preview .pg-renderer {
+  min-height: 100%;
+  background: #111827;
+}
+.graph-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.graph-preview-actions span {
+  color: #9ca3af;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.graph-preview-actions button {
+  padding: 5px 8px;
+  min-height: 28px;
+  font-size: 12px;
 }
 #chat-log {
   flex: 1;

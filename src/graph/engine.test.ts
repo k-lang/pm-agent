@@ -11,17 +11,18 @@ import { loadExpandedGraph, loadGraph } from "../../standalone-graph/transform"
 
 const TRACKER_ROOT = "/mnt/sda/test_claude_code/proj5_pm/project_progress_tracker"
 const COMMANDS_DIR = path.join(TRACKER_ROOT, "jiedaidan_trace", "commands")
+const REFINED_COMMANDS_DIR = path.join(TRACKER_ROOT, "jiedaidan_trace", "refined_v2", "commands")
 const PYTHON_SRC = path.join(TRACKER_ROOT, "src")
 const OUTPUT_ROOT = path.join(os.tmpdir(), "pm-agent-graph-engine-test")
 const PYTHON_OUT = path.join(OUTPUT_ROOT, "python")
 const TS_OUT = path.join(OUTPUT_ROOT, "ts")
 
-async function stepFiles() {
-  const files = await fs.readdir(COMMANDS_DIR)
+async function stepFiles(commandsDir = COMMANDS_DIR) {
+  const files = await fs.readdir(commandsDir)
   return files
     .filter((file) => /^step\d+\.json$/.test(file))
     .sort((a, b) => Number(a.match(/\d+/)?.[0] || 0) - Number(b.match(/\d+/)?.[0] || 0))
-    .map((file) => path.join(COMMANDS_DIR, file))
+    .map((file) => path.join(commandsDir, file))
 }
 
 async function listJsonFiles(dir: string): Promise<string[]> {
@@ -38,31 +39,35 @@ async function readJson(file: string) {
   return JSON.parse(await fs.readFile(file, "utf8"))
 }
 
-function normalizeHistory(history: unknown) {
+function normalizeHistory(history: unknown, options: { keepSerializedData?: boolean } = {}) {
   if (!Array.isArray(history)) return []
   return history.map((entry) => {
     const item = entry as Record<string, unknown>
-    return {
+    const normalized: Record<string, unknown> = {
       timestamp: item.timestamp,
       version: item.version,
       description: item.description,
     }
+    if (options.keepSerializedData && typeof item.serialized_data === "string") {
+      normalized.serialized_data = JSON.parse(item.serialized_data)
+    }
+    return normalized
   })
 }
 
-function normalizeGraphObject(value: Record<string, unknown>) {
+function normalizeGraphObject(value: Record<string, unknown>, options: { keepSerializedData?: boolean } = {}) {
   const copy = { ...value }
-  if ("history" in copy) copy.history = normalizeHistory(copy.history)
+  if ("history" in copy) copy.history = normalizeHistory(copy.history, options)
   return copy
 }
 
-async function normalizedDirectory(root: string) {
+async function normalizedDirectory(root: string, options: { keepSerializedData?: boolean } = {}) {
   const files = await listJsonFiles(root)
   const result: Record<string, unknown> = {}
   for (const file of files) {
     const rel = path.relative(root, file)
     if (rel.startsWith(`metadata${path.sep}`)) continue
-    result[rel.replaceAll(path.sep, "/")] = normalizeGraphObject(await readJson(file))
+    result[rel.replaceAll(path.sep, "/")] = normalizeGraphObject(await readJson(file), options)
   }
   return result
 }
@@ -109,6 +114,43 @@ describe("graph engine", () => {
       await runTsStep(file)
       expect(await normalizedDirectory(TS_OUT), path.basename(file)).toEqual(await normalizedDirectory(PYTHON_OUT))
     }
+  }, 30000)
+
+  test("replays refined jiedaidan steps equivalently to the python engine including history snapshots", async () => {
+    const files = await stepFiles(REFINED_COMMANDS_DIR)
+    await fs.rm(OUTPUT_ROOT, { recursive: true, force: true })
+    await fs.mkdir(OUTPUT_ROOT, { recursive: true })
+
+    for (const file of files) {
+      await runPythonStep(file)
+      await runTsStep(file)
+      expect(await normalizedDirectory(TS_OUT, { keepSerializedData: true }), path.basename(file)).toEqual(await normalizedDirectory(PYTHON_OUT, { keepSerializedData: true }))
+    }
+  }, 30000)
+
+  test("refined replay preserves readable history in node descriptions", async () => {
+    const files = await stepFiles(REFINED_COMMANDS_DIR)
+    await fs.rm(TS_OUT, { recursive: true, force: true })
+    await runTsReplay(files)
+
+    const nodes = (await new GraphStorage(TS_OUT).getAllNodes())
+    expect(nodes.length).toBeGreaterThan(0)
+    expect(nodes.every((node) => node.description.includes("历史记录："))).toBe(true)
+  }, 30000)
+
+  test("history serialized_data stores the object snapshot without nested history", async () => {
+    const files = await stepFiles(REFINED_COMMANDS_DIR)
+    await fs.rm(TS_OUT, { recursive: true, force: true })
+    await runTsReplay(files.slice(0, 2))
+
+    const storage = new GraphStorage(TS_OUT)
+    const node = await storage.getNodeById("goal_knowledge_organization")
+    expect(node?.history.length).toBeGreaterThan(0)
+    expect(JSON.parse(node!.history.at(-1)!.serialized_data)).not.toHaveProperty("history")
+
+    const edge = await storage.loadEdge("edge_event_to_goal")
+    expect(edge?.history.length).toBeGreaterThan(0)
+    expect(JSON.parse(edge!.history.at(-1)!.serialized_data)).not.toHaveProperty("history")
   }, 30000)
 
   test("replayed graph can be transformed for collapsed and expanded views", async () => {

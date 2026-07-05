@@ -251,11 +251,12 @@ export class GraphEngine {
   }
 
   private historyRecord(value: GraphNode | GraphEdge, timestamp: string, version: string, description: string): HistoryRecord {
+    const { history: _history, ...serializedValue } = value
     return {
       timestamp,
       version,
       description,
-      serialized_data: JSON.stringify(value, null, 2),
+      serialized_data: JSON.stringify(serializedValue, null, 2),
     }
   }
 
@@ -281,4 +282,3 @@ export async function loadCommandAndExecute(jsonFilePath: string, dataDir: strin
   const engine = new GraphEngine(new GraphStorage(dataDir))
   return engine.executeCommand(command)
 }
-

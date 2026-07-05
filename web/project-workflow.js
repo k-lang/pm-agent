@@ -15,6 +15,7 @@ import {
   workflowPermissionStatusText,
   workflowPermissionTitle,
 } from './project-workflow-view.js'
+import { ProjectGraphRenderer } from './project-graph-renderer.js'
 
 const API = ''
 const params = new URLSearchParams(location.search)
@@ -31,6 +32,11 @@ const btnDebug = document.getElementById('btn-debug')
 const workspaceSubtitle = document.getElementById('workspace-subtitle')
 const projectStatus = document.getElementById('project-status')
 const graphPreview = document.getElementById('graph-preview')
+const graphPreviewStatus = document.getElementById('graph-preview-status')
+const btnGraphRefresh = document.getElementById('btn-graph-refresh')
+const btnGraphFit = document.getElementById('btn-graph-fit')
+const btnGraphZoomOut = document.getElementById('btn-graph-zoom-out')
+const btnGraphZoomIn = document.getElementById('btn-graph-zoom-in')
 const notePreview = document.getElementById('note-preview')
 const resourcePreview = document.getElementById('resource-preview')
 const chatLog = document.getElementById('chat-log')
@@ -76,6 +82,11 @@ let workflowNote = null
 let selectedResourcePath = ''
 let resourceLoading = false
 let noteLoading = false
+let graphRenderer = null
+let graphLoading = false
+let graphLoadedProject = ''
+let graphError = ''
+let graphLoadSeq = 0
 let noteImporting = false
 let workflow = null
 let workflowMessages = []
@@ -450,9 +461,116 @@ function setActiveTab(tab) {
   for (const panel of tabPanels) {
     panel.classList.toggle('active', panel.dataset.tabPanel === tab)
   }
+  if (tab === 'graph') ensureGraphPreviewLoaded().catch(() => {})
+}
+
+function setGraphPreviewPlaceholder(message) {
+  graphRenderer?.destroy()
+  graphRenderer = null
+  graphPreview.innerHTML = `<div class="placeholder">${message}</div>`
+}
+
+function resetGraphPreview() {
+  graphLoadSeq += 1
+  graphLoading = false
+  graphLoadedProject = ''
+  graphError = ''
+  setGraphPreviewPlaceholder('等待图谱草案。')
+}
+
+function graphPreviewApi(project) {
+  return API + `/project/graph?project=${encodeURIComponent(project.name)}&view=expanded`
+}
+
+function renderGraphPreviewStatus(project, ready) {
+  const canLoad = !!project && ready
+  btnGraphRefresh.disabled = !canLoad || graphLoading
+  btnGraphFit.disabled = !graphRenderer
+  btnGraphZoomOut.disabled = !graphRenderer
+  btnGraphZoomIn.disabled = !graphRenderer
+
+  if (!project) {
+    graphPreviewStatus.textContent = '未选择项目'
+    return
+  }
+  if (!ready) {
+    graphPreviewStatus.textContent = '等待第一次图提交'
+    return
+  }
+  if (graphLoading) {
+    graphPreviewStatus.textContent = '当前图谱加载中'
+    return
+  }
+  if (graphError) {
+    graphPreviewStatus.textContent = '当前图谱加载失败'
+    return
+  }
+  if (graphRenderer && graphLoadedProject === project.name) {
+    graphPreviewStatus.textContent = '当前图谱'
+    return
+  }
+  graphPreviewStatus.textContent = '当前图谱未加载'
+}
+
+function renderGraphPreview(project, ready) {
+  renderGraphPreviewStatus(project, ready)
+  if (!project) {
+    setGraphPreviewPlaceholder('点击“新建项目”创建项目目录和基础结构。')
+    return
+  }
+  if (!ready) {
+    setGraphPreviewPlaceholder('项目目录已创建。第一次图数据提交前，这里将展示项目初始化 Skill 生成的初始图草案。')
+    return
+  }
+  if (graphLoading) {
+    setGraphPreviewPlaceholder('当前图谱加载中...')
+    return
+  }
+  if (graphError) {
+    setGraphPreviewPlaceholder(graphError)
+    return
+  }
+  if (graphRenderer && graphLoadedProject === project.name) return
+  setGraphPreviewPlaceholder('切换到“图谱变更”页签后加载当前完整图谱。')
+  if (activeTab === 'graph') ensureGraphPreviewLoaded().catch(() => {})
+}
+
+async function ensureGraphPreviewLoaded({ force = false } = {}) {
+  const project = selectedProject()
+  if (!project?.graphInitialized) return
+  if (!force && graphRenderer && graphLoadedProject === project.name) return
+
+  const loadSeq = ++graphLoadSeq
+  graphLoading = true
+  graphError = ''
+  renderGraphPreview(project, true)
+  try {
+    const payload = await fetchJson(graphPreviewApi(project))
+    if (loadSeq !== graphLoadSeq || selectedProject()?.name !== project.name) return
+    graphRenderer?.destroy()
+    graphRenderer = new ProjectGraphRenderer({
+      root: graphPreview,
+      view: 'expanded',
+      showLegend: false,
+      showControls: false,
+      readonly: true,
+    })
+    graphRenderer.setPayload(payload, { mode: 'current' })
+    graphLoadedProject = project.name
+  } catch (error) {
+    if (loadSeq !== graphLoadSeq || selectedProject()?.name !== project.name) return
+    graphError = error.message || '图谱预览加载失败'
+    graphLoadedProject = ''
+  } finally {
+    if (loadSeq !== graphLoadSeq || selectedProject()?.name !== project.name) return
+    graphLoading = false
+    renderGraphPreviewStatus(project, true)
+    if (graphError) renderGraphPreview(project, true)
+  }
 }
 
 function emptyMaterialState(message) {
+  resetGraphPreview()
   graphPreview.innerHTML = `<div class="placeholder">${message}</div>`
   operationList.innerHTML = '<div class="placeholder">还没有图操作草案。</div>'
   notePreview.innerHTML = '<div class="placeholder">还没有工作笔记。可以人工导入，也可以在下方对话中让 AI 帮你整理生成。</div>'
@@ -906,9 +1024,12 @@ function renderWorkspace() {
   btnDetail.disabled = !ready
   btnGraph.disabled = !ready
   updateTerminalActionButtons()
-  graphPreview.innerHTML = ready
-    ? '<div class="placeholder">后续这里显示当前项目图谱，并叠加本次工作推进草案的新增/更新节点和边。</div>'
-    : '<div class="placeholder">项目目录已创建。第一次图数据提交前，这里将展示项目初始化 Skill 生成的初始图草案。</div>'
+  if (!ready || graphLoadedProject !== project.name) {
+    graphLoadedProject = graphLoadedProject === project.name ? graphLoadedProject : ''
+    if (graphRenderer && graphLoadedProject !== project.name) graphRenderer.destroy()
+    if (graphLoadedProject !== project.name) graphRenderer = null
+  }
+  renderGraphPreview(project, ready)
   operationList.innerHTML = ready
     ? '<div class="placeholder">后续这里显示本次推进生成的图操作索引，点击后图谱预览会定位到对应节点或边。</div>'
     : '<div class="placeholder">等待项目初始化 Skill 生成第一批图操作：初始事件/目标/工作块/工作项等。</div>'
@@ -1068,6 +1189,7 @@ projectSelect.onchange = () => {
   projectName = projectSelect.value
   restorePromptProject = ''
   clearWorkflowView()
+  resetGraphPreview()
   render()
   connectWorkflowSSE()
   Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote()]).catch((error) => {
@@ -1086,6 +1208,15 @@ btnGraph.onclick = () => {
   const project = selectedProject()
   if (project?.graphInitialized) location.href = projectGraphUrl(project)
 }
+btnGraphRefresh.onclick = () => {
+  ensureGraphPreviewLoaded({ force: true }).catch((error) => {
+    graphError = error.message || '图谱预览加载失败'
+    renderGraphPreview(selectedProject(), !!selectedProject()?.graphInitialized)
+  })
+}
+btnGraphFit.onclick = () => graphRenderer?.fit()
+btnGraphZoomOut.onclick = () => graphRenderer?.zoomBy(1 / 1.2)
+btnGraphZoomIn.onclick = () => graphRenderer?.zoomBy(1.2)
 btnDebug.onclick = () => { location.href = '/web' }
 btnCancelProject.onclick = closeModal
 btnCreateProject.onclick = createProject

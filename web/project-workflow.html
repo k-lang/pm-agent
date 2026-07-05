@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>工作推进</title>
+  <link rel="stylesheet" href="/web/project-graph-renderer.css">
   <link rel="stylesheet" href="/web/project-workflow.css">
 </head>
 <body>
@@ -82,6 +83,13 @@
             <div class="preview-main">
               <div class="preview-header">
                 <h3>图谱预览 <span>展示当前图谱和草案变更</span></h3>
+                <div class="graph-preview-actions">
+                  <span id="graph-preview-status">当前图谱</span>
+                  <button id="btn-graph-refresh" type="button" class="btn-secondary">刷新</button>
+                  <button id="btn-graph-fit" type="button" class="btn-secondary">Fit</button>
+                  <button id="btn-graph-zoom-out" type="button" class="btn-secondary">-</button>
+                  <button id="btn-graph-zoom-in" type="button" class="btn-secondary">+</button>
+                </div>
               </div>
               <div id="graph-preview" class="preview-content">
                 <div class="placeholder">等待图谱草案。</div>
