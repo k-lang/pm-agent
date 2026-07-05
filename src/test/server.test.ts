@@ -6,10 +6,12 @@ import { Server } from "../server/server"
 import { tmpdir } from "./fixture/fixture"
 import { Log } from "../util/log"
 import { Session } from "../session"
+import { SessionPrompt } from "../session/prompt"
 import { ProjectDetail } from "../project/detail"
 import { Database } from "../storage/db"
 import { ProjectSummaryRecordTable } from "../project/project.sql"
 import { SessionID } from "../session/schema"
+import { ProjectWorkflow } from "../workflow/state"
 
 Log.init({ print: false })
 
@@ -278,6 +280,72 @@ describe("server routes", () => {
       await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
       await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
       await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("GET /project/workflow/messages hides forked warmup history", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "metadata"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await fs.writeFile(
+        path.join(projectDir, "metadata", "project_state.json"),
+        JSON.stringify({ graphInitialized: true }, null, 2) + "\n",
+        "utf8",
+      )
+
+      await Instance.provide({
+        directory: projectDir,
+        fn: async () => {
+          const warmup = await Session.create({ title: "工作推进上下文预热" })
+          await SessionPrompt.prompt({
+            sessionID: warmup.id,
+            noReply: true,
+            parts: [{ type: "text", text: "warmup baseline should be hidden" }],
+          })
+          const chat = await Session.fork({ sessionID: warmup.id })
+
+          await ProjectWorkflow.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
+          await ProjectWorkflow.bindSessions({
+            project: "demo",
+            directory: projectDir,
+            sessionID: chat.id,
+            warmupSessionID: warmup.id,
+            warmupStatus: "completed",
+          })
+          await new Promise((resolve) => setTimeout(resolve, 2))
+          await SessionPrompt.prompt({
+            sessionID: chat.id,
+            noReply: true,
+            parts: [{ type: "text", text: "visible workflow message" }],
+          })
+        },
+      })
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/messages?project=demo"))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      const text = JSON.stringify(body.messages)
+      expect(text).toContain("visible workflow message")
+      expect(text).not.toContain("warmup baseline should be hidden")
+
+      const statePath = path.join(projectDir, "workflows", "active", "state.json")
+      const state = JSON.parse(await fs.readFile(statePath, "utf8"))
+      delete state.sessionStartedAt
+      await fs.writeFile(statePath, JSON.stringify(state, null, 2) + "\n", "utf8")
+
+      const legacyRes = await app.fetch(new Request("http://localhost/project/workflow/messages?project=demo"))
+      expect(legacyRes.status).toBe(200)
+      const legacyBody = await legacyRes.json()
+      const legacyText = JSON.stringify(legacyBody.messages)
+      expect(legacyText).toContain("visible workflow message")
+      expect(legacyText).not.toContain("warmup baseline should be hidden")
     } finally {
       process.chdir(originalCwd)
     }

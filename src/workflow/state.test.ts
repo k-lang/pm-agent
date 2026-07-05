@@ -346,6 +346,41 @@ describe("ProjectWorkflow", () => {
     expect(restarted.data).toMatchObject({ restored: false })
   })
 
+  test("discard keeps note.md when the draft has a working note", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "这是一份需要保留的工作笔记。",
+      summary: "人工整理工作笔记。",
+    })
+    await action("追加消息", {
+      role: "用户",
+      text: "先放弃当前图操作草案。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.json"), "{}\n", "utf8")
+    await fs.writeFile(path.join(activeDir, "validation.json"), "{}\n", "utf8")
+    await fs.writeFile(path.join(activeDir, "preview.json"), "{}\n", "utf8")
+    await ProjectWorkflow.bindSessions({
+      project: "demo",
+      directory,
+      sessionID: "ses_demo_chat" as any,
+      warmupSessionID: "ses_demo_warmup" as any,
+      warmupStatus: "completed",
+    })
+
+    const discarded = await action("放弃草案")
+
+    expect(discarded.stage).toBe("笔记已生成")
+    expect(discarded.message).toContain("保留工作笔记")
+    expect(discarded.state?.sessionID).toBeUndefined()
+    expect(discarded.state?.warmupSessionID).toBe("ses_demo_warmup")
+    await expect(fs.readFile(path.join(activeDir, "note.md"), "utf8")).resolves.toBe("这是一份需要保留的工作笔记。\n")
+    await expect(fs.stat(path.join(activeDir, "messages.jsonl"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+  })
+
   test("discard removes the forked workflow chat session but keeps the warmup baseline session", async () => {
     const { Instance } = await import("@/project/instance")
     const { Session } = await import("@/session")

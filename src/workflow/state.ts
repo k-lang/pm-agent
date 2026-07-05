@@ -57,6 +57,7 @@ export namespace ProjectWorkflow {
     project: z.string(),
     stage: Stage,
     sessionID: z.string().optional(),
+    sessionStartedAt: z.number().optional(),
     warmupSessionID: z.string().optional(),
     warmupStatus: BaselineStatus.optional(),
     createdAt: z.number(),
@@ -253,12 +254,15 @@ export namespace ProjectWorkflow {
   }
 
   function withSessionBinding(state: State, input: { sessionID?: string; warmupSessionID?: string; warmupStatus?: BaselineStatus }) {
+    const now = Date.now()
+    const sessionChanged = !!input.sessionID && input.sessionID !== state.sessionID
     return State.parse({
       ...state,
       sessionID: input.sessionID ?? state.sessionID,
+      sessionStartedAt: sessionChanged ? now : state.sessionStartedAt,
       warmupSessionID: input.warmupSessionID ?? state.warmupSessionID,
       warmupStatus: input.warmupStatus ?? state.warmupStatus,
-      updatedAt: Date.now(),
+      updatedAt: now,
     })
   }
 
@@ -335,7 +339,7 @@ export namespace ProjectWorkflow {
       { action: "追加消息", reason: "继续记录用户输入、模型回应或审核意见。" },
       { action: "登记资源", reason: "登记上传附件或项目资源，供工作笔记引用。" },
       { action: "提出修订意见", reason: "记录用户对工作笔记、图操作或两者的审核意见。" },
-      { action: "放弃草案", reason: "清空当前 active 草案。", requiresUserConfirmation: true },
+      { action: "放弃草案", reason: "放弃当前图操作草案和聊天会话；如已有工作笔记则保留 note.md。", requiresUserConfirmation: true },
     ]
     const blockedActions: { action: Action; reason: string }[] = []
 
@@ -473,6 +477,7 @@ export namespace ProjectWorkflow {
     state = State.parse({
       ...state,
       sessionID: input.sessionID,
+      sessionStartedAt: Date.now(),
       warmupSessionID: input.warmupSessionID,
       warmupStatus: input.warmupStatus ?? "completed",
     })
@@ -498,11 +503,33 @@ export namespace ProjectWorkflow {
   }
 
   async function discard(project: string, directory: string, state: State) {
-    const next = transition(state, "放弃草案", "已取消", "用户确认放弃 active 草案。")
-    await writeState(directory, next)
-    await fs.rm(activeDir(directory), { recursive: true, force: true })
+    const note = await readOptionalText(artifactPath(directory, state, "note"))
     await cleanupWorkflowChatSession(state)
-    return inactive(project, directory, "已清空当前 active 草案。")
+    if (!note?.trim()) {
+      const next = transition(state, "放弃草案", "已取消", "用户确认放弃 active 草案；当前没有工作笔记可保留。")
+      await writeState(directory, next)
+      await fs.rm(activeDir(directory), { recursive: true, force: true })
+      return inactive(project, directory, "已清空当前 active 草案。")
+    }
+
+    await Promise.all([
+      fs.rm(artifactPath(directory, state, "messages"), { force: true }),
+      fs.rm(artifactPath(directory, state, "noteReview"), { force: true }),
+      fs.rm(artifactPath(directory, state, "operations"), { force: true }),
+      fs.rm(artifactPath(directory, state, "validation"), { force: true }),
+      fs.rm(artifactPath(directory, state, "preview"), { force: true }),
+    ])
+    const next = transition(
+      State.parse({ ...state, sessionID: undefined }),
+      "放弃草案",
+      "笔记已生成",
+      "用户确认放弃当前草案；已保留工作笔记并清空图操作草案、校验、预览和聊天会话。",
+    )
+    await writeState(directory, next)
+    return ok(project, directory, next, "已放弃当前草案，并保留工作笔记。", {
+      notePath: next.artifacts.note,
+      preservedNote: true,
+    })
   }
 
   function commandFromPayload(payload: z.infer<typeof OperationsPayload>): GraphCommand {

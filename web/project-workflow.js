@@ -525,7 +525,7 @@ async function maybeAskRestoreWorkflow() {
   if (restorePromptProject === project.name) return
   restorePromptProject = project.name
 
-  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“确定”会恢复本轮 active workflow。\n选择“取消”会放弃并删除 workflows/active 草案，包括本轮工作笔记、图操作草案、校验、预览和聊天会话；已写入的正式图数据不会删除。`)
+  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“确定”会恢复本轮 active workflow。\n选择“取消”会放弃当前图操作草案、校验、预览和聊天会话；如果已有工作笔记，会保留 workflows/active/note.md。已写入的正式图数据不会删除。`)
   if (ok) return
 
   suppressRestorePrompt = true
@@ -1128,7 +1128,7 @@ async function discardWorkflowFromButton() {
     return
   }
   const state = currentWorkflowState()
-  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n这会删除 workflows/active 草案，包括本轮工作笔记、图操作草案、校验、预览和聊天会话；已写入的正式图数据不会删除。`)
+  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n这会清空当前图操作草案、校验、预览和聊天会话；如果已有工作笔记，会保留 workflows/active/note.md。已写入的正式图数据不会删除。`)
   if (!ok) return
   btnDiscardWorkflow.disabled = true
   try {

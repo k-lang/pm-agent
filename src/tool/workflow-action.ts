@@ -16,7 +16,7 @@ const DESCRIPTION = `
 
 支持的 action：
 - 开始或恢复：进入项目工作推进流程，读取或创建 workflows/active 草案。
-- 放弃草案：仅当用户明确要求放弃时调用，清空 active 草案。
+- 放弃草案：仅当用户明确要求放弃时调用；如已有 note.md 会保留工作笔记并清空图操作草案、校验、预览和聊天会话，没有 note.md 时清空 active 草案。
 - 追加消息：记录用户或助手消息。payload: { "role": "用户|助手|系统", "text": "..." }
 - 登记资源：登记已上传或可引用资源。payload: { "path": "...", "title": "...", "note": "..." }
 - 同步工作笔记变更：在 note.md 已通过人工导入或原版 write/edit/apply_patch 创建或更新后，同步状态并清空旧图操作草案、校验和预览。payload: { "summary": "...", "source": "llm_draft|manual_import|manual_edit|llm_revision" }

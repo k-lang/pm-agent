@@ -579,16 +579,17 @@ async function latestAssistantText(sessionID: SessionID) {
 
 function warmupPrompt(project: string) {
   return [
-    "请进入工作推进的项目上下文预热模式。",
+    "请执行工作推进项目上下文预热。",
     "",
     `项目名：${project}`,
     "",
     "要求：",
     "- 使用 project-workflow-context-warmup Skill。",
     "- 只建立项目主干上下文，供后续 workflow chat session fork 使用。",
+    "- 只读取项目资料，不要创建、修改或删除任何文件。",
     "- 不要调用 workflow_action。",
     "- 不要生成正式项目总结报告，不要写 report_output。",
-    "- 输出 Markdown，覆盖项目主线、当前目标状态、关键工作线、关键问题与结果、最近变化、关键来源和后续推进需要确认的上下文缺口。",
+    "- 输出紧凑 Markdown，覆盖项目主线、当前目标状态、主要问题、主要工作块、最近变化的粗略线索、后续查找入口和需要确认的上下文缺口。",
   ].join("\n")
 }
 
@@ -648,7 +649,7 @@ async function runWorkflowWarmup(project: string, directory: string, carry: Proj
       directory,
       fn: () => SessionPrompt.prompt({
         sessionID: warmupSession.id,
-        agent: "project_workflow",
+        agent: "project_workflow_warmup",
         noReply: true,
         parts: [{ type: "text", text: warmupPrompt(project) }],
       }),
@@ -873,7 +874,19 @@ export const ProjectRoutes = lazy(() =>
           directory,
           fn: () => Session.messages({ sessionID: sessionID as SessionID }),
         })
-        return c.json({ sessionID, messages, workflow: active })
+        const startedAt = active.state?.sessionStartedAt
+        let visibleMessages = messages
+        if (typeof startedAt === "number") {
+          visibleMessages = messages.filter((message) => (message.info.time.created ?? 0) >= startedAt)
+        } else if (active.state?.warmupSessionID) {
+          const warmupMessages = await Instance.provide({
+            directory,
+            fn: () => Session.messages({ sessionID: active.state!.warmupSessionID as SessionID }),
+          }).catch(() => [])
+          const warmupCutoff = Math.max(0, ...warmupMessages.map((message) => message.info.time.created ?? 0))
+          if (warmupCutoff > 0) visibleMessages = messages.filter((message) => (message.info.time.created ?? 0) > warmupCutoff)
+        }
+        return c.json({ sessionID, messages: visibleMessages, workflow: active })
       },
     )
     .get(

@@ -1,11 +1,11 @@
 ---
 name: project-workflow-context-warmup
-description: 用于已有图数据项目进入工作推进前的项目上下文预热。读取当前项目图谱、最近总结、关键 notes 和 source 资源，建立后续 workflow chat session 可继承的主干上下文；不生成正式汇报，不直接生成工作笔记或图操作。
+description: 用于已有图数据项目进入工作推进前的轻量项目上下文预热。只读取项目主干索引和少量 goal、issue、work_block 信息，建立后续 workflow chat session 可继承的大致上下文；不生成正式汇报，不下钻 notes，不直接生成工作笔记或图操作。
 ---
 
 # 项目上下文预热 Skill
 
-本技能只用于已有图数据项目的工作推进预热。调用本技能的目的不是让 `skill` 工具结果本身成为最终上下文，而是给模型一套独立的阅读方法和取数路径，诱导模型在当前 warmup session 中形成一段可被后续 workflow chat session 继承的项目主干理解。
+本技能只用于已有图数据项目的工作推进预热。预热要轻，只建立“大致项目主干”，不要试图在用户提出具体问题前完成深度定位。
 
 未初始化项目不要使用本技能，直接进入项目初始化流程。
 
@@ -13,22 +13,21 @@ description: 用于已有图数据项目进入工作推进前的项目上下文�
 
 在 warmup session 的助手回复中形成一份紧凑、可继承的项目推进上下文，供后续工作推进对话 fork 使用。后端可以把这段助手回复保存到 `workflows/active/context_warmup.md`，但这不是本技能直接写文件的职责。
 
-这段上下文应更像“项目主干地图”，而不是正式汇报。它要帮助后续模型判断：
+这段上下文应更像“项目主干地图”，而不是正式汇报。它只需要帮助后续模型判断：
 
 - 当前项目主要在解决什么问题。
-- 图数据体现了哪些目标、工作线、问题、结果和最近变化。
-- 后续用户如果问某类工作、问题或计划，应优先沿哪些节点、分支、notes 或 source 资源继续查。
+- 图数据中有哪些主要目标、问题和工作块。
+- 后续用户如果问某类工作、问题或计划，应优先沿哪些 goal、issue、work_block 继续查。
 - 哪些内容只是预热阶段的弱理解，后续推进时仍需向用户确认或继续下钻。
 
 必须覆盖：
 
-- 项目背景和初始目标。
-- 当前主要目标及状态。
-- 主要工作块和关键工作项。
-- 未完成或正在推进的工作。
-- 关键问题、关键结果和最近变化。
-- 可能影响后续工作推进的上下文缺口。
-- 关键 notes/source 引用。
+- 项目主线的粗略判断。
+- 当前主要 goal 的状态。
+- 主要 issue。
+- 主要 work_block。
+- 最近变化的粗略线索。
+- 后续推进时需要继续下钻确认的上下文缺口。
 
 ## 边界
 
@@ -45,32 +44,24 @@ description: 用于已有图数据项目进入工作推进前的项目上下文�
 
 ## 方法
 
-本技能是独立技能，不依赖其他技能。开始前先阅读本技能目录下的资源：
+本技能是独立技能，不依赖其他技能，也不要求读取额外 resource 方法论文件。
 
-- `resource/图数据索引阅读指南.md`
+读取顺序：
 
-使用资源中的“索引驱动、按需深入”方法，但不要执行正式汇报流程，不要建立汇报输出目录，不要生成证据卡片文件。
+1. 如果存在 `changes/changelog.txt`，只快速读取最近若干 step 和开头若干 step，用于判断项目主线和最近变化；不要完整复盘每一步。
+2. 优先读取 `descriptions_output/description_summary/` 下与 `goal_*.txt`、`issue_*.txt`、`work_block_*.txt` 对应的少量文件。
+3. 如果 `description_summary` 缺失，再读取 `nodes/goal/`、`nodes/issue/`、`nodes/work_block/` 下的 JSON。只提取 `id`、`summary`、`description` 的当前概括、状态/完成度和关联 work_block/work_item 数量等主干字段。
+4. 可以读取 `workflows/active/state.json`，了解当前 active 草案阶段；如果已有 `context_warmup.md`，可以参考但不要照抄。
+5. 默认不要读取 `notes/`、`source/`、`nodes/work_item/`、`nodes/result/`、`edges/` 或完整 snapshots。只有在 goal/issue/work_block 完全无法判断项目主线时，才允许读取极少量最相关的文件，并在输出中说明这是预热阶段的弱理解。
 
-优先使用：
+硬性预算：
 
-1. `README.md`：项目背景。
-2. `report_output/current_final_report.md` 或最近 `report_output/*/final_report.md`：当前项目总结。
-3. `changes/changelog.txt`：时间线、最近变化、关键 step。
-4. `descriptions_output/description_summary/` 和 `descriptions_output/history/`：快速定位目标、工作块、工作项、问题、结果。
-5. `notes/`：关键判断和重要工作细节的权威来源。
-6. `source/`：用户上传的项目资源清单和可预览文本资料。
+- 目标是快速停止并输出上下文，不追求完整。
+- 工具读取总数应控制在约 10 次以内；大型项目更要保守。
+- 输出长度控制在 800-1500 中文字左右。
+- 如果索引缺失或信息不足，直接写“预热只能建立粗略理解，后续需按用户问题下钻”，不要为了补全而继续大量读取。
 
-不要批量读取所有节点或所有 notes。先从总结、changelog 和 summary/history 定位主干，再按需下钻到少量关键 notes。
-
-证据权威级别：
-
-```text
-notes > nodes/descriptions_output > changelog
-```
-
-如果只能从 changelog 得到某个判断，应标记为弱证据。
-
-## warmup session 回复格式
+## 输出格式
 
 使用 Markdown，建议结构：
 
@@ -81,25 +72,17 @@ notes > nodes/descriptions_output > changelog
 
 ## 当前目标状态
 
-## 关键工作线
+## 主要问题
 
-## 关键问题与结果
+## 主要工作块
 
 ## 最近变化
 
-## 后续推进的查找地图
+## 后续查找入口
 
 ## 待确认的上下文缺口
-
-## 关键来源
 ```
 
-输出要面向后续工作推进，而不是面向项目汇报读者。保持紧凑，避免长篇叙事。
+输出要面向后续工作推进，而不是面向项目汇报读者。保持紧凑，避免长篇叙事。不要列大量节点；每类只列最重要的主干入口。
 
-“后续推进的查找地图”应明确写出：
-
-- 如果用户提到某条工作线，应优先查看哪些 goal/work_block/work_item/result/issue。
-- 如果用户要了解某个结果或问题，应从哪些 history、summary 或 notes 下钻。
-- 如果用户上传或引用了 source 资源，应如何和既有图数据对齐。
-
-不要把目录结构介绍当作最终内容；目录和资源只是帮助后续模型定位项目事实的导航线索。
+“后续查找入口”只写主干节点和需要下钻的方向，例如“若用户问某目标的具体依据，再读取该 goal 关联的 work_block/work_item 和对应 notes”。不要在预热阶段提前完成这些下钻。

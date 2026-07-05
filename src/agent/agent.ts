@@ -15,6 +15,7 @@ import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import PROMPT_PROJECT_WORKFLOW from "./prompt/project-workflow.txt"
+import PROMPT_PROJECT_WORKFLOW_WARMUP from "./prompt/project-workflow-warmup.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
 import { Global } from "@/global"
@@ -220,13 +221,35 @@ export namespace Agent {
             },
             skill: {
               "*": "deny",
-              "project-workflow-context-warmup": "allow",
             },
             read: "allow",
           }),
           user,
         ),
         prompt: PROMPT_PROJECT_WORKFLOW,
+      },
+      project_workflow_warmup: {
+        name: "project_workflow_warmup",
+        description: "项目工作推进上下文预热 Agent。只读项目主干索引和少量 goal、issue、work_block 信息，建立后续 workflow chat 可 fork 的轻量上下文。",
+        mode: "primary",
+        native: true,
+        hidden: true,
+        options: {},
+        permission: Permission.merge(
+          defaults,
+          Permission.fromConfig({
+            "*": "deny",
+            read: "allow",
+            grep: "allow",
+            glob: "allow",
+            skill: {
+              "*": "deny",
+              "project-workflow-context-warmup": "allow",
+            },
+          }),
+          user,
+        ),
+        prompt: PROMPT_PROJECT_WORKFLOW_WARMUP,
       },
     }
 
