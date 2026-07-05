@@ -56,7 +56,6 @@ const modalError = document.getElementById('modal-error')
 const btnCancelProject = document.getElementById('btn-cancel-project')
 const btnCreateProject = document.getElementById('btn-create-project')
 const noteImportModal = document.getElementById('note-import-modal')
-const noteImportTitle = document.getElementById('note-import-title')
 const noteImportContent = document.getElementById('note-import-content')
 const noteImportError = document.getElementById('note-import-error')
 const btnCancelNoteImport = document.getElementById('btn-cancel-note-import')
@@ -940,7 +939,6 @@ function hideError() {
 }
 
 function openNoteImportModal() {
-  noteImportTitle.value = workflowNote?.exists ? '人工修改工作笔记' : ''
   noteImportContent.value = workflowNote?.content || ''
   hideNoteImportError()
   noteImportModal.classList.remove('hidden')
@@ -1029,7 +1027,6 @@ async function importPastedNote() {
   hideNoteImportError()
   const project = selectedProject()
   const content = noteImportContent.value.trim()
-  const title = noteImportTitle.value.trim()
   if (!project) {
     showNoteImportError('请先选择项目')
     return
@@ -1046,7 +1043,7 @@ async function importPastedNote() {
     const result = await fetchJson(API + `/project/workflow/note/import?project=${encodeURIComponent(project.name)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content, title: title || undefined }),
+      body: JSON.stringify({ content }),
     })
     workflowNote = result
     if (result?.workflow) workflow = result.workflow

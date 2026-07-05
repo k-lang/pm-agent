@@ -259,7 +259,7 @@ describe("server routes", () => {
       const first = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: "first note", title: "manual" }),
+        body: JSON.stringify({ content: "first note" }),
       }))
       expect(first.status).toBe(200)
       const firstBody = await first.json()

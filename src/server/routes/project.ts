@@ -72,7 +72,6 @@ const WorkflowWarmupInput = z.object({
 
 const WorkflowNoteImportInput = z.object({
   content: z.string().min(1),
-  title: z.string().optional(),
 })
 
 const WorkflowNote = z.object({
@@ -486,7 +485,6 @@ async function readWorkflowNote(project: string) {
 async function importWorkflowNote(input: {
   project: string
   content: string
-  title?: string
   sourcePath?: string
   sourceName?: string
 }) {
@@ -500,7 +498,7 @@ async function importWorkflowNote(input: {
       action: "登记资源",
       payload: {
         path: input.sourcePath,
-        title: input.sourceName ?? input.title ?? input.sourcePath,
+        title: input.sourceName ?? input.sourcePath,
         note: "人工导入工作笔记时保留的原始文件。",
       },
     })
@@ -558,7 +556,6 @@ async function importWorkflowNoteFromFile(project: string, file: File) {
   return importWorkflowNote({
     project,
     content,
-    title: file.name,
     sourcePath: resource.path,
     sourceName: resource.originalName,
   })
@@ -926,7 +923,6 @@ export const ProjectRoutes = lazy(() =>
         return c.json(await importWorkflowNote({
           project,
           content: input.content,
-          title: input.title,
         }))
       },
     )
