@@ -38,6 +38,7 @@ const chatHint = document.getElementById('chat-hint')
 const chatInput = document.getElementById('chat-input')
 const btnChatSend = document.getElementById('btn-chat-send')
 const btnWarmup = document.getElementById('btn-warmup')
+const warmupStatus = document.getElementById('warmup-status')
 const operationList = document.getElementById('operation-list')
 const noteList = document.getElementById('note-list')
 const resourceList = document.getElementById('resource-list')
@@ -742,6 +743,11 @@ function renderChat() {
   btnWarmup.classList.toggle('hidden', !project?.graphInitialized)
   btnWarmup.disabled = !canWarmup
   btnWarmup.textContent = state?.warmupStatus === 'completed' ? '重新预热项目上下文' : '开始项目上下文预热'
+  const showWarmupStatus = !!project?.graphInitialized
+  const warmupDisplayStatus = warmupStarting ? 'running' : (state?.warmupStatus || '')
+  warmupStatus.classList.toggle('hidden', !showWarmupStatus)
+  warmupStatus.textContent = showWarmupStatus ? warmupStatusText(warmupDisplayStatus) : ''
+  warmupStatus.dataset.status = warmupDisplayStatus || 'none'
 
   if (workflowLoading && !workflowMessages.length) {
     chatLog.innerHTML = ''

@@ -165,6 +165,24 @@ button:disabled {
   gap: 8px;
   flex-shrink: 0;
 }
+.warmup-status {
+  color: #9ca3af;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.warmup-status[data-status="completed"] {
+  color: #86efac;
+}
+.warmup-status[data-status="running"] {
+  color: #93c5fd;
+}
+.warmup-status[data-status="failed"] {
+  color: #fca5a5;
+}
+.warmup-status[data-status="stale"] {
+  color: #fde68a;
+}
 #workspace-tabs {
   display: flex;
   align-items: center;
