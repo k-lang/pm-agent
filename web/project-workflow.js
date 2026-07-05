@@ -6,6 +6,7 @@ import {
   permissionListUrl,
   permissionReplyUrl,
   renderResourceItem,
+  renderWorkflowReviewBody,
   renderWorkflowToolPart,
   resetWorkflowViewState,
   upsertWorkflowPermissionRecord as upsertWorkflowPermissionRecordList,
@@ -69,7 +70,7 @@ const permissionReviewError = document.getElementById('permission-review-error')
 const btnClosePermissionReview = document.getElementById('btn-close-permission-review')
 const btnRejectPermissionReview = document.getElementById('btn-reject-permission-review')
 const btnApprovePermissionReview = document.getElementById('btn-approve-permission-review')
-let activeTab = 'graph'
+let activeTab = 'notes'
 let resources = []
 let workflowNote = null
 let selectedResourcePath = ''
@@ -651,7 +652,7 @@ function renderPermissionReviewModal() {
   permissionReviewFile.textContent = record.file || workflowPermissionFile(record)
   permissionReviewStatus.textContent = workflowPermissionStatusText(record.status)
   permissionReviewStatus.className = `permission-status ${record.status || 'pending'}`
-  permissionReviewDiff.textContent = record.diff || workflowPermissionDiff(record)
+  permissionReviewDiff.innerHTML = renderWorkflowReviewBody(record)
   btnClosePermissionReview.classList.toggle('hidden', pending)
   btnApprovePermissionReview.classList.toggle('hidden', !pending)
   btnRejectPermissionReview.classList.toggle('hidden', !pending)

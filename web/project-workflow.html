@@ -29,34 +29,13 @@
           <div id="project-status"></div>
         </div>
         <div id="workspace-tabs">
-          <button type="button" class="tab-button active" data-tab="graph">图谱变更</button>
-          <button type="button" class="tab-button" data-tab="notes">工作笔记</button>
+          <button type="button" class="tab-button active" data-tab="notes">工作笔记</button>
           <button type="button" class="tab-button" data-tab="resources">项目资源</button>
+          <button type="button" class="tab-button" data-tab="graph">图谱变更</button>
         </div>
 
         <div id="workspace-body">
-          <section id="graph-tab" class="workspace-tab active" data-tab-panel="graph">
-            <div class="preview-main">
-              <div class="preview-header">
-                <h3>图谱预览 <span>展示当前图谱和草案变更</span></h3>
-              </div>
-              <div id="graph-preview" class="preview-content">
-                <div class="placeholder">等待图谱草案。</div>
-              </div>
-            </div>
-            <aside class="side-index">
-              <div class="side-header">
-                <h3>图操作索引 <span>自然语言展示图操作</span></h3>
-              </div>
-              <div id="operation-list" class="side-list"></div>
-              <div id="operation-actions">
-                <button id="btn-apply" type="button" class="btn-primary-action">确认提交图操作</button>
-                <button id="btn-discard-workflow" type="button" class="btn-danger">放弃本轮草案</button>
-              </div>
-            </aside>
-          </section>
-
-          <section id="notes-tab" class="workspace-tab" data-tab-panel="notes">
+          <section id="notes-tab" class="workspace-tab active" data-tab-panel="notes">
             <div class="preview-main">
               <div class="preview-header">
                 <h3>工作笔记预览 <span>人工导入、人工修改或 AI 生成</span></h3>
@@ -96,6 +75,27 @@
                 <input id="resource-file" type="file" class="hidden">
               </div>
               <div id="resource-list" class="side-list"></div>
+            </aside>
+          </section>
+
+          <section id="graph-tab" class="workspace-tab" data-tab-panel="graph">
+            <div class="preview-main">
+              <div class="preview-header">
+                <h3>图谱预览 <span>展示当前图谱和草案变更</span></h3>
+              </div>
+              <div id="graph-preview" class="preview-content">
+                <div class="placeholder">等待图谱草案。</div>
+              </div>
+            </div>
+            <aside class="side-index">
+              <div class="side-header">
+                <h3>图操作索引 <span>自然语言展示图操作</span></h3>
+              </div>
+              <div id="operation-list" class="side-list"></div>
+              <div id="operation-actions">
+                <button id="btn-apply" type="button" class="btn-primary-action">确认提交图操作</button>
+                <button id="btn-discard-workflow" type="button" class="btn-danger">放弃本轮草案</button>
+              </div>
             </aside>
           </section>
         </div>
@@ -170,7 +170,7 @@
         </div>
         <span id="permission-review-status" class="permission-status">待审核</span>
       </div>
-      <pre id="permission-review-diff" class="permission-review-diff"></pre>
+      <div id="permission-review-diff" class="permission-review-diff"></div>
       <div id="permission-review-error" class="modal-error hidden"></div>
       <div class="modal-actions">
         <button id="btn-close-permission-review" type="button" class="btn-secondary">关闭</button>

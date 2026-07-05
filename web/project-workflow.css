@@ -616,9 +616,105 @@ button:disabled {
   border-radius: 8px;
   background: #020617;
   color: #cbd5e1;
-  padding: 12px;
-  white-space: pre;
+  padding: 0;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.diff-view {
+  min-width: max-content;
+  padding: 8px 0;
+}
+.diff-row {
+  display: grid;
+  grid-template-columns: 56px 56px 24px minmax(520px, 1fr);
+  min-height: 22px;
+  border-left: 3px solid transparent;
+}
+.diff-row:hover {
+  background: rgba(148, 163, 184, 0.08);
+}
+.diff-line {
+  user-select: none;
+  color: #64748b;
+  text-align: right;
+  padding: 2px 10px 2px 6px;
+  border-right: 1px solid rgba(51, 65, 85, 0.72);
+}
+.diff-marker {
+  user-select: none;
+  text-align: center;
+  color: #94a3b8;
+  padding: 2px 0;
+}
+.diff-content {
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 2px 14px 2px 4px;
+}
+.diff-file,
+.diff-meta {
+  background: #0f172a;
+  color: #cbd5e1;
+}
+.diff-file .diff-content,
+.diff-meta .diff-content {
+  color: #93c5fd;
+  font-weight: 650;
+}
+.diff-hunk {
+  background: #172554;
+  color: #bfdbfe;
+}
+.diff-hunk .diff-content {
+  color: #bfdbfe;
+}
+.diff-delete {
+  background: rgba(127, 29, 29, 0.42);
+  border-left-color: #ef4444;
+}
+.diff-delete .diff-marker,
+.diff-delete .diff-content {
+  color: #fecaca;
+}
+.diff-add {
+  background: rgba(20, 83, 45, 0.42);
+  border-left-color: #22c55e;
+}
+.diff-add .diff-marker,
+.diff-add .diff-content {
+  color: #bbf7d0;
+}
+.diff-note {
+  color: #94a3b8;
+  font-style: italic;
+}
+.diff-word {
+  border-radius: 3px;
+  padding: 0 1px;
+  background: rgba(250, 204, 21, 0.28);
+  color: #fef9c3;
+}
+.diff-delete .diff-word {
+  background: rgba(248, 113, 113, 0.35);
+  color: #fee2e2;
+}
+.diff-add .diff-word {
+  background: rgba(74, 222, 128, 0.32);
+  color: #dcfce7;
+}
+.diff-empty {
+  padding: 16px;
+  color: #94a3b8;
+  font: 13px/1.5 system-ui, "PingFang SC", sans-serif;
+}
+.write-content-view {
+  padding: 12px;
+}
+.write-content-view pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #dbeafe;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 .modal-header h2 { font-size: 18px; margin-bottom: 4px; }
 .modal-header p { color: #9ca3af; font-size: 13px; line-height: 1.5; }

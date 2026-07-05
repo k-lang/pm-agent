@@ -3,16 +3,21 @@ import {
   allWorkflowDiffRecords,
   editToolRecords,
   isEditTool,
+  isWriteTool,
   markWorkflowPermissionRecord,
   mergeWorkflowPermissionRecords,
   permissionListUrl,
   permissionReplyUrl,
   renderResourceItem,
+  renderUnifiedDiff,
+  renderWorkflowReviewBody,
   renderWorkflowToolPart,
+  renderWriteContent,
   rejectedEditToolRecords,
   resetWorkflowViewState,
   upsertWorkflowPermissionRecord,
   visibleWorkflowPermissionRecords,
+  writeToolRecords,
 } from "./project-workflow-view.js"
 
 function permission(overrides = {}) {
@@ -60,10 +65,13 @@ function completedWriteMessage() {
     state: {
       status: "completed",
       title: "workflows/active/note.md",
+      input: {
+        filePath: "workflows/active/note.md",
+        content: "# 第一版工作笔记\n",
+      },
       metadata: {
         filepath: "workflows/active/note.md",
-        diff: "--- old\n+++ new\n@@\n+first note\n",
-        filediff: { file: "workflows/active/note.md" },
+        exists: false,
       },
     },
   })
@@ -101,8 +109,9 @@ describe("project workflow view helpers", () => {
     })
   })
 
-  test("treats original write/edit/apply_patch tools as edit diff sources", () => {
-    expect(isEditTool("write")).toBe(true)
+  test("distinguishes write content records from edit diff records", () => {
+    expect(isWriteTool("write")).toBe(true)
+    expect(isEditTool("write")).toBe(false)
     expect(isEditTool("edit")).toBe(true)
     expect(isEditTool("apply_patch")).toBe(true)
     expect(isEditTool("workflow_action")).toBe(false)
@@ -147,13 +156,25 @@ describe("project workflow view helpers", () => {
     }])
   })
 
-  test("uses completed write and apply_patch metadata as executed diff history", () => {
+  test("uses completed apply_patch metadata as executed diff history", () => {
     const records = editToolRecords([completedWriteMessage(), completedApplyPatchMessage()])
 
     expect(records).toMatchObject([
-      { id: "tool:msg_1:call_write", title: "已修改工作笔记", diff: expect.stringContaining("first note") },
       { id: "tool:msg_1:call_patch", title: "已修改工作笔记", diff: expect.stringContaining("patched") },
     ])
+  })
+
+  test("uses completed write input as executed content history", () => {
+    const records = writeToolRecords([completedWriteMessage()])
+
+    expect(records).toMatchObject([{
+      id: "tool-write:executed:msg_1:call_write",
+      kind: "content",
+      status: "executed",
+      title: "已创建工作笔记",
+      content: expect.stringContaining("第一版工作笔记"),
+      buttonLabel: "查看写入内容",
+    }])
   })
 
   test("hides approved permission entry when matching executed tool diff exists", () => {
@@ -186,6 +207,31 @@ describe("project workflow view helpers", () => {
     expect(html).toContain("查看 diff")
   })
 
+  test("renders unified diff with line numbers and highlighted changed spans", () => {
+    const html = renderUnifiedDiff("--- a/note.md\n+++ b/note.md\n@@ -2,2 +2,2 @@\n-old value\n+new value\n context\n")
+
+    expect(html).toContain("diff-view")
+    expect(html).toContain("diff-delete")
+    expect(html).toContain("diff-add")
+    expect(html).toContain("diff-hunk")
+    expect(html).toContain('<span class="diff-line old">2</span>')
+    expect(html).toContain('<span class="diff-line new">2</span>')
+    expect(html).toContain('<span class="diff-word">old</span>')
+    expect(html).toContain('<span class="diff-word">new</span>')
+  })
+
+  test("renders an empty diff fallback", () => {
+    expect(renderUnifiedDiff("")).toContain("没有可展示的 diff")
+  })
+
+  test("renders write content without presenting it as a diff", () => {
+    const html = renderWriteContent("# note\n")
+
+    expect(html).toContain("write-content-view")
+    expect(html).toContain("# note")
+    expect(html).not.toContain("diff-add")
+  })
+
   test("does not render a diff button for unrelated tools", () => {
     const html = renderWorkflowToolPart({
       type: "tool",
@@ -195,6 +241,16 @@ describe("project workflow view helpers", () => {
 
     expect(html).toContain("状态机动作 · completed")
     expect(html).not.toContain("data-tool-diff-open")
+  })
+
+  test("renders completed write tool part with a content button", () => {
+    const part = completedWriteMessage().parts[0]
+    const html = renderWorkflowToolPart(part, completedWriteMessage())
+
+    expect(html).toContain("已创建工作笔记 · 已执行")
+    expect(html).toContain("data-tool-diff-open=\"tool-write:executed:msg_1:call_write\"")
+    expect(html).toContain("查看写入内容")
+    expect(html).not.toContain("查看 diff")
   })
 
   test("renders rejected edit tool errors with a diff button reconstructed from tool input", () => {
@@ -211,7 +267,7 @@ describe("project workflow view helpers", () => {
     }
     const html = renderWorkflowToolPart(part, message)
 
-    expect(html).toContain("edit · 用户已拒绝")
+    expect(html).toContain("已拒绝修改工作笔记 · 用户已拒绝")
     expect(html).toContain("data-tool-diff-open=\"tool-rejected:msg_1:call_1\"")
     expect(rejectedEditToolRecords([{ ...message, parts: [part] }])).toMatchObject([{
       id: "tool-rejected:msg_1:call_1",
@@ -221,20 +277,38 @@ describe("project workflow view helpers", () => {
     }])
   })
 
-  test("reconstructs rejected write and apply_patch proposals from persisted tool input", () => {
+  test("renders rejected write as submitted content, not diff", () => {
+    const message = {
+      info: { id: "msg_rejected" },
+      parts: [{
+        type: "tool",
+        tool: "write",
+        callID: "call_write_rejected",
+        state: {
+          status: "error",
+          input: { filePath: "workflows/active/note.md", content: "new note" },
+          error: "The user rejected permission to use this specific tool call.",
+        },
+      }],
+    }
+    const records = writeToolRecords([message])
+    const html = renderWorkflowToolPart(message.parts[0], message)
+
+    expect(records).toMatchObject([{
+      id: "tool-write:rejected:msg_rejected:call_write_rejected",
+      title: "已拒绝写入工作笔记",
+      content: "new note",
+      buttonLabel: "查看模型提交的内容",
+    }])
+    expect(html).toContain("已拒绝写入工作笔记 · 用户已拒绝")
+    expect(html).toContain("查看模型提交的内容")
+    expect(renderWorkflowReviewBody(records[0])).toContain("new note")
+  })
+
+  test("reconstructs rejected apply_patch proposals from persisted tool input", () => {
     const message = {
       info: { id: "msg_rejected" },
       parts: [
-        {
-          type: "tool",
-          tool: "write",
-          callID: "call_write_rejected",
-          state: {
-            status: "error",
-            input: { filePath: "workflows/active/note.md", content: "new note" },
-            error: "The user rejected permission to use this specific tool call.",
-          },
-        },
         {
           type: "tool",
           tool: "apply_patch",
@@ -249,11 +323,6 @@ describe("project workflow view helpers", () => {
     }
 
     expect(rejectedEditToolRecords([message])).toMatchObject([
-      {
-        id: "tool-rejected:msg_rejected:call_write_rejected",
-        title: "已拒绝修改工作笔记",
-        diff: expect.stringContaining("+new note"),
-      },
       {
         id: "tool-rejected:msg_rejected:call_patch_rejected",
         title: "已拒绝修改工作笔记",

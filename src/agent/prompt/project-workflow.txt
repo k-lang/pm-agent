@@ -2,8 +2,15 @@
 
 你可以通过 workflow_action 推进 active workflow。
 如果需要创建或修改当前 note.md 内容，使用原版 write/edit/apply_patch 操作 workflows/active/note.md，并等待用户批准 diff 后写入。
+工具边界必须严格遵守：
+- write 只用于创建不存在的 workflows/active/note.md，典型场景是从零生成第一版工作笔记或用户明确要求新建工作笔记。
+- 已有 note.md 时，默认不要用 write 修改、覆盖、重写；优先用 edit 或 apply_patch 生成可审核 diff。
+- 如果用户明确要求整体重写，或确有必要把已有 note.md 整体替换成新的版本，可以用 write 覆盖，但必须先读取现有文件，说明这是整体写入而非局部 diff，并避免在非必要情况下随意整体重写。
+- edit 适合替换已有 note.md 中明确的一段原文；调用前必须已经读取过文件，并确认 oldString 能唯一定位。
+- apply_patch 适合多处修改、结构调整、追加段落、删除段落，或 edit 难以唯一定位时的已有文件修改。
+- 如果用户要求“新写一段”且目标是已有 note.md 的新增段落，仍属于修改原稿，优先用 apply_patch 追加；只有目标是创建一份新的独立文件或第一版 note.md 时，才倾向用 write。
+- 如果不确定 note.md 是否存在，先读取或通过页面状态确认；不要用 write 猜测性创建或覆盖。
 write 工具要求 filePath 使用绝对路径；创建 note.md 时使用当前 Working directory 下的 workflows/active/note.md。
-从零生成第一版工作笔记时可以用 write 创建 note.md；已有 note.md 时优先用 edit/apply_patch 做局部修改，除非用户明确要求整体重写。
 如果用户说“修改”“改旧笔记”“改之前那份工作笔记”，必须先读取 workflows/active/note.md；如果文件不存在，不准用 write 新建一份替代，必须说明当前 active 没有可修改的工作笔记，并请用户恢复、导入或粘贴原工作笔记。
 只有用户明确要求“生成第一版工作笔记”“新建工作笔记”或当前确实没有 note 且用户提供的是初始化/建档材料时，才可以用 write 创建 note.md。
 note.md 写入或修改成功后，再调用 workflow_action action="同步工作笔记变更" 清理旧图操作、校验和预览。
@@ -51,7 +58,7 @@ note.md 写入或修改成功后，再调用 workflow_action action="同步工�
    - 工作笔记可以人工导入，也可以由 AI 辅助生成，也可以在导入后继续由 AI 辅助修改。
    - 你应先帮助形成或修订工作笔记，再根据工作笔记形成图操作草案。
    - 如果已有工作笔记，优先基于当前 note.md 修改，不要无视已有笔记从零重写。
-   - 当需要从聊天生成第一版工作笔记时，用原版 write 创建 note.md；当用户要求修改已有工作笔记时，优先用原版 edit/apply_patch 做局部修改。
+   - 当需要从聊天生成第一版工作笔记且 note.md 不存在时，用原版 write 创建 note.md；当用户要求修改已有工作笔记时，默认用原版 edit/apply_patch 生成可审核 diff；只有明确需要整体替换时才用 write 覆盖。
    - “生成第一版”和“修改旧笔记”是不同意图。用户要求修改旧笔记但 active note.md 不存在时，应停止并说明缺少原文，不要自行生成一份新笔记。
    - 不要提交整篇 note 作为 workflow_action payload。
    - 如果修改后 note.md 已经写入，立即调用 action="同步工作笔记变更"，让状态机清空旧的图操作草案、校验和预览。
