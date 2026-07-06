@@ -17,6 +17,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { Instance } from "@/project/instance"
 import { MessageV2 } from "@/session/message-v2"
 import { ProjectWorkflow } from "@/workflow/state"
+import { ProjectWorkflowExecution } from "@/workflow/execution"
 import { loadExpandedGraph, loadGraph, saveLayout } from "../../../standalone-graph/transform"
 
 const ProjectDirectory = z.object({
@@ -80,6 +81,8 @@ const WorkflowNote = z.object({
   path: z.string().optional(),
   workflow: ProjectWorkflow.ActionResult,
 })
+
+const WorkflowOperationArtifacts = ProjectWorkflowExecution.OperationArtifactSnapshot
 
 const GraphView = z.enum(["collapsed", "expanded"]).default("collapsed")
 
@@ -482,6 +485,12 @@ async function readWorkflowNote(project: string) {
   })
 }
 
+async function readWorkflowOperationArtifacts(project: string) {
+  const directory = projectDirectoryForName(project)
+  await ensureExistingProject(directory)
+  return ProjectWorkflowExecution.readOperationArtifacts({ project, directory })
+}
+
 async function importWorkflowNote(input: {
   project: string
   content: string
@@ -503,12 +512,12 @@ async function importWorkflowNote(input: {
       },
     })
   }
-  const workflow = await ProjectWorkflow.runAction({
+  await ProjectWorkflowExecution.writeNote({ directory, content: input.content })
+  const workflow = await ProjectWorkflowExecution.runAction({
     project: input.project,
     directory,
-    action: "更新工作笔记",
+    action: "同步工作笔记变更",
     payload: {
-      content: input.content,
       summary: input.sourcePath ? `人工导入工作笔记：${input.sourceName ?? input.sourcePath}` : "人工修改工作笔记。",
       source: input.sourcePath ? "manual_import" : "manual_edit",
       sourcePath: input.sourcePath,
@@ -775,7 +784,7 @@ export const ProjectRoutes = lazy(() =>
       validator("json", ProjectWorkflow.ActionRequest.omit({ project: true })),
       async (c) => {
         const query = c.req.valid("query")
-        return c.json(await ProjectWorkflow.runAction({ project: query.project, ...c.req.valid("json") }))
+        return c.json(await ProjectWorkflowExecution.runAction({ project: query.project, ...c.req.valid("json") }))
       },
     )
     .post(
@@ -898,6 +907,19 @@ export const ProjectRoutes = lazy(() =>
       }),
       validator("query", ProjectOnlyQuery),
       async (c) => c.json(await readWorkflowNote(c.req.valid("query").project)),
+    )
+    .get(
+      "/workflow/operations",
+      describeRoute({
+        summary: "Get active workflow graph operation artifacts",
+        operationId: "project.workflowOperations",
+        responses: {
+          200: { description: "Active workflow graph operation artifacts", content: { "application/json": { schema: resolver(WorkflowOperationArtifacts) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      async (c) => c.json(await readWorkflowOperationArtifacts(c.req.valid("query").project)),
     )
     .post(
       "/workflow/note/import",

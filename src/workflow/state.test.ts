@@ -3,6 +3,7 @@ import os from "os"
 import path from "path"
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { ProjectWorkflow } from "./state"
+import { ProjectWorkflowExecution } from "./execution"
 import { loadCommandAndExecute } from "@/graph/engine"
 
 const TRACKER_ROOT = "/mnt/sda/test_claude_code/proj5_pm/project_progress_tracker"
@@ -25,6 +26,10 @@ describe("ProjectWorkflow", () => {
   })
 
   function action(action: ProjectWorkflow.Action, payload: Record<string, unknown> = {}) {
+    return ProjectWorkflowExecution.runAction({ project: "demo", directory, action, payload })
+  }
+
+  function stateAction(action: ProjectWorkflow.Action, payload: Record<string, unknown> = {}) {
     return ProjectWorkflow.runAction({ project: "demo", directory, action, payload })
   }
 
@@ -34,6 +39,34 @@ describe("ProjectWorkflow", () => {
 
   async function readStepCommand(step: number) {
     return JSON.parse(await fs.readFile(path.join(COMMANDS_DIR, `step${step}.json`), "utf8"))
+  }
+
+  async function writeOperationDraft(command: any) {
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.mkdir(activeDir, { recursive: true })
+    await fs.writeFile(path.join(activeDir, "operation_notes.md"), `# 图操作说明\n\n${command.change_id || "未命名变更"}\n`, "utf8")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify(command, null, 2) + "\n", "utf8")
+  }
+
+  async function registerOperationDraft(command: any, summary = "登记已写入的图操作 draft。") {
+    await writeOperationDraft(command)
+    return action("生成图操作草案", {
+      summary,
+      change_id: command.change_id,
+      artifacts: { operationNotes: true, operationsDraft: true },
+    })
+  }
+
+  async function registerCompressedDraft(draft: any, summary = "登记已写入的压缩图操作 draft。") {
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.mkdir(activeDir, { recursive: true })
+    await fs.writeFile(path.join(activeDir, "operation_notes.md"), `# 图操作说明\n\n${draft.change_id || "未命名变更"}\n`, "utf8")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify(draft, null, 2) + "\n", "utf8")
+    return action("生成图操作草案", {
+      summary,
+      change_id: draft.change_id,
+      artifacts: { operationNotes: true, operationsDraft: true },
+    })
   }
 
   async function replayStepsBefore(step: number) {
@@ -62,15 +95,14 @@ describe("ProjectWorkflow", () => {
     })
     expect(reviewed.stage).toBe("笔记已生成")
 
-    const drafted = await action("生成图操作草案", { command })
-    expect(drafted.stage).toBe("图操作已生成")
-
-    const validated = await action("校验图操作")
-    expect(validated.stage).toBe("校验已通过")
+    const drafted = await registerOperationDraft(command)
+    expect(drafted.stage).toBe("校验已通过")
+    expect(drafted.data?.validation).toMatchObject({ passed: true })
 
     const previewed = await action("生成预览")
     expect(previewed.stage).toBe("预览已生成")
-    expect(previewed.data?.preview).toMatchObject({
+    const preview = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "preview.json"), "utf8"))
+    expect(preview).toMatchObject({
       change_id: "step18_knowledge_scheme",
       operationCount: 7,
     })
@@ -112,6 +144,128 @@ describe("ProjectWorkflow", () => {
     expect(completed.stage).toBe("笔记已生成")
   })
 
+  test("compiles compressed operation draft into executable operations and generated index", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+
+    const drafted = await registerCompressedDraft({
+      change_id: "compressed_step18_delta",
+      timestamp: "2026-07-06T10:00:00+08:00",
+      items: [
+        {
+          kind: "update_node",
+          node_id: "goal_knowledge_organization",
+          field_updates: { completion_score: 31 },
+          description_delta: "本轮用压缩 draft 记录：知识梳理目标补充了一次可校验的进展增量。",
+          history: "压缩 draft 更新目标完成度并追加说明增量。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "result_compressed_draft_demo",
+          node_type: "result",
+          summary: "压缩 draft 编译验证结果",
+          description: "用于验证模型只写语义增量，最终 GraphCommand 由执行层生成。",
+          fields: { status: "produced" },
+          history: "创建压缩 draft 编译验证结果节点。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_distinction_sort_creates_compressed_result",
+          from_node: "work_item_distinction_sort",
+          to_node: "result_compressed_draft_demo",
+          edge_type: "creates",
+          description: "已有语料分析工作项产出压缩 draft 编译验证结果。",
+          history: "建立工作项到压缩 draft 编译验证结果的 creates 关系。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_compressed_result_adjusts_goal",
+          from_node: "result_compressed_draft_demo",
+          to_node: "goal_knowledge_organization",
+          edge_type: "adjusts_result",
+          description: "压缩 draft 编译结果影响知识梳理目标。",
+          history: "建立压缩 draft 验证结果到知识梳理目标的影响关系。",
+        },
+      ],
+    })
+
+    expect(drafted.stage).toBe("校验已通过")
+    const activeDir = path.join(directory, "workflows", "active")
+    const command = JSON.parse(await fs.readFile(path.join(activeDir, "operations.json"), "utf8"))
+    expect(command).toMatchObject({
+      change_id: "compressed_step18_delta",
+      operations: [
+        {
+          type: "update_node",
+          node_id: "goal_knowledge_organization",
+        },
+        {
+          type: "create_node",
+          temp_id: "result_compressed_draft_demo",
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_distinction_sort_creates_compressed_result",
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_compressed_result_adjusts_goal",
+        },
+      ],
+    })
+    expect(command.operations[0].updates.description).toContain("基于标签易混淆点分析")
+    expect(command.operations[0].updates.description).toContain("本轮用压缩 draft 记录")
+    expect(command.history_descriptions).toMatchObject({
+      goal_knowledge_organization: "压缩 draft 更新目标完成度并追加说明增量。",
+      result_compressed_draft_demo: "创建压缩 draft 编译验证结果节点。",
+      edge_distinction_sort_creates_compressed_result: "建立工作项到压缩 draft 编译验证结果的 creates 关系。",
+      edge_compressed_result_adjusts_goal: "建立压缩 draft 验证结果到知识梳理目标的影响关系。",
+    })
+    const index = JSON.parse(await fs.readFile(path.join(activeDir, "operation_index.json"), "utf8"))
+    expect(index.items).toHaveLength(4)
+    expect(index.items[0].history_entry).toContain("压缩 draft")
+  })
+
+  test("compressed draft can provide full current-state descriptions for summary nodes", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+
+    const fullDescription = "领域知识梳理目标的当前状态总结：已完成代表性标签分析、资深座席反馈消化和语料实验复盘；当前认识是偏好问题和额外知识点需要分治处理，后续应扩大标签范围继续验证。"
+    const drafted = await registerCompressedDraft({
+      change_id: "compressed_full_description",
+      timestamp: "2026-07-06T10:00:00+08:00",
+      items: [
+        {
+          kind: "update_node",
+          node_id: "goal_knowledge_organization",
+          field_updates: { completion_score: 32 },
+          description: fullDescription,
+          history: "用完整当前状态总结更新领域知识梳理目标，而不是机械追加一句 delta。",
+        },
+      ],
+    })
+
+    expect(drafted.stage).toBe("校验已通过")
+    const command = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "operations.json"), "utf8"))
+    expect(command.operations[0]).toMatchObject({
+      type: "update_node",
+      node_id: "goal_knowledge_organization",
+      updates: {
+        completion_score: 32,
+        description: fullDescription,
+      },
+    })
+    expect(command.operations[0].updates.description).not.toContain("基于标签易混淆点分析")
+  })
+
   test("uses jiedaidan step17 material and a damaged command to enter graph-operation revision", async () => {
     await replayStepsBefore(17)
     await action("开始或恢复")
@@ -129,7 +283,7 @@ describe("ProjectWorkflow", () => {
       }
       return operation
     })
-    await action("生成图操作草案", { command: damaged })
+    await registerOperationDraft(damaged)
 
     const validated = await action("校验图操作")
     expect(validated.stage).toBe("图操作需修订")
@@ -137,6 +291,7 @@ describe("ProjectWorkflow", () => {
     expect(validated.recommendations.join("\n")).toContain("修订图操作")
     expect(validated.availableActions.map((item) => item.action)).toContain("生成图操作草案")
     expect(validated.availableActions.map((item) => item.action)).toContain("同步工作笔记变更")
+    expect(validated.blockedActions.find((item) => item.action === "生成预览")?.reason).toContain("校验未通过")
   })
 
   test("uses jiedaidan step19 multi-source plan material for operations-only review feedback", async () => {
@@ -150,7 +305,7 @@ describe("ProjectWorkflow", () => {
       sufficient: true,
       summary: "step19 包含工作归属、前序来源、结果和目标影响，足以生成图操作。",
     })
-    await action("生成图操作草案", { command: await readStepCommand(19) })
+    await registerOperationDraft(await readStepCommand(19))
     await action("校验图操作")
     await action("生成预览")
     await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).resolves.toBeTruthy()
@@ -170,21 +325,449 @@ describe("ProjectWorkflow", () => {
     await action("开始或恢复")
     await action("更新工作笔记", { content: await readOriginalNote("knowledge_entry_point.txt"), summary: "使用 step18 对应原始工作笔记。" })
     const command = await readStepCommand(18)
-    await action("生成图操作草案", { command })
+    await registerOperationDraft(command)
     await action("校验图操作")
     await action("生成预览")
 
-    const regenerated = await action("生成图操作草案", {
-      command: {
-        ...command,
-        change_id: "step18_knowledge_scheme_revised",
-        description: "根据审核意见重新生成 step18 图操作草案。",
+    const regenerated = await registerOperationDraft({
+      ...command,
+      change_id: "step18_knowledge_scheme_revised",
+      description: "根据审核意见重新生成 step18 图操作草案。",
+    }, "根据审核意见重新登记 step18 图操作草案。")
+    expect(regenerated.stage).toBe("校验已通过")
+    await expect(fs.stat(path.join(directory, "workflows", "active", "operations.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "validation.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
+  })
+
+  test("requires operations.draft.json when registering graph operations", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(
+      path.join(activeDir, "operation_notes.md"),
+      "## 图操作说明\n\n准备更新已有目标，并追加本次试探性验证的历史条目。\n",
+      "utf8",
+    )
+
+    await expect(action("生成图操作草案", {
+      summary: "只登记自然语言说明不应该推进图操作状态。",
+      change_id: "workflow_without_operations",
+      artifacts: {
+        operationNotes: true,
+        operationsDraft: false,
+      },
+    })).rejects.toThrow("生成图操作必须先写入 workflows/active/operations.draft.json")
+  })
+
+  test("keeps previous operation files when command content is submitted to the state machine", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operation_notes.md"), "旧图操作说明\n", "utf8")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "old_operations",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      operations: [],
+      history_descriptions: {},
+    }, null, 2) + "\n", "utf8")
+    await action("生成图操作草案", {
+      summary: "登记旧图操作说明和草案。",
+      change_id: "old_operations",
+      artifacts: {
+        operationNotes: true,
+        operationsDraft: true,
       },
     })
-    expect(regenerated.stage).toBe("图操作已生成")
-    await expect(fs.stat(path.join(directory, "workflows", "active", "operations.json"))).resolves.toBeTruthy()
-    await expect(fs.stat(path.join(directory, "workflows", "active", "validation.json"))).rejects.toThrow()
-    await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
+
+    await expect(action("生成图操作草案", {
+      command: { change_id: "bad_command" },
+    })).rejects.toThrow()
+
+    await expect(fs.readFile(path.join(activeDir, "operation_notes.md"), "utf8")).resolves.toContain("旧图操作说明")
+    await expect(fs.readFile(path.join(activeDir, "operations.json"), "utf8")).resolves.toContain("old_operations")
+  })
+
+  test("requires declared operation draft artifacts to exist before lightweight registration", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+
+    await expect(action("生成图操作草案", {
+      summary: "登记尚未写入的图操作草稿。",
+      artifacts: {
+        operationNotes: true,
+        operationsDraft: true,
+      },
+    })).rejects.toThrow("图操作草案产物尚未写入")
+  })
+
+  test("requires lightweight operation draft registration to declare at least one produced artifact", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+
+    await expect(action("生成图操作草案", {
+      summary: "空登记不应该推进图操作状态。",
+      artifacts: {
+        operationNotes: false,
+        operationsDraft: false,
+      },
+    })).rejects.toThrow("生成图操作必须先写入 workflows/active/operations.draft.json")
+  })
+
+  test("unified graph validation reports operations.draft.json schema errors", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_op_field",
+      operations: [
+        {
+          op: "create_node",
+          temp_id: "work_item_bad_op",
+          data: { type: "work_item", summary: "错误字段草稿" },
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误字段图操作。",
+      change_id: "bad_op_field",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    expect(JSON.stringify(registered.data?.validation)).toContain("operations.draft.json")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.issues.map((issue: { message: string }) => issue.message).join("\n")).toContain("operations.draft.json")
+  })
+
+  test("automatic validation feeds back legacy commands schema errors for model iteration", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "legacy_commands_schema",
+      description: "错误使用旧 commands schema。",
+      commands: [
+        {
+          command: "create_node",
+          temp_id: "work_item_legacy",
+          data: { type: "work_item", summary: "错误旧格式工作项" },
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记旧 schema 图操作。",
+      change_id: "legacy_commands_schema",
+      artifacts: { operationsDraft: true },
+    })
+
+    expect(registered.stage).toBe("图操作需修订")
+    expect(JSON.stringify(registered.data?.validation)).toContain("timestamp")
+    expect(JSON.stringify(registered.data?.validation)).toContain("operations")
+  })
+
+  test("unified graph validation rejects compiled operations that invent edge types", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_edge_type",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      operations: [
+        {
+          type: "create_node",
+          temp_id: "work_item_bad_edge_type",
+          data: {
+            type: "work_item",
+            summary: "错误边类型工作项",
+            linked_work_block_id: "work_block_knowledge_organization",
+          },
+        },
+        {
+          type: "create_node",
+          temp_id: "result_bad_edge_type",
+          data: { type: "result", summary: "错误边类型结果" },
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_bad_produces",
+          from_node: "work_item_bad_edge_type",
+          to_node: "result_bad_edge_type",
+          edge_type: "produces",
+          description: "错误使用 produces。",
+        },
+      ],
+      history_descriptions: {},
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记非法边类型图操作。",
+      change_id: "bad_edge_type",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    expect(validation.issues.map((issue: { message: string }) => issue.message).join("\n")).toContain("operations.draft.json")
+  })
+
+  test("unified graph validation rejects compiled operations that creates edges for attribute relationships", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_attribute_edge",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      operations: [
+        {
+          type: "create_node",
+          temp_id: "work_block_bad_attribute_edge",
+          data: { type: "work_block", summary: "错误属性关系工作块" },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_item_bad_attribute_edge",
+          data: {
+            type: "work_item",
+            summary: "错误属性关系工作项",
+            linked_work_block_id: "work_block_knowledge_organization",
+          },
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_bad_block_to_work_item",
+          from_node: "work_block_bad_attribute_edge",
+          to_node: "work_item_bad_attribute_edge",
+          edge_type: "next",
+          description: "错误地把工作块到工作项关系建成边。",
+        },
+      ],
+      history_descriptions: {},
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记属性关系建边图操作。",
+      change_id: "bad_attribute_edge",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    expect(validation.issues.map((issue: { message: string }) => issue.message).join("\n")).toContain("属性关系")
+    expect(JSON.stringify(registered.data?.validation)).toContain("属性关系")
+  })
+
+  test("automatic validation rejects result-to-issue with goal-only edge type", async () => {
+    await replayStepsBefore(17)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("distinction_sort.txt"),
+      summary: "使用 step17 对应原始工作笔记生成工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_result_issue_edge",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "result_bad_issue_relation",
+          node_type: "result",
+          summary: "错误影响问题的结果",
+          description: "用于验证 result -> issue 不能使用 adjusts_result。",
+          history: "创建用于验证错误边类型的结果节点。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_existing_work_item_creates_bad_result",
+          from_node: "work_item_daily_metric_monitoring",
+          to_node: "result_bad_issue_relation",
+          edge_type: "creates",
+          description: "已有工作项产生该结果，避免结果归属校验掩盖 result->issue 边类型错误。",
+          history: "建立已有工作项到测试结果的 creates 关系。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_bad_result_issue_relation",
+          from_node: "result_bad_issue_relation",
+          to_node: "issue_labeling_quality",
+          edge_type: "adjusts_result",
+          description: "错误地用目标关系边描述结果影响问题。",
+          history: "错误建立 result 到 issue 的 adjusts_result 关系。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误 result->issue 边类型草案。",
+      change_id: "bad_result_issue_edge",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    expect(validation.issues.map((issue: { message: string }) => issue.message).join("\n")).toContain("result -> issue 不应使用 adjusts_result")
+    expect(validation.issues.map((issue: { message: string }) => issue.message).join("\n")).toContain("affects_issue")
+  })
+
+  test("compressed draft schema rejects top-level history_descriptions array", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_history_descriptions_array",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      items: [],
+      history_descriptions: ["错误地把历史说明写成顶层数组"],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误 history_descriptions 结构草案。",
+      change_id: "bad_history_descriptions_array",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("history_descriptions")
+    expect(messages).toContain("压缩 draft 顶层不允许写")
+  })
+
+  test("compressed draft schema rejects derived reverse relationship lists", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "完成了一次试探性验证，准备更新已有目标和工作项。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_reverse_lists",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "work_block_bad_reverse",
+          node_type: "work_block",
+          summary: "错误反向列表工作块",
+          fields: {
+            linked_goal_id: "goal_knowledge_organization",
+            work_items: ["work_item_later"],
+          },
+        },
+        {
+          kind: "update_node",
+          node_id: "goal_knowledge_organization",
+          field_updates: {
+            linked_work_blocks: ["work_block_bad_reverse"],
+          },
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误反向关系列表草案。",
+      change_id: "bad_reverse_lists",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("linked_work_blocks/work_items")
+    expect(messages).toContain("反向")
+  })
+
+  test("state machine rejects full note content and expects note service to write note.md first", async () => {
+    await stateAction("开始或恢复")
+
+    await expect(stateAction("更新工作笔记", {
+      content: "状态机不应该接收整篇工作笔记。",
+      summary: "错误入口。",
+    })).rejects.toThrow("不再由状态机接收整篇 note 内容")
+
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "note.md"), "由 note service 写入的工作笔记。\n", "utf8")
+    const synced = await stateAction("同步工作笔记变更", {
+      summary: "note service 写入后同步状态。",
+      source: "manual_edit",
+    })
+    expect(synced.stage).toBe("笔记已生成")
+  })
+
+  test("state machine registers validation only after validation service writes validation artifact", async () => {
+    await replayStepsBefore(18)
+    await stateAction("开始或恢复")
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "note.md"), await readOriginalNote("knowledge_entry_point.txt"), "utf8")
+    await stateAction("同步工作笔记变更", {
+      summary: "state-only 写入工作笔记后同步状态。",
+      source: "manual_edit",
+    })
+    await writeOperationDraft(await readStepCommand(18))
+    await stateAction("生成图操作草案", {
+      summary: "state-only 登记图操作。",
+      change_id: "step18_knowledge_scheme",
+      artifacts: { operationsDraft: true },
+    })
+    await expect(stateAction("校验图操作")).rejects.toThrow()
+
+    const compiled = await ProjectWorkflowExecution.compileOperationDraft({ directory })
+    expect(compiled.ok).toBe(true)
+    const validation = await ProjectWorkflowExecution.validateOperations({ directory })
+    expect(validation.passed).toBe(true)
+    const registered = await stateAction("校验图操作", {
+      passed: validation.passed,
+      summary: "validation service 已写入校验结果。",
+    })
+    expect(registered.stage).toBe("校验已通过")
+  })
+
+  test("state machine syncs note state without managing downstream artifact cleanup", async () => {
+    await stateAction("开始或恢复")
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "note.md"), "由外部写入的工作笔记。\n", "utf8")
+    await fs.writeFile(path.join(activeDir, "operations.json"), "{}\n", "utf8")
+    await fs.writeFile(path.join(activeDir, "validation.json"), "{}\n", "utf8")
+    await fs.writeFile(path.join(activeDir, "preview.json"), "{}\n", "utf8")
+
+    const synced = await stateAction("同步工作笔记变更", {
+      summary: "只同步状态，不处理产物文件。",
+      source: "manual_edit",
+    })
+
+    expect(synced.stage).toBe("笔记已生成")
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).resolves.toBeTruthy()
   })
 
   test("updating note invalidates graph operation draft and downstream artifacts", async () => {
@@ -196,7 +779,7 @@ describe("ProjectWorkflow", () => {
       source: "manual_import",
       sourcePath: "source/knowledge_entry_point.txt",
     })
-    await action("生成图操作草案", { command: await readStepCommand(18) })
+    await registerOperationDraft(await readStepCommand(18))
     await action("校验图操作")
     await action("生成预览")
 
@@ -226,7 +809,7 @@ describe("ProjectWorkflow", () => {
       content: await readOriginalNote("knowledge_entry_point.txt"),
       summary: "使用 step18 对应原始工作笔记。",
     })
-    await action("生成图操作草案", { command: await readStepCommand(18) })
+    await registerOperationDraft(await readStepCommand(18))
     await action("校验图操作")
     await action("生成预览")
 
@@ -259,7 +842,7 @@ describe("ProjectWorkflow", () => {
       note: "用于本次预热迁移校验。",
     })
     await action("更新工作笔记", { content: note, summary: "使用 step18 对应原始工作笔记。" })
-    await action("生成图操作草案", { command })
+    await registerOperationDraft(command)
     await action("校验图操作")
     await action("生成预览")
 
@@ -292,7 +875,7 @@ describe("ProjectWorkflow", () => {
   test("blocks unsafe actions but allows flexible non-destructive actions", async () => {
     await action("开始或恢复")
 
-    await expect(action("生成图操作草案", { command: await readStepCommand(18) })).rejects.toThrow("尚未生成工作笔记")
+    await expect(action("生成图操作草案", { artifacts: { operationsDraft: true } })).rejects.toThrow("尚未生成工作笔记")
     await expect(action("校验图操作")).rejects.toThrow("尚未生成图操作草案")
 
     const messaged = await action("追加消息", {
@@ -316,7 +899,7 @@ describe("ProjectWorkflow", () => {
       content: await readOriginalNote("knowledge_entry_point.txt"),
       summary: "使用 step18 对应原始工作笔记。",
     })
-    await action("生成图操作草案", { command: await readStepCommand(18) })
+    await registerOperationDraft(await readStepCommand(18))
     await action("校验图操作")
     const previewed = await action("生成预览")
     const apply = previewed.availableActions.find((item) => item.action === "应用图操作")
@@ -430,7 +1013,7 @@ describe("ProjectWorkflow", () => {
       content: await readOriginalNote("knowledge_entry_point.txt"),
       summary: "使用 step18 对应原始工作笔记。",
     })
-    await action("生成图操作草案", { command: await readStepCommand(18) })
+    await registerOperationDraft(await readStepCommand(18))
     await action("校验图操作")
     await action("生成预览")
 

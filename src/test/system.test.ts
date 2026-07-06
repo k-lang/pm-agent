@@ -61,7 +61,7 @@ description: ${description}
     }
   })
 
-  test("project workflow warmup skill is only exposed to warmup agent", async () => {
+  test("project workflow skills are exposed to the intended agents", async () => {
     const projectDirName = "demo-project"
     await using tmp = await tmpdir({
       git: true,
@@ -72,6 +72,7 @@ description: ${description}
         for (const [name, description] of [
           ["graph-project-reporting", "Generate project summary reports."],
           ["project-workflow-context-warmup", "Warm up project workflow context."],
+          ["project-workflow-graph-operation-draft", "Draft project workflow graph operations."],
         ]) {
           const skillDir = path.join(graphRoot, ".agents", "skills", name)
           await Bun.write(
@@ -101,8 +102,10 @@ description: ${description}
           const warmupPrompt = await SystemPrompt.skills(warmup!)
 
           expect(workflowPrompt).not.toContain("<name>project-workflow-context-warmup</name>")
+          expect(workflowPrompt).toContain("<name>project-workflow-graph-operation-draft</name>")
           expect(workflowPrompt).not.toContain("<name>graph-project-reporting</name>")
           expect(warmupPrompt).toContain("<name>project-workflow-context-warmup</name>")
+          expect(warmupPrompt).not.toContain("<name>project-workflow-graph-operation-draft</name>")
           expect(warmupPrompt).not.toContain("<name>graph-project-reporting</name>")
         },
       })

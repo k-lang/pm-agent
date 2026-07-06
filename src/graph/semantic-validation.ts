@@ -1,4 +1,4 @@
-import { GraphCommand, type GraphOperation, type NodeType } from "./schema"
+import { GraphCommand, type EdgeType, type GraphOperation, type NodeType } from "./schema"
 import { GraphStorage } from "./storage"
 
 export type GraphSemanticIssue = {
@@ -20,6 +20,46 @@ type EdgeRef = {
   from: string
   to: string
   type: string
+  operationIndex?: number
+}
+
+export function validateEdgeRelation(fromType: NodeType, toType: NodeType, edgeType: EdgeType) {
+  if ((fromType === "goal" && toType === "work_block") || (fromType === "work_block" && toType === "goal")) {
+    return "goal 与 work_block 是属性关系，请使用 linked_goal_id/linked_work_blocks，不要创建边。"
+  }
+  if ((fromType === "work_block" && toType === "work_item") || (fromType === "work_item" && toType === "work_block")) {
+    return "work_block 与 work_item 是属性关系，请使用 linked_work_block_id/work_items，不要创建边。"
+  }
+  const allowed: Record<NodeType, Partial<Record<NodeType, EdgeType[]>>> = {
+    event: {
+      work_item: ["leads_to"],
+      goal: ["generates", "adjusts", "cancels"],
+      issue: ["triggers", "affects"],
+      result: ["forms", "modifies"],
+    },
+    work_item: {
+      work_item: ["next"],
+      issue: ["discovers"],
+      result: ["creates", "modifies_work"],
+    },
+    goal: {
+      goal: ["subgoal"],
+    },
+    issue: {
+      goal: ["generates", "generates_goal", "adjusts_goal", "cancels_goal"],
+    },
+    result: {
+      issue: ["affects_issue"],
+      goal: ["generates_result", "adjusts_result", "cancels_result"],
+      work_item: ["based_on"],
+    },
+    work_block: {},
+  }
+  const allowedTypes = allowed[fromType]?.[toType] ?? []
+  if (!allowedTypes.includes(edgeType)) {
+    return `${fromType} -> ${toType} 不应使用 ${edgeType}，允许类型：${allowedTypes.length ? allowedTypes.join(", ") : "无"}。`
+  }
+  return undefined
 }
 
 export class GraphSemanticValidator {
@@ -53,9 +93,23 @@ export class GraphSemanticValidator {
         if (node) nodes.set(operation.node_id, { ...node, data: { ...node.data, ...operation.updates }, operationIndex: index })
       }
       if (operation.type === "create_edge") {
-        edges.push({ from: operation.from_node, to: operation.to_node, type: operation.edge_type })
+        edges.push({ from: operation.from_node, to: operation.to_node, type: operation.edge_type, operationIndex: index })
       }
     })
+
+    for (const edge of edges.filter((item) => item.operationIndex !== undefined)) {
+      const from = nodes.get(edge.from)
+      const to = nodes.get(edge.to)
+      if (!from || !to) continue
+      const relationIssue = validateEdgeRelation(from.type, to.type, edge.type as EdgeType)
+      if (relationIssue) {
+        issues.push({
+          severity: "error",
+          operationIndex: edge.operationIndex,
+          message: relationIssue,
+        })
+      }
+    }
 
     for (const nodeId of newNodeIds) {
       const node = nodes.get(nodeId)
@@ -176,4 +230,3 @@ export class GraphSemanticValidator {
     return null
   }
 }
-

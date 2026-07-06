@@ -33,6 +33,8 @@ const workspaceSubtitle = document.getElementById('workspace-subtitle')
 const projectStatus = document.getElementById('project-status')
 const graphPreview = document.getElementById('graph-preview')
 const graphPreviewStatus = document.getElementById('graph-preview-status')
+const btnGraphModeMap = document.getElementById('btn-graph-mode-map')
+const btnGraphModeDraft = document.getElementById('btn-graph-mode-draft')
 const btnGraphRefresh = document.getElementById('btn-graph-refresh')
 const btnGraphFit = document.getElementById('btn-graph-fit')
 const btnGraphZoomOut = document.getElementById('btn-graph-zoom-out')
@@ -46,6 +48,7 @@ const btnChatSend = document.getElementById('btn-chat-send')
 const btnWarmup = document.getElementById('btn-warmup')
 const warmupStatus = document.getElementById('warmup-status')
 const operationList = document.getElementById('operation-list')
+const operationSideTitle = document.getElementById('operation-side-title')
 const noteList = document.getElementById('note-list')
 const resourceList = document.getElementById('resource-list')
 const btnUploadResource = document.getElementById('btn-upload-resource')
@@ -87,6 +90,10 @@ let graphLoading = false
 let graphLoadedProject = ''
 let graphError = ''
 let graphLoadSeq = 0
+let graphPreviewMode = 'map'
+let workflowOperations = null
+let selectedOperationArtifactKey = 'operationNotes'
+let workflowOperationsLoading = false
 let noteImporting = false
 let workflow = null
 let workflowMessages = []
@@ -125,6 +132,7 @@ function clearWorkflowView() {
   const reset = resetWorkflowViewState()
   workflow = reset.workflow
   workflowNote = reset.workflowNote
+  workflowOperations = null
   workflowMessages = reset.workflowMessages
   workflowPermissions = reset.workflowPermissions
   workflowPermissionRecords = reset.workflowPermissionRecords
@@ -211,7 +219,7 @@ async function loadProjects() {
   if (!projectName && projects.length) projectName = projects[0].name
   render()
   connectWorkflowSSE()
-  await Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote()])
+  await Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote(), loadWorkflowOperations()])
 }
 
 async function loadWorkflowNote() {
@@ -231,6 +239,27 @@ async function loadWorkflowNote() {
     workflowNote = { exists: false, content: '', error: error.message || '工作笔记加载失败' }
   } finally {
     noteLoading = false
+    renderWorkspace()
+  }
+}
+
+async function loadWorkflowOperations() {
+  const project = selectedProject()
+  workflowOperations = null
+  if (!project) {
+    renderOperationPreview()
+    return
+  }
+  workflowOperationsLoading = true
+  renderOperationPreview()
+  try {
+    const result = await fetchJson(API + `/project/workflow/operations?project=${encodeURIComponent(project.name)}`)
+    workflowOperations = result || null
+    if (result?.workflow) workflow = result.workflow
+  } catch (error) {
+    workflowOperations = { files: [], error: error.message || '图操作草稿加载失败' }
+  } finally {
+    workflowOperationsLoading = false
     renderWorkspace()
   }
 }
@@ -461,7 +490,10 @@ function setActiveTab(tab) {
   for (const panel of tabPanels) {
     panel.classList.toggle('active', panel.dataset.tabPanel === tab)
   }
-  if (tab === 'graph') ensureGraphPreviewLoaded().catch(() => {})
+  if (tab === 'graph') {
+    if (graphPreviewMode === 'map') ensureGraphPreviewLoaded().catch(() => {})
+    else loadWorkflowOperations().catch(() => {})
+  }
 }
 
 function setGraphPreviewPlaceholder(message) {
@@ -513,6 +545,10 @@ function renderGraphPreviewStatus(project, ready) {
 }
 
 function renderGraphPreview(project, ready) {
+  if (graphPreviewMode === 'draft') {
+    renderOperationDraftPreview()
+    return
+  }
   renderGraphPreviewStatus(project, ready)
   if (!project) {
     setGraphPreviewPlaceholder('点击“新建项目”创建项目目录和基础结构。')
@@ -531,7 +567,7 @@ function renderGraphPreview(project, ready) {
     return
   }
   if (graphRenderer && graphLoadedProject === project.name) return
-  setGraphPreviewPlaceholder('切换到“图谱变更”页签后加载当前完整图谱。')
+  setGraphPreviewPlaceholder('切换到“图操作预览”页签后加载当前完整图谱。')
   if (activeTab === 'graph') ensureGraphPreviewLoaded().catch(() => {})
 }
 
@@ -566,6 +602,104 @@ async function ensureGraphPreviewLoaded({ force = false } = {}) {
     graphLoading = false
     renderGraphPreviewStatus(project, true)
     if (graphError) renderGraphPreview(project, true)
+  }
+}
+
+function operationArtifactFiles() {
+  return workflowOperations?.files || []
+}
+
+function operationArtifactByKey(key) {
+  return operationArtifactFiles().find((file) => file.key === key)
+}
+
+function operationIndexItems() {
+  const file = operationArtifactByKey('operationIndex')
+  if (!file?.content) return []
+  try {
+    const parsed = JSON.parse(file.content)
+    if (Array.isArray(parsed)) return parsed
+    if (Array.isArray(parsed.items)) return parsed.items
+  } catch {}
+  return []
+}
+
+function renderOperationIndexList() {
+  operationSideTitle.innerHTML = '图操作索引 <span>自然语言展示图操作</span>'
+  const items = operationIndexItems()
+  if (!items.length) {
+    operationList.innerHTML = '<div class="placeholder">后续这里显示本次推进生成的图操作索引，点击后图谱预览会定位到对应节点或边。</div>'
+    return
+  }
+  operationList.innerHTML = items.map((item, index) => {
+    const title = item.title || item.summary || item.review_text || `图操作 ${index + 1}`
+    const kind = item.kind || item.type || '图操作'
+    const detail = item.description || item.history_entry || item.detail || ''
+    return `
+      <button type="button" class="operation-item" data-index="${index}">
+        <div class="operation-kind">${esc(kind)}</div>
+        <div class="operation-title">${esc(title)}</div>
+        ${detail ? `<div class="operation-history">${esc(detail)}</div>` : ''}
+      </button>
+    `
+  }).join('')
+}
+
+function renderOperationDraftPreview() {
+  operationSideTitle.innerHTML = '图操作文件 <span>说明与校验</span>'
+  btnGraphRefresh.disabled = true
+  btnGraphFit.disabled = true
+  btnGraphZoomOut.disabled = true
+  btnGraphZoomIn.disabled = true
+  graphPreviewStatus.textContent = workflowOperationsLoading ? '说明加载中' : '说明只读'
+  graphRenderer?.destroy()
+  graphRenderer = null
+
+  const files = operationArtifactFiles()
+  const visibleFiles = files.filter((file) => ['operationNotes', 'operationsDraft', 'operations', 'operationIndex', 'validation', 'preview'].includes(file.key))
+  if (!visibleFiles.some((file) => file.key === selectedOperationArtifactKey && file.exists)) {
+    selectedOperationArtifactKey = visibleFiles.find((file) => file.exists)?.key || 'operationNotes'
+  }
+  const selected = operationArtifactByKey(selectedOperationArtifactKey)
+  if (workflowOperationsLoading) {
+    graphPreview.innerHTML = '<div class="placeholder">图操作说明加载中...</div>'
+  } else if (workflowOperations?.error) {
+    graphPreview.innerHTML = `<div class="placeholder">${esc(workflowOperations.error)}</div>`
+  } else if (!selected?.exists) {
+    graphPreview.innerHTML = '<div class="placeholder">生成图操作草案后，这里会展示自然语言说明、operations.draft.json、代码生成的 operations.json 和校验结果。需要修改时请在下方聊天框提出意见。</div>'
+  } else if (selected.type === 'json') {
+    let content = selected.content || ''
+    try {
+      content = JSON.stringify(JSON.parse(content), null, 2)
+    } catch {}
+    graphPreview.innerHTML = `<pre class="operation-draft-content">${esc(content)}</pre>`
+  } else {
+    graphPreview.innerHTML = `<pre class="operation-draft-content">${esc(selected.content || '')}</pre>`
+  }
+
+  operationList.innerHTML = visibleFiles.map((file) => `
+    <button type="button" class="resource-item ${file.key === selectedOperationArtifactKey ? 'active' : ''}" data-operation-file="${esc(file.key)}" ${file.exists ? '' : 'disabled'}>
+      <div class="resource-name">${esc(file.label)}</div>
+      <div class="resource-meta">${esc(file.exists ? file.path : '未生成')}</div>
+    </button>
+  `).join('') || '<div class="placeholder">还没有图操作说明。</div>'
+  for (const item of operationList.querySelectorAll('[data-operation-file]')) {
+    item.onclick = () => {
+      selectedOperationArtifactKey = item.dataset.operationFile
+      renderOperationDraftPreview()
+    }
+  }
+}
+
+function renderOperationPreview() {
+  btnGraphModeMap.classList.toggle('active', graphPreviewMode === 'map')
+  btnGraphModeDraft.classList.toggle('active', graphPreviewMode === 'draft')
+  const draftMode = graphPreviewMode === 'draft'
+  graphPreview.classList.toggle('draft-mode', draftMode)
+  if (draftMode) {
+    renderOperationDraftPreview()
+  } else {
+    renderOperationIndexList()
   }
 }
 
@@ -657,6 +791,7 @@ async function maybeAskRestoreWorkflow() {
     clearWorkflowView()
     await loadWorkflow({ askRestore: false })
     await loadWorkflowNote()
+    await loadWorkflowOperations()
   } catch (error) {
     chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '放弃草案失败')}</div>`
   } finally {
@@ -1030,9 +1165,8 @@ function renderWorkspace() {
     if (graphLoadedProject !== project.name) graphRenderer = null
   }
   renderGraphPreview(project, ready)
-  operationList.innerHTML = ready
-    ? '<div class="placeholder">后续这里显示本次推进生成的图操作索引，点击后图谱预览会定位到对应节点或边。</div>'
-    : '<div class="placeholder">等待项目初始化 Skill 生成第一批图操作：初始事件/目标/工作块/工作项等。</div>'
+  if (ready || graphPreviewMode === 'draft') renderOperationPreview()
+  else operationList.innerHTML = '<div class="placeholder">等待项目初始化 Skill 生成第一批图操作：初始事件/目标/工作块/工作项等。</div>'
   renderResources()
   renderNotes()
   renderChat()
@@ -1117,6 +1251,7 @@ async function refreshAfterNoteImport() {
     loadWorkflow({ askRestore: false }),
     loadWorkflowNote(),
     loadResources(),
+    loadWorkflowOperations(),
   ])
   setActiveTab('notes')
 }
@@ -1192,7 +1327,7 @@ projectSelect.onchange = () => {
   resetGraphPreview()
   render()
   connectWorkflowSSE()
-  Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote()]).catch((error) => {
+  Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote(), loadWorkflowOperations()]).catch((error) => {
     chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '加载失败')}</div>`
   })
 }
@@ -1213,6 +1348,16 @@ btnGraphRefresh.onclick = () => {
     graphError = error.message || '图谱预览加载失败'
     renderGraphPreview(selectedProject(), !!selectedProject()?.graphInitialized)
   })
+}
+btnGraphModeMap.onclick = () => {
+  graphPreviewMode = 'map'
+  renderWorkspace()
+  if (activeTab === 'graph') ensureGraphPreviewLoaded().catch(() => {})
+}
+btnGraphModeDraft.onclick = () => {
+  graphPreviewMode = 'draft'
+  renderWorkspace()
+  if (activeTab === 'graph') loadWorkflowOperations().catch(() => {})
 }
 btnGraphFit.onclick = () => graphRenderer?.fit()
 btnGraphZoomOut.onclick = () => graphRenderer?.zoomBy(1 / 1.2)
@@ -1276,6 +1421,7 @@ async function discardWorkflowFromButton() {
     restorePromptProject = project.name
     await loadWorkflow({ askRestore: false })
     await loadWorkflowNote()
+    await loadWorkflowOperations()
   } catch (error) {
     alert(error.message || '放弃草案失败')
   } finally {
@@ -1399,6 +1545,7 @@ async function sendChat() {
     })
     chatInput.value = ''
     await loadWorkflow({ askRestore: false })
+    await loadWorkflowOperations()
     startWorkflowPolling()
   } catch (error) {
     workflowAwaitingReply = false
@@ -1440,6 +1587,7 @@ function startWorkflowPolling() {
   workflowPollTimer = setTimeout(async () => {
     workflowPollTimer = null
     await loadWorkflow({ askRestore: false })
+    await loadWorkflowOperations()
   }, 1600)
 }
 

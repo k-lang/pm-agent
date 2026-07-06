@@ -1,6 +1,9 @@
 import fs from "fs/promises"
 import { GraphStorage } from "./storage"
 import { GraphCommand, GraphEdge, GraphNode, type GraphOperation, type HistoryRecord, type NodeType } from "./schema"
+import { GraphSemanticValidator, type GraphSemanticIssue } from "./semantic-validation"
+
+export type GraphValidationIssue = GraphSemanticIssue
 
 type ExecuteResult = {
   success: boolean
@@ -104,6 +107,12 @@ export class GraphEngine {
         if (typeof linkedGoal === "string" && this.isTempId(linkedGoal, operations) && (!createdNodes.has(linkedGoal) || createdNodes.get(linkedGoal)! >= opNum)) {
           errors.push(`操作 ${opNum}: 引用的目标节点 '${linkedGoal}' 在此之前未创建`)
         }
+        const workItems = operation.data.type === "work_block" && Array.isArray(operation.data.work_items) ? operation.data.work_items : []
+        for (const ref of workItems) {
+          if (typeof ref === "string" && this.isTempId(ref, operations) && (!createdNodes.has(ref) || createdNodes.get(ref)! >= opNum)) {
+            errors.push(`操作 ${opNum}: 引用的工作项 '${ref}' 在此之前未创建`)
+          }
+        }
       } else if (operation.type === "create_edge") {
         if (operation.temp_id && await this.storage.loadEdge(operation.temp_id)) errors.push(`操作 ${opNum}: 边temp_id '${operation.temp_id}' 已被现有边占用`)
         for (const ref of [operation.from_node, operation.to_node]) {
@@ -116,16 +125,45 @@ export class GraphEngine {
           }
         }
       } else if (operation.type === "update_node") {
-        if (!this.isTempId(operation.node_id, operations) && !await this.storage.getNodeById(operation.node_id)) {
+        if (this.isTempId(operation.node_id, operations)) {
+          const createdAt = createdNodes.get(operation.node_id)
+          if (!this.idMapping.has(operation.node_id) && (!createdAt || createdAt >= opNum)) {
+            errors.push(`操作 ${opNum}: 临时节点 '${operation.node_id}' 在此之前未创建`)
+          }
+        } else if (!await this.storage.getNodeById(operation.node_id)) {
           errors.push(`操作 ${opNum}: 节点 '${operation.node_id}' 在storage中不存在`)
         }
       } else if (operation.type === "update_edge") {
-        if (!this.isTempId(operation.edge_id, operations) && !await this.storage.loadEdge(operation.edge_id)) {
+        if (this.isTempId(operation.edge_id, operations)) {
+          const createdAt = createdEdges.get(operation.edge_id)
+          if (!createdAt || createdAt >= opNum) errors.push(`操作 ${opNum}: 要更新的边 '${operation.edge_id}' 在此之前未创建`)
+        } else if (!await this.storage.loadEdge(operation.edge_id)) {
           errors.push(`操作 ${opNum}: 要更新的边 '${operation.edge_id}' 在storage中不存在`)
         }
       }
     }
     return errors
+  }
+
+  async validateCommand(command: unknown): Promise<{ command?: GraphCommand; issues: GraphValidationIssue[] }> {
+    const parsed = GraphCommand.safeParse(command)
+    if (!parsed.success) {
+      return {
+        issues: parsed.error.issues.map((issue) => ({
+          severity: "error",
+          message: `operations.json 结构错误：${issue.path.join(".") || "(root)"} ${issue.message}`,
+        })),
+      }
+    }
+    const basicErrors = await this.validateOperations(parsed.data.operations)
+    const semanticIssues = await new GraphSemanticValidator(this.storage).validateCommand(parsed.data)
+    return {
+      command: parsed.data,
+      issues: [
+        ...basicErrors.map((message) => ({ severity: "error" as const, message })),
+        ...semanticIssues,
+      ],
+    }
   }
 
   private async createNode(operation: Extract<GraphOperation, { type: "create_node" }>) {

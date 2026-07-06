@@ -308,11 +308,45 @@ button:disabled {
   min-height: 100%;
   background: #111827;
 }
+#graph-preview.draft-mode {
+  overflow: auto;
+}
+.operation-draft-content {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #d1d5db;
+  font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
 .graph-preview-actions {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+.segment-control {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #374151;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #020617;
+}
+.segment-control button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #9ca3af;
+  min-height: 28px;
+  padding: 5px 9px;
+}
+.segment-control button.active {
+  background: #1d4ed8;
+  color: #eff6ff;
 }
 .graph-preview-actions span {
   color: #9ca3af;

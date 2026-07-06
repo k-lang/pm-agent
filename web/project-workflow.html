@@ -32,7 +32,7 @@
         <div id="workspace-tabs">
           <button type="button" class="tab-button active" data-tab="notes">工作笔记</button>
           <button type="button" class="tab-button" data-tab="resources">项目资源</button>
-          <button type="button" class="tab-button" data-tab="graph">图谱变更</button>
+          <button type="button" class="tab-button" data-tab="graph">图操作预览</button>
         </div>
 
         <div id="workspace-body">
@@ -82,8 +82,12 @@
           <section id="graph-tab" class="workspace-tab" data-tab-panel="graph">
             <div class="preview-main">
               <div class="preview-header">
-                <h3>图谱预览 <span>展示当前图谱和草案变更</span></h3>
+                <h3>图操作预览 <span>查看草案图谱或图操作说明</span></h3>
                 <div class="graph-preview-actions">
+                  <div class="segment-control" aria-label="图操作预览模式">
+                    <button id="btn-graph-mode-map" type="button" class="active">图谱预览</button>
+                    <button id="btn-graph-mode-draft" type="button">图操作说明</button>
+                  </div>
                   <span id="graph-preview-status">当前图谱</span>
                   <button id="btn-graph-refresh" type="button" class="btn-secondary">刷新</button>
                   <button id="btn-graph-fit" type="button" class="btn-secondary">Fit</button>
@@ -97,7 +101,7 @@
             </div>
             <aside class="side-index">
               <div class="side-header">
-                <h3>图操作索引 <span>自然语言展示图操作</span></h3>
+                <h3 id="operation-side-title">图操作索引 <span>自然语言展示图操作</span></h3>
               </div>
               <div id="operation-list" class="side-list"></div>
               <div id="operation-actions">

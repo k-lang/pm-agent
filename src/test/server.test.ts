@@ -12,6 +12,7 @@ import { Database } from "../storage/db"
 import { ProjectSummaryRecordTable } from "../project/project.sql"
 import { SessionID } from "../session/schema"
 import { ProjectWorkflow } from "../workflow/state"
+import { ProjectWorkflowExecution } from "../workflow/execution"
 
 Log.init({ print: false })
 
@@ -277,9 +278,65 @@ describe("server routes", () => {
       const secondBody = await second.json()
       expect(secondBody).toMatchObject({ exists: true, content: "second note\n" })
       await expect(fs.readFile(path.join(activeDir, "note.md"), "utf8")).resolves.toBe("second note\n")
+      await expect(fs.stat(path.join(activeDir, "operations.draft.json"))).rejects.toThrow()
       await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
       await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
       await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("GET /project/workflow/operations returns active graph operation draft artifacts", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+
+      await ProjectWorkflow.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
+      await ProjectWorkflowExecution.writeNote({
+        directory: projectDir,
+        content: "本轮准备把工作笔记转成图操作草案。",
+      })
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "同步工作笔记变更",
+        payload: { summary: "测试写入工作笔记。" },
+      })
+      const activeDir = path.join(projectDir, "workflows", "active")
+      await fs.writeFile(path.join(activeDir, "operation_notes.md"), "## 图操作说明\n\n准备更新已有目标。\n", "utf8")
+      await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+        change_id: "demo_operations",
+        timestamp: "2026-07-06T10:00:00+08:00",
+        items: [],
+      }, null, 2) + "\n", "utf8")
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "生成图操作草案",
+        payload: {
+          summary: "登记图操作产物。",
+          change_id: "demo_operations",
+          artifacts: {
+            operationNotes: true,
+            operationsDraft: true,
+          },
+        },
+      })
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/operations?project=demo"))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.workflow.stage).toBe("校验已通过")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationNotes")?.content).toContain("图操作说明")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationsDraft")?.content).toContain("demo_operations")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationIndex")?.content).toContain("demo_operations")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operations")?.content).toContain("demo_operations")
     } finally {
       process.chdir(originalCwd)
     }

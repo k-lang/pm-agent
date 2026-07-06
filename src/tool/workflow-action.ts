@@ -1,6 +1,7 @@
 import z from "zod"
 import { Tool } from "./tool"
 import { ProjectWorkflow } from "@/workflow/state"
+import { ProjectWorkflowExecution } from "@/workflow/execution"
 
 const parameters = z.object({
   project: z.string().describe("项目名，对应 project_graph_data 下的项目目录名。"),
@@ -19,12 +20,12 @@ const DESCRIPTION = `
 - 放弃草案：仅当用户明确要求放弃时调用；如已有 note.md 会保留工作笔记并清空图操作草案、校验、预览和聊天会话，没有 note.md 时清空 active 草案。
 - 追加消息：记录用户或助手消息。payload: { "role": "用户|助手|系统", "text": "..." }
 - 登记资源：登记已上传或可引用资源。payload: { "path": "...", "title": "...", "note": "..." }
-- 同步工作笔记变更：在 note.md 已通过人工导入或原版 write/edit/apply_patch 创建或更新后，同步状态并清空旧图操作草案、校验和预览。payload: { "summary": "...", "source": "llm_draft|manual_import|manual_edit|llm_revision" }
-- 更新工作笔记：仅供页面人工导入/人工修改接口直接调用；聊天工具不能执行该动作，避免大模型把整篇 note.md 作为 tool input 传入。
+- 同步工作笔记变更：在 note.md 已通过人工导入或原版 write/edit/apply_patch 创建或更新后，登记笔记变化；执行层会清空旧图操作草案、校验和预览。payload: { "summary": "...", "source": "llm_draft|manual_import|manual_edit|llm_revision" }
+- 更新工作笔记：兼容旧页面接口；聊天工具不能执行该动作，避免大模型把整篇 note.md 作为 tool input 传入。新流程应先由 note service 或原版编辑工具写 note.md，再调用“同步工作笔记变更”。
 - 检查笔记充分性：判断 note.md 是否足以支撑图操作。payload: { "sufficient": true|false, "blockingQuestions": [], "missingFields": [], "summary": "..." }
-- 生成图操作草案：保存 operations.json。payload 可提供完整 command，或 operations/change_id/description/history_descriptions。
-- 校验图操作：执行图引擎基础校验和语义布局校验。
-- 生成预览：基于最近一次通过的校验生成预览元数据。
+- 生成图操作草案：只登记已写入 active 目录的 operation_notes.md 和 operations.draft.json，不接收正文。先用 write/edit/apply_patch 写入 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json；draft 应是压缩结构化语义 delta，只放模型必须判断的节点/边/字段增量、description_delta 和 history。operations.json、operation_index.json、validation.json 和 preview.json 均由执行层生成。执行层会把 draft 编译为 operations.json，生成索引并立刻自动校验，返回 validation.issues；若失败，会进入“图操作需修订”。payload: { "summary": "...", "change_id": "...", "artifacts": { "operationNotes": true, "operationsDraft": true } }
+- 校验图操作：通常不需要在“生成图操作草案”后再手动调用；该动作用于重新登记已经存在的 validation.json。
+- 生成预览：由执行层生成 preview.json 后，状态机登记预览结果。
 - 提出修订意见：记录用户审核意见并进入对应修订状态。payload: { "target": "工作笔记|图操作|两者", "comment": "..." }
 - 应用图操作：当前版本保留动作入口，但不执行真实写图；必须等待用户明确确认。
 
@@ -33,6 +34,7 @@ const DESCRIPTION = `
 
 const UI_ONLY_ACTIONS = new Set<ProjectWorkflow.Action>(["放弃草案", "应用图操作"])
 const NON_CHAT_ACTIONS = new Set<ProjectWorkflow.Action>(["更新工作笔记"])
+const GRAPH_DRAFT_CONTENT_FIELDS = new Set(["operation_notes", "draft", "operation_index", "command", "operations", "history_descriptions"])
 
 export const WorkflowActionTool = Tool.define("workflow_action", {
   description: DESCRIPTION,
@@ -47,7 +49,13 @@ export const WorkflowActionTool = Tool.define("workflow_action", {
     if (NON_CHAT_ACTIONS.has(args.action)) {
       throw new Error(`「${args.action}」不能通过聊天工具执行。请使用原版 write/edit/apply_patch 创建或修改 note.md 后，再调用「同步工作笔记变更」。`)
     }
-    const result = await ProjectWorkflow.runAction(args)
+    if (args.action === "生成图操作草案") {
+      const contentFields = Object.keys(args.payload ?? {}).filter((key) => GRAPH_DRAFT_CONTENT_FIELDS.has(key))
+      if (contentFields.length) {
+        throw new Error(`「生成图操作草案」不能通过 workflow_action 传输草稿正文或可执行 command（字段：${contentFields.join(", ")}）。请先写入 workflows/active/operation_notes.md 和 operations.draft.json，再用 artifacts 小清单登记。`)
+      }
+    }
+    const result = await ProjectWorkflowExecution.runAction(args)
     return {
       title: `工作推进：${args.action}`,
       metadata: {

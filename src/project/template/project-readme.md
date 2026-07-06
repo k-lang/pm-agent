@@ -96,9 +96,12 @@
 - `messages.jsonl`：过程消息记录。
 - `resources.json`：本轮登记资源。
 - `note.md`：本轮工作笔记草案。
-- `operations.json`：本轮图操作草案。
-- `validation.json`：图操作校验结果。
-- `preview.json`：图谱预览元数据。
+- `operation_notes.md`：给用户审核的自然语言图操作说明。
+- `operations.draft.json`：模型写出的压缩结构化图操作草案，只保存语义增量。
+- `operations.json`：后端执行层从 draft 编译生成的最终图操作命令。
+- `operation_index.json`：后端执行层从最终图操作命令派生的自然语言索引。
+- `validation.json`：后端执行层生成的图操作校验结果。
+- `preview.json`：后端执行层生成的图谱预览元数据。
 - `context_warmup.md`：项目上下文预热输出，可选。
 
 active workflow 是草案区，不等同于正式图数据。只有用户明确确认并由后端应用后，图操作才会写入正式图数据。

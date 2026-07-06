@@ -218,9 +218,12 @@ export namespace Agent {
             edit: {
               "*": "deny",
               [path.relative(Instance.worktree, path.join(Instance.directory, "workflows", "active", "note.md")).replaceAll("\\", "/")]: "ask",
+              [path.relative(Instance.worktree, path.join(Instance.directory, "workflows", "active", "operation_notes.md")).replaceAll("\\", "/")]: "allow",
+              [path.relative(Instance.worktree, path.join(Instance.directory, "workflows", "active", "operations.draft.json")).replaceAll("\\", "/")]: "allow",
             },
             skill: {
               "*": "deny",
+              "project-workflow-graph-operation-draft": "allow",
             },
             read: "allow",
           }),

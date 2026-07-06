@@ -50,4 +50,17 @@ describe("workflow_action tool", () => {
       payload: { content: "完整工作笔记内容" },
     }, context("project_workflow"))).rejects.toThrow("不能通过聊天工具执行")
   })
+
+  test("does not allow chat to send graph draft content through workflow_action", async () => {
+    const tool = await WorkflowActionTool.init()
+
+    await expect(tool.execute({
+      project: "demo",
+      action: "生成图操作草案",
+      payload: {
+        operation_notes: "很长的图操作说明正文",
+        draft: { change_id: "demo", draft_operations: [] },
+      },
+    }, context("project_workflow"))).rejects.toThrow("不能通过 workflow_action 传输草稿正文")
+  })
 })
