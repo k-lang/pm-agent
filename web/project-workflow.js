@@ -88,11 +88,15 @@ let noteLoading = false
 let graphRenderer = null
 let graphLoading = false
 let graphLoadedProject = ''
+let graphLoadedPreviewKey = ''
 let graphError = ''
 let graphLoadSeq = 0
 let graphPreviewMode = 'map'
 let workflowOperations = null
 let selectedOperationArtifactKey = 'operationNotes'
+let selectedOperationKey = ''
+let operationHighlight = { nodeIds: [], edgeIds: [], focusNodeId: '', focusEdgeId: '' }
+let expandedOperationGroups = new Set()
 let workflowOperationsLoading = false
 let noteImporting = false
 let workflow = null
@@ -138,6 +142,9 @@ function clearWorkflowView() {
   workflowPermissionRecords = reset.workflowPermissionRecords
   pendingUserText = reset.pendingUserText
   activePermissionReviewID = reset.activePermissionReviewID
+  selectedOperationKey = ''
+  operationHighlight = { nodeIds: [], edgeIds: [], focusNodeId: '', focusEdgeId: '' }
+  expandedOperationGroups = new Set()
   shownPermissionModalIds.clear()
   workflowAwaitingReply = reset.workflowAwaitingReply
   workflowStatusById.clear()
@@ -256,6 +263,9 @@ async function loadWorkflowOperations() {
     const result = await fetchJson(API + `/project/workflow/operations?project=${encodeURIComponent(project.name)}`)
     workflowOperations = result || null
     if (result?.workflow) workflow = result.workflow
+    if (activeTab === 'graph' && graphPreviewMode === 'map') {
+      await ensureGraphPreviewLoaded({ force: true }).catch(() => {})
+    }
   } catch (error) {
     workflowOperations = { files: [], error: error.message || '图操作草稿加载失败' }
   } finally {
@@ -499,6 +509,8 @@ function setActiveTab(tab) {
 function setGraphPreviewPlaceholder(message) {
   graphRenderer?.destroy()
   graphRenderer = null
+  graphLoadedProject = ''
+  graphLoadedPreviewKey = ''
   graphPreview.innerHTML = `<div class="placeholder">${message}</div>`
 }
 
@@ -506,12 +518,63 @@ function resetGraphPreview() {
   graphLoadSeq += 1
   graphLoading = false
   graphLoadedProject = ''
+  graphLoadedPreviewKey = ''
   graphError = ''
   setGraphPreviewPlaceholder('等待图谱草案。')
 }
 
 function graphPreviewApi(project) {
   return API + `/project/graph?project=${encodeURIComponent(project.name)}&view=expanded`
+}
+
+function operationArtifactJson(key) {
+  const file = operationArtifactByKey(key)
+  if (!file?.content) return null
+  try {
+    return JSON.parse(file.content)
+  } catch {
+    return null
+  }
+}
+
+function workflowPreviewArtifact() {
+  return operationArtifactJson('preview')
+}
+
+function workflowPreviewChange() {
+  return workflowPreviewArtifact()?.change || null
+}
+
+function workflowPreviewGraph() {
+  return workflowPreviewArtifact()?.graph || null
+}
+
+function graphPreviewKey(project) {
+  if (!project) return ''
+  const preview = workflowPreviewArtifact()
+  if (!preview?.graph) return `${project.name}:current`
+  return `${project.name}:preview:${preview.change_id || ''}:${preview.generatedAt || ''}:${preview.operationCount || ''}`
+}
+
+function graphPreviewOptions() {
+  const change = workflowPreviewChange()
+  const directNodeIds = [
+    ...(change?.createdNodeIds || []),
+    ...(change?.updatedNodeIds || []),
+  ]
+  const directEdgeIds = [
+    ...(change?.createdEdgeIds || []),
+    ...(change?.updatedEdgeIds || []),
+  ]
+  return {
+    mode: workflowPreviewGraph() ? 'draft-preview' : 'current',
+    draftNodeIds: directNodeIds,
+    draftEdgeIds: directEdgeIds,
+    highlightNodeIds: operationHighlight.nodeIds,
+    highlightEdgeIds: operationHighlight.edgeIds,
+    focusNodeId: operationHighlight.focusNodeId,
+    focusEdgeId: operationHighlight.focusEdgeId,
+  }
 }
 
 function renderGraphPreviewStatus(project, ready) {
@@ -537,8 +600,8 @@ function renderGraphPreviewStatus(project, ready) {
     graphPreviewStatus.textContent = '当前图谱加载失败'
     return
   }
-  if (graphRenderer && graphLoadedProject === project.name) {
-    graphPreviewStatus.textContent = '当前图谱'
+  if (graphRenderer && graphLoadedProject === project.name && graphLoadedPreviewKey === graphPreviewKey(project)) {
+    graphPreviewStatus.textContent = workflowPreviewGraph() ? '草案预览，未提交' : '当前图谱'
     return
   }
   graphPreviewStatus.textContent = '当前图谱未加载'
@@ -566,7 +629,7 @@ function renderGraphPreview(project, ready) {
     setGraphPreviewPlaceholder(graphError)
     return
   }
-  if (graphRenderer && graphLoadedProject === project.name) return
+  if (graphRenderer && graphLoadedProject === project.name && graphLoadedPreviewKey === graphPreviewKey(project)) return
   setGraphPreviewPlaceholder('切换到“图操作预览”页签后加载当前完整图谱。')
   if (activeTab === 'graph') ensureGraphPreviewLoaded().catch(() => {})
 }
@@ -574,14 +637,15 @@ function renderGraphPreview(project, ready) {
 async function ensureGraphPreviewLoaded({ force = false } = {}) {
   const project = selectedProject()
   if (!project?.graphInitialized) return
-  if (!force && graphRenderer && graphLoadedProject === project.name) return
+  const key = graphPreviewKey(project)
+  if (!force && graphRenderer && graphLoadedProject === project.name && graphLoadedPreviewKey === key) return
 
   const loadSeq = ++graphLoadSeq
   graphLoading = true
   graphError = ''
   renderGraphPreview(project, true)
   try {
-    const payload = await fetchJson(graphPreviewApi(project))
+    const payload = workflowPreviewGraph() || await fetchJson(graphPreviewApi(project))
     if (loadSeq !== graphLoadSeq || selectedProject()?.name !== project.name) return
     graphRenderer?.destroy()
     graphRenderer = new ProjectGraphRenderer({
@@ -591,12 +655,14 @@ async function ensureGraphPreviewLoaded({ force = false } = {}) {
       showControls: false,
       readonly: true,
     })
-    graphRenderer.setPayload(payload, { mode: 'current' })
+    graphRenderer.setPayload(payload, graphPreviewOptions())
     graphLoadedProject = project.name
+    graphLoadedPreviewKey = key
   } catch (error) {
     if (loadSeq !== graphLoadSeq || selectedProject()?.name !== project.name) return
     graphError = error.message || '图谱预览加载失败'
     graphLoadedProject = ''
+    graphLoadedPreviewKey = ''
   } finally {
     if (loadSeq !== graphLoadSeq || selectedProject()?.name !== project.name) return
     graphLoading = false
@@ -614,35 +680,130 @@ function operationArtifactByKey(key) {
 }
 
 function operationIndexItems() {
-  const file = operationArtifactByKey('operationIndex')
-  if (!file?.content) return []
-  try {
-    const parsed = JSON.parse(file.content)
-    if (Array.isArray(parsed)) return parsed
-    if (Array.isArray(parsed.items)) return parsed.items
-  } catch {}
+  const parsed = operationArtifactJson('operationIndex')
+  if (Array.isArray(parsed)) return parsed
+  if (Array.isArray(parsed?.items)) return parsed.items
   return []
+}
+
+function normalizeOperationGroup(group) {
+  const sourceNodeId = group.sourceNodeId || group.nodeIds?.[0] || ''
+  const targetNodeId = group.targetNodeId || group.nodeIds?.[1] || ''
+  const edgeId = group.edgeId || group.edgeIds?.[0] || ''
+  const allowedNodes = new Set([sourceNodeId, targetNodeId].filter(Boolean))
+  const children = Array.isArray(group.children)
+    ? group.children.filter((child) => {
+      const childEdges = child.edgeIds || []
+      if (childEdges.length) return edgeId ? childEdges.includes(edgeId) : childEdges.length === 1
+      const childNodes = child.nodeIds || []
+      return childNodes.length > 0 && childNodes.every((nodeId) => allowedNodes.has(nodeId))
+    })
+    : []
+  return {
+    ...group,
+    sourceNodeId,
+    targetNodeId,
+    edgeId,
+    nodeIds: [sourceNodeId, targetNodeId].filter(Boolean),
+    edgeIds: edgeId ? [edgeId] : (group.edgeIds || []).slice(0, 1),
+    children,
+  }
+}
+
+function operationIndexGroups() {
+  const parsed = operationArtifactJson('operationIndex')
+  if (Array.isArray(parsed?.groups) && parsed.groups.length) return parsed.groups.map(normalizeOperationGroup)
+  return operationIndexItems().map((item, index) => ({
+    index,
+    kind: item.kind || item.type || '图操作',
+    title: item.title || item.summary || item.review_text || `图操作 ${index + 1}`,
+    description: item.description || item.history_entry || item.detail || '',
+    nodeIds: item.nodeIds || (item.targetIds || []).filter((id) => !String(id).includes('|')),
+    edgeIds: item.edgeIds || (item.targetIds || []).filter((id) => String(id).includes('|')),
+    children: [],
+  }))
+}
+
+function setOperationHighlight(input = {}) {
+  operationHighlight = {
+    nodeIds: input.nodeIds || [],
+    edgeIds: input.edgeIds || [],
+    focusNodeId: input.focusNodeId || input.nodeIds?.[0] || '',
+    focusEdgeId: input.focusEdgeId || input.edgeIds?.[0] || '',
+  }
+  if (graphRenderer) {
+    graphRenderer.setHighlights(graphPreviewOptions())
+    if (operationHighlight.focusNodeId) graphRenderer.focusNode(operationHighlight.focusNodeId)
+    else if (operationHighlight.focusEdgeId) graphRenderer.focusEdge(operationHighlight.focusEdgeId)
+  }
 }
 
 function renderOperationIndexList() {
   operationSideTitle.innerHTML = '图操作索引 <span>自然语言展示图操作</span>'
-  const items = operationIndexItems()
-  if (!items.length) {
+  const groups = operationIndexGroups()
+  if (!groups.length) {
     operationList.innerHTML = '<div class="placeholder">后续这里显示本次推进生成的图操作索引，点击后图谱预览会定位到对应节点或边。</div>'
     return
   }
-  operationList.innerHTML = items.map((item, index) => {
-    const title = item.title || item.summary || item.review_text || `图操作 ${index + 1}`
-    const kind = item.kind || item.type || '图操作'
-    const detail = item.description || item.history_entry || item.detail || ''
+  operationList.innerHTML = groups.map((group, index) => {
+    const title = group.title || group.summary || `关系组 ${index + 1}`
+    const kind = group.kind || '关系组'
+    const detail = group.description || group.history_entry || ''
+    const key = `group:${index}`
+    const children = Array.isArray(group.children) ? group.children : []
+    const expanded = expandedOperationGroups.has(key)
+    const groupActive = selectedOperationKey === key
     return `
-      <button type="button" class="operation-item" data-index="${index}">
-        <div class="operation-kind">${esc(kind)}</div>
-        <div class="operation-title">${esc(title)}</div>
-        ${detail ? `<div class="operation-history">${esc(detail)}</div>` : ''}
-      </button>
+      <div class="operation-group ${groupActive ? 'active' : ''}">
+      <div class="operation-group-row">
+        <button type="button" class="operation-toggle" data-operation-toggle="${esc(key)}" aria-label="${expanded ? '折叠图操作组' : '展开图操作组'}">${expanded ? 'v' : '>'}</button>
+        <button type="button" class="operation-item operation-group-title" data-operation-key="${esc(key)}" data-node-ids="${esc((group.nodeIds || []).join(','))}" data-edge-ids="${esc((group.edgeIds || []).join(','))}" data-focus-node="${esc(group.sourceNodeId || group.focusNodeId || group.nodeIds?.[0] || '')}" data-focus-edge="${esc(group.edgeId || group.focusEdgeId || group.edgeIds?.[0] || '')}">
+          <div class="operation-kind">${esc(kind)}</div>
+          <div class="operation-title">${esc(title)}</div>
+          ${detail ? `<div class="operation-history">${esc(detail)}</div>` : ''}
+        </button>
+      </div>
+      ${children.length && expanded ? `<div class="operation-children">
+        ${children.map((child, childIndex) => {
+          const childKey = `${key}:child:${childIndex}`
+          const childEdgeIds = child.edgeIds || []
+          const childNodeIds = childEdgeIds.length ? [] : (child.nodeIds || [])
+          return `
+            <button type="button" class="operation-child ${selectedOperationKey === childKey ? 'active' : ''}" data-operation-key="${esc(childKey)}" data-node-ids="${esc(childNodeIds.join(','))}" data-edge-ids="${esc(childEdgeIds.join(','))}" data-focus-node="${esc(childNodeIds[0] || '')}" data-focus-edge="${esc(childEdgeIds[0] || '')}">
+              <span>${esc(child.kind || '子项')}</span>
+              <strong>${esc(child.title || `子项 ${childIndex + 1}`)}</strong>
+              ${child.history_entry ? `<em>${esc(child.history_entry)}</em>` : ''}
+            </button>
+          `
+        }).join('')}
+      </div>` : ''}
+      </div>
     `
   }).join('')
+  for (const toggle of operationList.querySelectorAll('[data-operation-toggle]')) {
+    toggle.onclick = () => {
+      const key = toggle.dataset.operationToggle || ''
+      if (!key) return
+      if (expandedOperationGroups.has(key)) expandedOperationGroups.delete(key)
+      else expandedOperationGroups.add(key)
+      renderOperationIndexList()
+    }
+  }
+  for (const item of operationList.querySelectorAll('[data-operation-key]')) {
+    item.onclick = async () => {
+      selectedOperationKey = item.dataset.operationKey || ''
+      const nodeIds = (item.dataset.nodeIds || '').split(',').filter(Boolean)
+      const edgeIds = (item.dataset.edgeIds || '').split(',').filter(Boolean)
+      setOperationHighlight({
+        nodeIds,
+        edgeIds,
+        focusNodeId: item.dataset.focusNode || nodeIds[0] || '',
+        focusEdgeId: item.dataset.focusEdge || edgeIds[0] || '',
+      })
+      renderOperationIndexList()
+      if (!graphRenderer && graphPreviewMode === 'map') await ensureGraphPreviewLoaded()
+    }
+  }
 }
 
 function renderOperationDraftPreview() {
@@ -654,6 +815,8 @@ function renderOperationDraftPreview() {
   graphPreviewStatus.textContent = workflowOperationsLoading ? '说明加载中' : '说明只读'
   graphRenderer?.destroy()
   graphRenderer = null
+  graphLoadedProject = ''
+  graphLoadedPreviewKey = ''
 
   const files = operationArtifactFiles()
   const visibleFiles = files.filter((file) => ['operationNotes', 'operationsDraft', 'operations', 'operationIndex', 'validation', 'preview'].includes(file.key))
@@ -700,6 +863,7 @@ function renderOperationPreview() {
     renderOperationDraftPreview()
   } else {
     renderOperationIndexList()
+    if (graphRenderer) graphRenderer.setHighlights(graphPreviewOptions())
   }
 }
 
@@ -753,7 +917,7 @@ function updateTerminalActionButtons() {
   }
   if (btnApply) {
     btnApply.disabled = !hasProject
-    btnApply.classList.toggle('pending-action', state?.stage === '预览已生成')
+    btnApply.classList.toggle('pending-action', !!workflowActionEntry('应用图操作').available)
     btnApply.title = state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
   }
 }
@@ -778,7 +942,7 @@ async function maybeAskRestoreWorkflow() {
   if (restorePromptProject === project.name) return
   restorePromptProject = project.name
 
-  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“确定”会恢复本轮 active workflow。\n选择“取消”会放弃当前图操作草案、校验、预览和聊天会话；如果已有工作笔记，会保留 workflows/active/note.md。已写入的正式图数据不会删除。`)
+  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“确定”会恢复本轮 active workflow。\n选择“取消”会结束并删除本轮 active workflow，包括 state、图操作草案、校验、预览和聊天会话；如果已有工作笔记，会只保留 workflows/active/note.md 供下一轮重新开始使用。已写入的正式图数据不会删除。`)
   if (ok) return
 
   suppressRestorePrompt = true
@@ -1159,10 +1323,11 @@ function renderWorkspace() {
   btnDetail.disabled = !ready
   btnGraph.disabled = !ready
   updateTerminalActionButtons()
-  if (!ready || graphLoadedProject !== project.name) {
-    graphLoadedProject = graphLoadedProject === project.name ? graphLoadedProject : ''
-    if (graphRenderer && graphLoadedProject !== project.name) graphRenderer.destroy()
-    if (graphLoadedProject !== project.name) graphRenderer = null
+  if (!ready || graphLoadedProject !== project.name || graphLoadedPreviewKey !== graphPreviewKey(project)) {
+    graphRenderer?.destroy()
+    graphRenderer = null
+    graphLoadedProject = ''
+    graphLoadedPreviewKey = ''
   }
   renderGraphPreview(project, ready)
   if (ready || graphPreviewMode === 'draft') renderOperationPreview()
@@ -1408,7 +1573,7 @@ async function discardWorkflowFromButton() {
     return
   }
   const state = currentWorkflowState()
-  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n这会清空当前图操作草案、校验、预览和聊天会话；如果已有工作笔记，会保留 workflows/active/note.md。已写入的正式图数据不会删除。`)
+  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n这会结束并删除本轮 active workflow，包括 state、图操作草案、校验、预览和聊天会话；如果已有工作笔记，会只保留 workflows/active/note.md 供下一轮重新开始使用。已写入的正式图数据不会删除。`)
   if (!ok) return
   btnDiscardWorkflow.disabled = true
   try {

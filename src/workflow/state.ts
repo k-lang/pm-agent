@@ -11,8 +11,6 @@ export namespace ProjectWorkflow {
     "笔记需补充",
     "图操作已生成",
     "图操作需修订",
-    "校验已通过",
-    "预览已生成",
     "应用中",
     "已应用",
     "已取消",
@@ -29,7 +27,6 @@ export namespace ProjectWorkflow {
     "检查笔记充分性",
     "生成图操作草案",
     "校验图操作",
-    "生成预览",
     "提出修订意见",
     "应用图操作",
   ])
@@ -49,6 +46,7 @@ export namespace ProjectWorkflow {
     operationIndex: z.string().default("operation_index.json"),
     validation: z.string().default("validation.json"),
     preview: z.string().default("preview.json"),
+    previewGraph: z.string().default("preview_graph"),
   })
 
   export const State = z.object({
@@ -76,20 +74,14 @@ export namespace ProjectWorkflow {
       operationIndex: "operation_index.json",
       validation: "validation.json",
       preview: "preview.json",
+      previewGraph: "preview_graph",
     }),
     lastAction: Action.optional(),
     pendingConfirmation: z.object({
       action: Action,
       message: z.string(),
     }).optional(),
-    history: z.array(z.object({
-      time: z.number(),
-      action: Action,
-      from: Stage.optional(),
-      to: Stage,
-      summary: z.string(),
-    })).default([]),
-  })
+  }).strict()
   export type State = z.infer<typeof State>
 
   export const ActionRequest = z.object({
@@ -179,16 +171,10 @@ export namespace ProjectWorkflow {
     summary: z.string().optional(),
   })
 
-  const PreviewRegisterPayload = z.object({
-    summary: z.string().optional(),
-  })
-
   const ValidationArtifact = z.object({
     passed: z.boolean(),
     issues: z.array(z.unknown()).default([]),
   }).passthrough()
-
-  const PreviewArtifact = z.object({}).passthrough()
 
   function validateProjectName(input: string) {
     const name = input.trim()
@@ -216,6 +202,10 @@ export namespace ProjectWorkflow {
 
   function artifactPath(directory: string, state: State, key: keyof z.infer<typeof ArtifactPaths>) {
     return path.join(activeDir(directory), state.artifacts[key])
+  }
+
+  function defaultArtifactPath(directory: string, key: keyof z.infer<typeof ArtifactPaths>) {
+    return path.join(activeDir(directory), ArtifactPaths.parse({})[key])
   }
 
   async function ensureProject(directory: string) {
@@ -250,21 +240,13 @@ export namespace ProjectWorkflow {
   }
 
   function createState(project: string, now = Date.now()): State {
-    const state = State.parse({
+    return State.parse({
       id: ulid(now),
       project,
       stage: "收集材料",
       createdAt: now,
       updatedAt: now,
-      history: [],
     })
-    state.history.push({
-      time: now,
-      action: "开始或恢复",
-      to: state.stage,
-      summary: "创建工作推进草案。",
-    })
-    return state
   }
 
   function withSessionBinding(state: State, input: { sessionID?: string; warmupSessionID?: string; warmupStatus?: BaselineStatus }) {
@@ -290,30 +272,19 @@ export namespace ProjectWorkflow {
     await Session.remove(state.sessionID as any).catch(() => undefined)
   }
 
-  function transition(state: State, action: Action, to: Stage, summary: string): State {
+  function transition(state: State, action: Action, to: Stage): State {
     const now = Date.now()
-    const from = state.stage
     return State.parse({
       ...state,
       stage: to,
       updatedAt: now,
       lastAction: action,
       pendingConfirmation: undefined,
-      history: [
-        ...state.history,
-        {
-          time: now,
-          action,
-          from,
-          to,
-          summary,
-        },
-      ],
     })
   }
 
-  function touch(state: State, action: Action, summary: string): State {
-    return transition(state, action, state.stage, summary)
+  function touch(state: State, action: Action): State {
+    return transition(state, action, state.stage)
   }
 
   async function fileExists(file: string) {
@@ -321,7 +292,7 @@ export namespace ProjectWorkflow {
   }
 
   async function artifactStatus(directory: string, state: State) {
-    const [note, noteReview, operationNotes, operationsDraft, operations, operationIndex, validation, preview] = await Promise.all([
+    const [note, noteReview, operationNotes, operationsDraft, operations, operationIndex, validation, preview, previewGraph] = await Promise.all([
       fileExists(artifactPath(directory, state, "note")),
       fileExists(artifactPath(directory, state, "noteReview")),
       fileExists(artifactPath(directory, state, "operationNotes")),
@@ -330,8 +301,9 @@ export namespace ProjectWorkflow {
       fileExists(artifactPath(directory, state, "operationIndex")),
       fileExists(artifactPath(directory, state, "validation")),
       fileExists(artifactPath(directory, state, "preview")),
+      fileExists(artifactPath(directory, state, "previewGraph")),
     ])
-    return { note, noteReview, operationNotes, operationsDraft, operations, operationIndex, validation, preview }
+    return { note, noteReview, operationNotes, operationsDraft, operations, operationIndex, validation, preview, previewGraph }
   }
 
   async function latestValidationPassed(directory: string, state: State) {
@@ -348,8 +320,9 @@ export namespace ProjectWorkflow {
       "operationIndex",
       "validation",
       "preview",
+      "previewGraph",
     ]
-    await Promise.all(keys.map((key) => fs.rm(artifactPath(directory, state, key), { force: true })))
+    await Promise.all(keys.map((key) => fs.rm(artifactPath(directory, state, key), { recursive: key === "previewGraph", force: true })))
   }
 
   async function assertOperationArtifactManifest(
@@ -391,7 +364,7 @@ export namespace ProjectWorkflow {
       { action: "追加消息", reason: "继续记录用户输入、模型回应或审核意见。" },
       { action: "登记资源", reason: "登记上传附件或项目资源，供工作笔记引用。" },
       { action: "提出修订意见", reason: "记录用户对工作笔记、图操作或两者的审核意见。" },
-      { action: "放弃草案", reason: "放弃当前图操作草案和聊天会话；如已有工作笔记则保留 note.md。", requiresUserConfirmation: true },
+      { action: "放弃草案", reason: "结束并删除当前 active workflow；如已有工作笔记则只保留 note.md 供下一轮重新开始。", requiresUserConfirmation: true },
     ]
     const blockedActions: { action: Action; reason: string }[] = []
 
@@ -403,29 +376,25 @@ export namespace ProjectWorkflow {
       blockedActions.push({ action: "检查笔记充分性", reason: "尚未生成工作笔记。" })
     }
 
-    if (artifacts.note) availableActions.push({ action: "生成图操作草案", reason: "登记已由图操作生成模块写入的 operations.draft.json 和可审核说明；执行层会生成 operations.json、索引和校验结果。" })
+    if (artifacts.note) availableActions.push({ action: "生成图操作草案", reason: "登记已由图操作生成模块写入的 operations.draft.json 和可审核说明；执行层会生成 operations.json、索引、校验结果和图谱预览。" })
     else blockedActions.push({ action: "生成图操作草案", reason: "尚未生成工作笔记。" })
 
     if (artifacts.operations) availableActions.push({ action: "校验图操作", reason: "校验当前 operations.json 的基础合法性和布局语义。" })
     else blockedActions.push({ action: "校验图操作", reason: artifacts.operationNotes || artifacts.operationsDraft ? "尚未生成可执行 operations.json，当前中间说明或草稿不能替代图操作。" : "尚未生成图操作草案。" })
 
-    if (artifacts.validation) {
-      if (await latestValidationPassed(directory, state)) availableActions.push({ action: "生成预览", reason: "最近一次校验通过，可生成图谱预览元数据。" })
-      else blockedActions.push({ action: "生成预览", reason: "最近一次校验未通过，不能生成预览。" })
+    const previewReady = artifacts.preview && artifacts.previewGraph && await latestValidationPassed(directory, state)
+    if (state.stage === "图操作已生成" && previewReady) {
+      availableActions.push({ action: "应用图操作", reason: "图操作和预览已生成，可在用户明确确认时应用图操作。", requiresUserConfirmation: true })
     } else {
-      blockedActions.push({ action: "生成预览", reason: "尚未校验图操作。" })
+      blockedActions.push({ action: "应用图操作", reason: "尚未生成可审核的图操作预览。" })
     }
-
-    if (state.stage === "预览已生成") availableActions.push({ action: "应用图操作", reason: "预览后可在用户明确确认时应用图操作。", requiresUserConfirmation: true })
-    else blockedActions.push({ action: "应用图操作", reason: "尚未生成可审核的预览。" })
 
     const recommendations: string[] = []
     if (!artifacts.note) recommendations.push("先整理或更新工作笔记；材料不足时继续追加消息或登记资源。")
     if (state.stage === "笔记需补充") recommendations.push("当前笔记不足以支撑图操作，优先追问用户并修订工作笔记。")
     if (state.stage === "图操作需修订") recommendations.push("当前工作笔记可以保留，优先根据审核意见或校验结果修订图操作。")
-    if (state.stage === "校验已通过") recommendations.push("校验通过后可以生成预览；用户仍可选择继续修改笔记或图操作。")
-    if (state.stage === "预览已生成") recommendations.push("预览已生成后，用户可确认应用，也可只修订图操作或回到工作笔记。")
-    if (!recommendations.length) recommendations.push("根据用户意图选择补材料、改笔记、生成图操作、校验或预览；状态机只做轻量护栏。")
+    if (state.stage === "图操作已生成" && previewReady) recommendations.push("图操作和预览已生成后，用户可确认应用，也可继续修订图操作或回到工作笔记。")
+    if (!recommendations.length) recommendations.push("根据用户意图选择补材料、改笔记、生成或修订图操作；状态机只做轻量护栏。")
 
     return { availableActions, blockedActions, recommendations }
   }
@@ -440,11 +409,10 @@ export namespace ProjectWorkflow {
     if (action === "检查笔记充分性" && !artifacts.note) throw new Error("尚未生成工作笔记，不能检查笔记充分性。")
     if (action === "生成图操作草案" && !artifacts.note) throw new Error("尚未生成工作笔记，不能生成图操作草案。")
     if (action === "校验图操作" && !artifacts.validation && !artifacts.operations) throw new Error(artifacts.operationNotes || artifacts.operationsDraft ? "尚未生成校验结果，不能登记校验。" : "尚未生成图操作草案，不能校验。")
-    if (action === "生成预览" && !artifacts.validation) throw new Error("尚未校验图操作，不能生成预览。")
-    if (action === "生成预览" && !(await latestValidationPassed(directory, state))) throw new Error("最近一次校验未通过，不能生成预览。")
     if (action === "应用图操作") {
       const parsed = ApplyPayload.parse(payload)
-      if (state.stage !== "预览已生成") throw new Error("尚未生成可审核的预览，不能应用图操作。")
+      if (state.stage !== "图操作已生成") throw new Error("尚未生成可审核的图操作预览，不能应用图操作。")
+      if (!artifacts.preview || !artifacts.previewGraph || !(await latestValidationPassed(directory, state))) throw new Error("尚未生成可审核的图操作预览，不能应用图操作。")
       if (!parsed.confirm) throw new Error("应用图操作需要 payload.confirm = true，并且必须来自用户明确确认。")
     }
   }
@@ -463,22 +431,34 @@ export namespace ProjectWorkflow {
     }
   }
 
-  async function inactive(project: string, directory: string, message: string): Promise<ActionResult> {
+  async function inactive(project: string, directory: string, message: string, data?: Record<string, unknown>): Promise<ActionResult> {
     const view = await actionView(directory)
     return {
       ok: true,
       project,
       ...view,
       message,
+      data,
     }
   }
 
   async function startOrResume(project: string, directory: string) {
     const existing = await readState(directory)
     if (existing) return ok(project, directory, existing, `已恢复工作推进草案，当前阶段：${existing.stage}。`, { restored: true })
-    const state = createState(project)
+    let state = createState(project)
+    const preservedNote = await readOptionalText(defaultArtifactPath(directory, "note"))
+    if (preservedNote?.trim()) {
+      state = State.parse({
+        ...state,
+        stage: "笔记已生成",
+        lastAction: "同步工作笔记变更",
+      })
+    }
     await writeState(directory, state)
-    return ok(project, directory, state, "已创建新的工作推进草案。", { restored: false })
+    return ok(project, directory, state, preservedNote?.trim() ? "已基于保留的工作笔记创建新的工作推进草案。" : "已创建新的工作推进草案。", {
+      restored: false,
+      preservedNote: !!preservedNote?.trim(),
+    })
   }
 
   export async function bindSessions(input: {
@@ -507,10 +487,9 @@ export namespace ProjectWorkflow {
     const directory = input.directory ?? projectDirectory(project)
     await ensureProject(directory)
     const state = await readState(directory)
-    if (!state) return {}
     const [note, resources] = await Promise.all([
-      readOptionalText(artifactPath(directory, state, "note")),
-      readOptionalText(artifactPath(directory, state, "resources")),
+      readOptionalText(state ? artifactPath(directory, state, "note") : defaultArtifactPath(directory, "note")),
+      readOptionalText(state ? artifactPath(directory, state, "resources") : defaultArtifactPath(directory, "resources")),
     ])
     return ActiveArtifactSnapshot.parse({ note, resources })
   }
@@ -548,7 +527,6 @@ export namespace ProjectWorkflow {
         state,
         "同步工作笔记变更",
         "笔记已生成",
-        "重新预热后沿用上一版工作笔记，已清空图操作草案、校验和预览。",
       )
     }
     await writeState(directory, state)
@@ -561,26 +539,21 @@ export namespace ProjectWorkflow {
 
   async function discard(project: string, directory: string, state: State) {
     const note = await readOptionalText(artifactPath(directory, state, "note"))
+    const resources = await readOptionalText(artifactPath(directory, state, "resources"))
     await cleanupWorkflowChatSession(state)
     if (!note?.trim()) {
-      const next = transition(state, "放弃草案", "已取消", "用户确认放弃 active 草案；当前没有工作笔记可保留。")
-      await writeState(directory, next)
       await fs.rm(activeDir(directory), { recursive: true, force: true })
       return inactive(project, directory, "已清空当前 active 草案。")
     }
 
-    await fs.rm(artifactPath(directory, state, "messages"), { force: true })
-    await clearGraphDraftArtifacts(directory, state, { includeNoteReview: true })
-    const next = transition(
-      State.parse({ ...state, sessionID: undefined }),
-      "放弃草案",
-      "笔记已生成",
-      "用户确认放弃当前草案；已保留工作笔记并清空图操作草案、校验、预览和聊天会话。",
-    )
-    await writeState(directory, next)
-    return ok(project, directory, next, "已放弃当前草案，并保留工作笔记。", {
-      notePath: next.artifacts.note,
+    await fs.rm(activeDir(directory), { recursive: true, force: true })
+    await fs.mkdir(activeDir(directory), { recursive: true })
+    await fs.writeFile(defaultArtifactPath(directory, "note"), note.trimEnd() + "\n", "utf8")
+    if (resources?.trim()) await fs.writeFile(defaultArtifactPath(directory, "resources"), resources, "utf8")
+    return inactive(project, directory, "已放弃当前 active workflow，并保留工作笔记。", {
+      notePath: "workflows/active/note.md",
       preservedNote: true,
+      preservedResources: !!resources?.trim(),
     })
   }
 
@@ -605,7 +578,7 @@ export namespace ProjectWorkflow {
         role: payload.role,
         text: payload.text,
       })
-      const next = touch(state, "追加消息", `追加${payload.role}消息。`)
+      const next = touch(state, "追加消息")
       await writeState(directory, next)
       return ok(project, directory, next, "已记录消息。")
     }
@@ -618,7 +591,7 @@ export namespace ProjectWorkflow {
         title: payload.title,
         note: payload.note,
       })
-      const next = touch(state, "登记资源", `登记资源：${payload.title || payload.path}`)
+      const next = touch(state, "登记资源")
       await writeState(directory, next)
       return ok(project, directory, next, "已登记资源。")
     }
@@ -629,10 +602,7 @@ export namespace ProjectWorkflow {
 
     if (request.action === "同步工作笔记变更") {
       const payload = NoteSyncPayload.parse(request.payload)
-      const sourceSummary = payload.source
-        ? `来源：${payload.source}${payload.sourcePath ? ` (${payload.sourcePath})` : ""}。`
-        : ""
-      const next = transition(state, "同步工作笔记变更", "笔记已生成", payload.summary || `${sourceSummary}工作笔记已更新。`)
+      const next = transition(state, "同步工作笔记变更", "笔记已生成")
       await writeState(directory, next)
       return ok(project, directory, next, "已同步工作笔记变更。", {
         notePath: next.artifacts.note,
@@ -656,7 +626,6 @@ export namespace ProjectWorkflow {
         state,
         "检查笔记充分性",
         review.sufficient && review.canDraftOperations ? "笔记已生成" : "笔记需补充",
-        review.summary || (review.sufficient ? "当前工作笔记足以生成图操作草案。" : "当前工作笔记仍需补充。"),
       )
       await writeState(directory, next)
       return ok(project, directory, next, review.sufficient ? "笔记充分性检查通过。" : "笔记仍需补充。", { review })
@@ -666,7 +635,7 @@ export namespace ProjectWorkflow {
       const payload = OperationsPayload.parse(request.payload)
       await assertOperationArtifactManifest(directory, state, payload.artifacts)
       const artifacts = await artifactStatus(directory, state)
-      const next = transition(state, "生成图操作草案", "图操作已生成", payload.summary || `生成图操作草案${payload.change_id ? `：${payload.change_id}` : "。"}`)
+      const next = transition(state, "生成图操作草案", "图操作已生成")
       await writeState(directory, next)
       return ok(project, directory, next, "已登记图操作草案产物。", {
         change_id: payload.change_id,
@@ -684,27 +653,16 @@ export namespace ProjectWorkflow {
       const next = transition(
         state,
         "校验图操作",
-        passed ? "校验已通过" : "图操作需修订",
-        payload.summary || (passed ? "图操作草案通过校验。" : "图操作草案校验未通过，需要修订图操作。"),
+        passed ? "图操作已生成" : "图操作需修订",
       )
       await writeState(directory, next)
-      return ok(project, directory, next, passed ? "校验已通过。" : "图操作需修订。", {
+      return ok(project, directory, next, passed ? "图操作和预览已生成。" : "图操作需修订。", {
         validation: {
           passed: validation.passed,
           issueCount: validation.issues.length,
           issues: validation.issues,
         },
       })
-    }
-
-    if (request.action === "生成预览") {
-      const payload = PreviewRegisterPayload.parse(request.payload)
-      const validation = await readJsonFile(artifactPath(directory, state, "validation"), ValidationArtifact)
-      if (!validation.passed) throw new Error("最近一次校验未通过，不能生成预览。")
-      await readJsonFile(artifactPath(directory, state, "preview"), PreviewArtifact)
-      const next = transition(state, "生成预览", "预览已生成", payload.summary || "登记图操作预览产物。")
-      await writeState(directory, next)
-      return ok(project, directory, next, "已登记图操作预览产物。")
     }
 
     if (request.action === "提出修订意见") {
@@ -717,7 +675,7 @@ export namespace ProjectWorkflow {
         text: payload.comment,
       })
       const nextStage: Stage = payload.target === "图操作" ? "图操作需修订" : payload.target === "工作笔记" ? "笔记需补充" : "笔记需补充"
-      const next = transition(state, "提出修订意见", nextStage, `用户提出${payload.target}修订意见：${payload.comment}`)
+      const next = transition(state, "提出修订意见", nextStage)
       await writeState(directory, next)
       return ok(project, directory, next, `已记录${payload.target}修订意见。`)
     }

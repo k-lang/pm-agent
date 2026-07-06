@@ -4,7 +4,7 @@
 
 把当前 active workflow 的工作笔记转成可审核、可校验的图操作草案。
 
-你不是直接修改正式图数据，也不要直接写最终 `operations.json`。你要先生成给人看的自然语言说明，再生成压缩的结构化 `operations.draft.json`，把它们写入 active workflow 草案区，最后通过 `workflow_action` 登记这些草案产物已经写好。后端执行层会从 draft 编译生成 `operations.json`、`operation_index.json`、`validation.json` 和后续 `preview.json`。用户审核的是自然语言化的图操作说明、代码派生的图操作索引和图谱预览，不是让用户手改内部 JSON。
+你不是直接修改正式图数据，也不要直接写最终 `operations.json`。你要先生成给人看的自然语言说明，再生成压缩的结构化 `operations.draft.json`，把它们写入 active workflow 草案区，最后通过 `workflow_action` 登记这些草案产物已经写好。后端执行层会从 draft 编译生成 `operations.json`、`operation_index.json`、`validation.json`、`preview.json` 和 `preview_graph`；校验通过时，图谱预览会同步生成。用户审核的是自然语言化的图操作说明、代码派生的图操作索引和图谱预览，不是让用户手改内部 JSON。
 
 ## 输入
 
@@ -222,6 +222,7 @@
 - `workflows/active/operation_index.json`
 - `workflows/active/validation.json`
 - `workflows/active/preview.json`
+- `workflows/active/preview_graph/`
 
 然后通过 `workflow_action` 的 `生成图操作草案` 动作登记产物。payload 只包含小清单，不包含草稿正文：
 
@@ -272,7 +273,7 @@
 
 判断标准：如果用户打开这个节点时需要直接看到“截至当前这个节点到底是什么状态、有什么结论、还有什么限制”，就写完整 `description`；如果只是给原说明补一个局部事实，才写 `description_delta`。
 
-`description` 写当前状态总结，`history` 写本轮为什么变、证据来自哪里、影响了什么。本次历史说明写入每个 item 的 `history`。执行层会从 draft 生成最终 `operations.json` 和 `history_descriptions`；图引擎在真正应用时负责追加节点/边 `history[]` 和快照。
+`description` 写当前状态总结，`history` 写本轮为什么变、证据来自哪里、影响了什么。本次历史说明写入每个 item 的 `history`。执行层会从 draft 生成最终 `operations.json` 和 `history_descriptions`，并保留旧 `description` 里的可读 `历史记录：` 段，把本轮 `history` 插到最前面；图引擎在真正应用时负责追加节点/边结构化 `history[]` 和快照。
 
 示例：
 
@@ -342,7 +343,7 @@
 
 - 不直接写 `nodes/`、`edges/`、`snapshots/`、`descriptions_output/`、`changes/changelog.txt`。
 - 不直接用原版 `write` / `edit` / `apply_patch` 修改图数据文件。
-- 旧历史记录的保留、本次 history 插入、snapshot 写入由图引擎负责；模型只写每个 item 的最新一条历史说明字符串。
+- 可读 `description` 里的旧历史记录保留和本次 history 插入由执行层编译 draft 时负责；结构化 `history[]` 追加和 snapshot 写入由图引擎 apply 时负责。模型只写每个 item 的最新一条历史说明字符串。
 - graph schema、节点边引用、布局语义归属、dry-run、preview、apply 都由后端代码负责。
 - 后端会把 `operations.draft.json` 编译为 `operations.json` 后做硬校验：非法 `type`、非法 `edge_type`、不存在节点引用、属性关系建边、布局语义无法归属都会被拒绝。
 - 如果工作笔记事实不足以判断图操作，先指出缺口并建议补充工作笔记，不要强行生成。

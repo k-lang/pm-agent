@@ -25,30 +25,29 @@ describe("workflow_action tool", () => {
     }, context("build"))).rejects.toThrow("workflow_action 只能由 project_workflow agent 调用")
   })
 
-  test("does not allow chat to execute terminal UI-only actions", async () => {
+  test("does not expose UI-only or internal actions in the chat tool schema", async () => {
     const tool = await WorkflowActionTool.init()
+    const actionOptions = ((tool.parameters as any).shape.action.options || []) as string[]
 
-    await expect(tool.execute({
-      project: "demo",
-      action: "放弃草案",
-      payload: {},
-    }, context("project_workflow"))).rejects.toThrow("必须由工作推进页的专用确认按钮触发")
-
-    await expect(tool.execute({
-      project: "demo",
-      action: "应用图操作",
-      payload: { confirm: true },
-    }, context("project_workflow"))).rejects.toThrow("必须由工作推进页的专用确认按钮触发")
+    expect(actionOptions).not.toContain("放弃草案")
+    expect(actionOptions).not.toContain("更新工作笔记")
+    expect(actionOptions).not.toContain("生成预览")
+    expect(actionOptions).not.toContain("应用图操作")
   })
 
-  test("does not allow chat to write full note content through workflow_action", async () => {
+  test("rejects internal actions at schema validation", async () => {
     const tool = await WorkflowActionTool.init()
 
-    await expect(tool.execute({
+    expect(tool.parameters.safeParse({
       project: "demo",
       action: "更新工作笔记",
       payload: { content: "完整工作笔记内容" },
-    }, context("project_workflow"))).rejects.toThrow("不能通过聊天工具执行")
+    }).success).toBe(false)
+    expect(tool.parameters.safeParse({
+      project: "demo",
+      action: "生成预览",
+      payload: {},
+    }).success).toBe(false)
   })
 
   test("does not allow chat to send graph draft content through workflow_action", async () => {

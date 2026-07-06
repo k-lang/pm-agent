@@ -61,6 +61,12 @@ export function normalizeGraphRenderOptions(options = {}) {
   }
 }
 
+export function isEdgeHighlighted(edge, selectedNodeId, options = normalizeGraphRenderOptions()) {
+  if (options.highlightEdgeIds.has(edge.id)) return true
+  if (options.mode === 'draft-preview') return false
+  return Boolean(selectedNodeId && (edge.source === selectedNodeId || edge.target === selectedNodeId))
+}
+
 function createSvg(tag, attrs = {}) {
   const el = document.createElementNS(SVG_NS, tag)
   for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, String(value))
@@ -714,8 +720,7 @@ export class ProjectGraphRenderer {
       const pathData = this.quadPath(start, handle, end)
       const group = createSvg('g')
       const selected = this.state.selectedEdgeId === edge.id
-      const highlighted = this.state.options.highlightEdgeIds.has(edge.id)
-        || (this.state.selectedNodeId && (edge.source === this.state.selectedNodeId || edge.target === this.state.selectedNodeId))
+      const highlighted = isEdgeHighlighted(edge, this.state.selectedNodeId, this.state.options)
       const draft = this.state.options.draftEdgeIds.has(edge.id)
       const path = createSvg('path', {
         d: pathData,

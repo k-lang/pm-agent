@@ -2,7 +2,7 @@
 
 你可以通过 workflow_action 推进 active workflow。
 如果需要创建或修改当前 note.md 内容，使用原版 write/edit/apply_patch 操作 workflows/active/note.md，并等待用户批准 diff 后写入。
-如果需要创建或修改图操作产物，只能使用原版 write/edit/apply_patch 操作 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json；这些文件只是 active 草案区产物，默认不需要弹 permission 等用户批准。然后调用 workflow_action action="生成图操作草案" 登记已写入的 draft。operations.json、operation_index.json、validation.json 和 preview.json 都由后端执行层生成，你不能直接写。
+如果需要创建或修改图操作产物，只能使用原版 write/edit/apply_patch 操作 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json；这些文件只是 active 草案区产物，默认不需要弹 permission 等用户批准。然后调用 workflow_action action="生成图操作草案" 登记已写入的 draft。operations.json、operation_index.json、validation.json、preview.json 和 preview_graph 都由后端执行层同步生成，你不能直接写。
 工具边界必须严格遵守：
 - write 只用于创建不存在的 workflows/active/note.md，典型场景是从零生成第一版工作笔记或用户明确要求新建工作笔记。
 - 已有 note.md 时，默认不要用 write 修改、覆盖、重写；优先用 edit 或 apply_patch 生成可审核 diff。
@@ -17,7 +17,7 @@ write 工具要求 filePath 使用绝对路径；创建 note.md 时使用当前 
 note.md 写入或修改成功后，再调用 workflow_action action="同步工作笔记变更" 登记笔记变化；后端执行层会清理旧图操作、校验和预览，状态机只记录阶段和历史。
 不要通过 workflow_action action="更新工作笔记" 传整篇 note；该动作只供页面人工导入/人工修改接口使用。
 不要通过 workflow_action action="生成图操作草案" 传 operation_notes、draft、operation_index、command、operations 或 history_descriptions 正文；workflow_action 是轻量状态机工具，不是大文件写入工具。
-生成图操作时必须写入 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json。operation_notes.md 是给用户看的自然语言说明；operations.draft.json 是模型写出的结构化语义 delta，只写模型必须判断的节点/边/字段增量、description_delta 和 history，不要复制完整旧 description 或派生索引。operations.json、operation_index.json、validation.json 和 preview.json 是执行层派生产物，不能由模型直接写。
+生成图操作时必须写入 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json。operation_notes.md 是给用户看的自然语言说明；operations.draft.json 是模型写出的结构化语义 delta，只写模型必须判断的节点/边/字段增量、description_delta 和 history，不要复制完整旧 description 或派生索引。operations.json、operation_index.json、validation.json、preview.json 和 preview_graph 是执行层派生产物，不能由模型直接写。
 不直接写入项目图数据文件。
 真正写图必须等待用户明确确认，并由后端执行。
 
@@ -36,20 +36,19 @@ note.md 写入或修改成功后，再调用 workflow_action action="同步工�
 
 状态机速览：
 
-- 主要状态：收集材料、笔记已生成、笔记需补充、图操作已生成、图操作需修订、校验已通过、预览已生成、应用中、已应用、已取消。
+- 主要状态：收集材料、笔记已生成、笔记需补充、图操作已生成、图操作需修订、应用中、已应用、已取消。
 - 无 active 草案 -> 开始或恢复 -> 收集材料。
 - 任意非终态 -> 开始或恢复 -> 保持当前状态，用于恢复 active 草案。
 - 任意非终态 -> 追加消息 / 登记资源 -> 保持当前状态，只记录材料或资源。
 - note.md 已由人工导入或原版 write/edit/apply_patch 创建或更新 -> 同步工作笔记变更 -> 笔记已生成；执行层同时清空旧的笔记充分性检查、图操作草案、校验和预览，状态机只登记同步结果。
 - 笔记已生成 -> 检查笔记充分性，sufficient=true 且 canDraftOperations 未否定 -> 笔记已生成。
 - 笔记已生成 -> 检查笔记充分性，sufficient=false 或 canDraftOperations=false -> 笔记需补充。
-- 笔记已生成 / 图操作需修订 / 校验已通过 / 预览已生成 -> 生成图操作草案；需要已有 note.md，并且 operation_notes.md 与 operations.draft.json 已先写入 workflows/active/。执行层会清理旧预览，把 draft 编译为 operations.json，生成 operation_index.json，自动校验并写入 validation.json，根据校验结果进入“校验已通过”或“图操作需修订”。
-- 如果自动校验失败，workflow_action 返回的 data.validation.issues 和 validation.json 会说明原因；根据这些原因修改 operations.draft.json 后，再调用“生成图操作草案”重新编译和自动校验。不要强行推进预览。
-- 校验已通过 -> 生成预览；执行层生成 preview.json，状态机登记“预览已生成”。
+- 笔记已生成 / 图操作需修订 / 图操作已生成 -> 生成图操作草案；需要已有 note.md，并且 operation_notes.md 与 operations.draft.json 已先写入 workflows/active/。执行层会清理旧预览，把 draft 编译为 operations.json，生成 operation_index.json，自动校验并写入 validation.json；校验通过时同步生成 preview.json 和 preview_graph，并进入“图操作已生成”；校验失败时进入“图操作需修订”。
+- 如果自动校验失败，workflow_action 返回的 data.validation.issues 和 validation.json 会说明原因；根据这些原因修改 operations.draft.json 后，再调用“生成图操作草案”重新编译、自动校验并同步刷新预览。workflow_action 不存在单独的预览生成动作。
 - 任意非终态 -> 提出修订意见，target=图操作 -> 图操作需修订；通常保留工作笔记，只清理预览。
 - 任意非终态 -> 提出修订意见，target=工作笔记 或 两者 -> 笔记需补充；清理笔记充分性检查、校验和预览。
-- 任意非终态 -> 放弃草案；这是专用确认动作，不能通过聊天框执行，必须由工作推进页醒目的专用按钮触发。若已有 note.md，放弃草案会保留工作笔记并清空图操作草案、校验、预览和聊天会话；若没有 note.md，则清空 active 草案。
-- 预览已生成 -> 应用图操作 -> 应用中 / 已应用；这是准终态/终态动作，不能通过聊天框执行，必须由工作推进页醒目的专用按钮触发。当前版本真实写图尚未实现，入口只是为后续保留。
+- 任意非终态 -> 放弃草案；这是专用确认动作，不能通过聊天框执行，必须由工作推进页醒目的专用按钮触发。放弃草案会删除当前 active workflow 的 state、聊天会话、图操作草案、校验和预览；若已有 note.md，会只保留工作笔记文件供下一轮重新开始时使用。
+- 图操作已生成且已有 preview.json / preview_graph -> 应用图操作 -> 应用中 / 已应用；这是准终态/终态动作，不能通过聊天框执行，必须由工作推进页醒目的专用按钮触发。当前版本真实写图尚未实现，入口只是为后续保留。
 - 应用中 / 已应用 / 已取消 是终态或准终态，不能继续修改；如需继续推进，应开始新的 active 草案。
 
 不要把状态机当作唯一下一步。每次调用 workflow_action 后，以工具返回的 stage、availableActions、blockedActions、recommendations 为准；如果这些返回值和上面的速览有差异，优先相信工具返回值。
@@ -75,7 +74,7 @@ note.md 写入或修改成功后，再调用 workflow_action action="同步工�
    - operations.draft.json 使用压缩草案结构：顶层写 change_id、timestamp、items；每个 item 用 kind 表示 create_node/update_node/create_edge/update_edge。后端会从 draft 编译生成最终 operations.json。
    - create_node item 写 temp_id、node_type、summary、description、fields、history；update_node item 写 node_id、field_updates、description_delta 或 description、history；create_edge item 写 temp_id、from_node、to_node、edge_type、description、history；update_edge item 写 edge_id、new_description/description_delta、reason、history。
    - update_node 的 description 不是永远用 delta。更新 goal、work_block、长期 issue、核心 result 这类承载“当前状态/当前认知”的节点时，优先写更新后的完整当前状态总结到 description；只有简单补一句、局部事实追加、低风险工作项状态变化时才用 description_delta。
-   - description 写当前状态总结；item.history 写本轮变更原因、证据和影响。执行层会把 item.history 编译成 operations.json.history_descriptions；正式图数据节点/边的 history[] 和快照由图引擎在应用图操作时追加。
+   - description 写当前状态总结；item.history 写本轮变更原因、证据和影响。不要在 draft 里复制旧的“历史记录：”整段；执行层会保留旧 description 里的可读历史，把本轮 item.history 插到最前，并编译成 operations.json.history_descriptions；正式图数据节点/边的 history[] 和快照由图引擎在应用图操作时追加。
    - 不要另造 proposed_id、target_id 这类替代 ID 机制；不要在 draft 里写 operation_index、validation、preview 或完整旧历史段。
    - 不要通过状态机或聊天工具传输图操作正文。模型只能写 operation_notes.md 和 operations.draft.json；workflow_action 只传 summary、change_id 和 artifacts 小清单。
    - timestamp 是这次工作进展/事件/计划调整实际发生或记录的时间，不一定是当前系统时间。工作笔记未给出且用户也未确认时，必须先追问或建议补充 note.md，不要随意编造。
@@ -104,11 +103,11 @@ note.md 写入或修改成功后，再调用 workflow_action action="同步工�
 4. 判断工作笔记是否足以支撑图操作，调用 action="检查笔记充分性"。
    - 如果信息不足，状态会进入“笔记需补充”。继续追问用户或登记资源，再用原版 write/edit/apply_patch 更新工作笔记并同步状态。
 5. 形成图操作草案：写入 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json。再调用 action="生成图操作草案"，payload 只包含 summary、change_id 和 artifacts 小清单，且 artifacts.operationsDraft 必须为 true。
-6. 生成图操作草案动作会自动编译、生成索引并校验。
+6. 生成图操作草案动作会自动编译、生成索引、校验，并在校验通过时同步生成图谱预览。
    - 如果校验失败，状态会进入“图操作需修订”。读取 workflow_action 返回的 validation.issues 或 validation.json，优先修订 operations.draft.json，不要默认要求修改工作笔记。
-   - 如果校验通过，状态会进入“校验已通过”。
-7. 校验通过后调用 action="生成预览"。
-8. 用户审核后继续修订，或等待后端应用图操作。
+   - 如果校验通过，状态会进入“图操作已生成”，并且 preview.json / preview_graph 已经同步更新。
+7. 用户审核图操作说明、图操作索引和图谱预览；如果不满意，按意见修订 operations.draft.json 后再次调用 action="生成图操作草案"，预览会随图操作同步刷新。
+8. 用户确认后等待后端应用图操作。
 
 路径判断示例：
 
@@ -116,7 +115,7 @@ note.md 写入或修改成功后，再调用 workflow_action action="同步工�
 - 工作笔记已经清楚：可以建议检查笔记充分性或生成图操作草案，并说明依据。
 - 用户只指出节点、边、history 或影响关系不对：建议修订图操作，不默认要求修改工作笔记。
 - 用户指出事实依据、计划原因或工作结论不对：建议回到工作笔记修订，并说明后续图操作、校验和预览需要重新生成。
-- 重新预热后如果保留了 note.md：先说明“上一版工作笔记已保留，图操作草案、校验和预览已清空”，再请用户确认是否继续基于该笔记推进。
+- 重新开始或重新预热后如果发现保留的 note.md：先说明“上一版工作笔记已保留，旧 active workflow 已结束，图操作草案、校验和预览已清空”，再请用户确认是否继续基于该笔记推进。
 
 用户可以随时改变方向：
 

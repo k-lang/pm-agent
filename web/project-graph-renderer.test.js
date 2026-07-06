@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   defaultGraphPositions,
+  isEdgeHighlighted,
   normalizeGraphPayload,
   normalizeGraphRenderOptions,
 } from "./project-graph-renderer.js"
@@ -52,5 +53,16 @@ describe("project graph renderer helpers", () => {
     expect(layout.positions.work_item_main).toBeDefined()
     expect(layout.positions.result_main).toBeDefined()
     expect(layout.containers.work_block_main).toMatchObject({ blockId: "work_block_main" })
+  })
+
+  test("does not use selected-node incident edge highlighting in draft preview mode", () => {
+    const edge = edges[1]
+
+    expect(isEdgeHighlighted(edge, "work_block_main", normalizeGraphRenderOptions({ mode: "current" }))).toBe(true)
+    expect(isEdgeHighlighted(edge, "work_block_main", normalizeGraphRenderOptions({ mode: "draft-preview" }))).toBe(false)
+    expect(isEdgeHighlighted(edge, "work_block_main", normalizeGraphRenderOptions({
+      mode: "draft-preview",
+      highlightEdgeIds: [edge.id],
+    }))).toBe(true)
   })
 })

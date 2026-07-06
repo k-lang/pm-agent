@@ -76,7 +76,48 @@ describe("ProjectWorkflow", () => {
     }
   }
 
-  test("uses jiedaidan original note for a mid-project normal draft-check-validate-preview flow", async () => {
+  test("rejects active state files that still use removed workflow stages", async () => {
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.mkdir(activeDir, { recursive: true })
+    await fs.writeFile(path.join(activeDir, "state.json"), JSON.stringify({
+      id: "legacy_state",
+      project: "demo",
+      stage: "预览已生成",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      history: [{
+        time: Date.now(),
+        action: "生成预览",
+        from: "校验已通过",
+        to: "预览已生成",
+        summary: "旧状态机遗留状态。",
+      }],
+    }, null, 2) + "\n", "utf8")
+
+    await expect(ProjectWorkflow.getActive({ project: "demo", directory })).rejects.toThrow()
+  })
+
+  test("rejects active state files that still contain hidden state history", async () => {
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.mkdir(activeDir, { recursive: true })
+    await fs.writeFile(path.join(activeDir, "state.json"), JSON.stringify({
+      id: "legacy_state",
+      project: "demo",
+      stage: "收集材料",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      history: [{
+        time: Date.now(),
+        action: "开始或恢复",
+        to: "收集材料",
+        summary: "旧实现写入的隐藏状态历史。",
+      }],
+    }, null, 2) + "\n", "utf8")
+
+    await expect(ProjectWorkflow.getActive({ project: "demo", directory })).rejects.toThrow()
+  })
+
+  test("uses jiedaidan original note for a mid-project draft-check-and-preview flow", async () => {
     await replayStepsBefore(18)
     const started = await action("开始或恢复")
     expect(started.stage).toBe("收集材料")
@@ -96,20 +137,95 @@ describe("ProjectWorkflow", () => {
     expect(reviewed.stage).toBe("笔记已生成")
 
     const drafted = await registerOperationDraft(command)
-    expect(drafted.stage).toBe("校验已通过")
+    expect(drafted.stage).toBe("图操作已生成")
     expect(drafted.data?.validation).toMatchObject({ passed: true })
 
-    const previewed = await action("生成预览")
-    expect(previewed.stage).toBe("预览已生成")
     const preview = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "preview.json"), "utf8"))
     expect(preview).toMatchObject({
       change_id: "step18_knowledge_scheme",
       operationCount: 7,
+      graphDirectory: "workflows/active/preview_graph",
     })
-    expect(previewed.availableActions.map((item) => item.action)).toContain("应用图操作")
+    expect(preview.mode).toBe("full-graph")
+    expect(Array.isArray(preview.graph?.nodes)).toBe(true)
+    expect(Array.isArray(preview.graph?.edges)).toBe(true)
+    expect(preview.change.createdNodeIds.length + preview.change.updatedNodeIds.length).toBeGreaterThan(0)
+    expect(preview.change.createdEdgeIds.length + preview.change.updatedEdgeIds.length).toBeGreaterThan(0)
+    const index = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "operation_index.json"), "utf8"))
+    const firstEdgeOperation = command.operations.find((operation: any) => operation.type === "create_edge")
+    expect(firstEdgeOperation).toBeTruthy()
+    const expectedRenderEdgeID = `${firstEdgeOperation.from_node}|${firstEdgeOperation.to_node}|${firstEdgeOperation.edge_type}`
+    const matchingGroup = index.groups.find((group: any) => group.edgeIds?.includes(expectedRenderEdgeID))
+    expect(matchingGroup).toBeTruthy()
+    expect(matchingGroup.nodeIds).toEqual([firstEdgeOperation.from_node, firstEdgeOperation.to_node])
+    const matchingEdgeChild = matchingGroup.children.find((child: any) => child.edgeIds?.includes(expectedRenderEdgeID))
+    expect(matchingEdgeChild).toBeTruthy()
+    expect(matchingEdgeChild.nodeIds || []).toEqual([])
+    for (const group of index.groups) {
+      if (group.kind !== "关系组") continue
+      expect(group.nodeIds).toHaveLength(2)
+      expect(group.edgeIds).toHaveLength(1)
+      const edgeChildren = group.children.filter((child: any) => child.edgeIds?.length)
+      expect(edgeChildren).toHaveLength(1)
+      expect(edgeChildren[0].edgeIds).toEqual(group.edgeIds)
+      expect(edgeChildren[0].nodeIds || []).toEqual([])
+      for (const child of group.children.filter((item: any) => item.nodeIds?.length && !item.edgeIds?.length)) {
+        expect(child.nodeIds.every((nodeId: string) => group.nodeIds.includes(nodeId))).toBe(true)
+      }
+    }
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview_graph", "nodes"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview_graph", "edges"))).resolves.toBeTruthy()
+    expect(drafted.availableActions.map((item) => item.action)).toContain("应用图操作")
 
     const stateRaw = await fs.readFile(path.join(directory, "workflows", "active", "state.json"), "utf8")
-    expect(stateRaw).toContain("预览已生成")
+    expect(stateRaw).toContain("图操作已生成")
+  })
+
+  test("groups update_edge operations by existing source edge and target", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "验证已有边更新时，图操作索引仍按起点、边、终点组织。",
+      summary: "建立测试工作笔记。",
+    })
+    const edgeIDs = (await fs.readdir(path.join(directory, "edges"))).filter((name) => name.endsWith(".json"))
+    const edgeID = path.basename(edgeIDs[0], ".json")
+    const edge = JSON.parse(await fs.readFile(path.join(directory, "edges", `${edgeID}.json`), "utf8"))
+
+    await registerOperationDraft({
+      change_id: "update_edge_group_index",
+      timestamp: "2026-07-06T10:00:00+08:00",
+      description: "更新已有边说明，验证索引分组。",
+      operations: [
+        {
+          type: "update_edge",
+          edge_id: edgeID,
+          new_description: "更新后的边说明。",
+          reason: "验证索引生成。",
+        },
+      ],
+      history_descriptions: {
+        [edgeID]: "更新已有边说明。",
+      },
+    })
+
+    const index = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "operation_index.json"), "utf8"))
+    const renderEdgeID = `${edge.from_node_id}|${edge.to_node_id}|${edge.type}`
+    expect(index.groups).toHaveLength(1)
+    expect(index.groups[0]).toMatchObject({
+      kind: "关系组",
+      sourceNodeId: edge.from_node_id,
+      targetNodeId: edge.to_node_id,
+      edgeId: renderEdgeID,
+      nodeIds: [edge.from_node_id, edge.to_node_id],
+      edgeIds: [renderEdgeID],
+    })
+    expect(index.groups[0].children).toHaveLength(1)
+    expect(index.groups[0].children[0]).toMatchObject({
+      kind: "更新关系",
+      nodeIds: [],
+      edgeIds: [renderEdgeID],
+    })
   })
 
   test("uses a truncated jiedaidan note to cover note-needs-supplement then returns to note-ready", async () => {
@@ -193,7 +309,7 @@ describe("ProjectWorkflow", () => {
       ],
     })
 
-    expect(drafted.stage).toBe("校验已通过")
+    expect(drafted.stage).toBe("图操作已生成")
     const activeDir = path.join(directory, "workflows", "active")
     const command = JSON.parse(await fs.readFile(path.join(activeDir, "operations.json"), "utf8"))
     expect(command).toMatchObject({
@@ -219,6 +335,14 @@ describe("ProjectWorkflow", () => {
     })
     expect(command.operations[0].updates.description).toContain("基于标签易混淆点分析")
     expect(command.operations[0].updates.description).toContain("本轮用压缩 draft 记录")
+    expect(command.operations[0].updates.description).toContain("历史记录：")
+    expect(command.operations[0].updates.description).toContain("压缩 draft 更新目标完成度")
+    expect(command.operations[0].updates.description).toContain("语料分析实验")
+    expect(command.operations[0].updates.description).not.toContain("\n- - [")
+    expect(command.operations[0].updates.description).not.toContain("\n- 发生变动")
+    const historyLines = command.operations[0].updates.description.split("历史记录：\n")[1].split("\n")
+    expect(historyLines[0]).toContain("压缩 draft 更新目标完成度")
+    expect(historyLines[1]).toContain("语料分析实验")
     expect(command.history_descriptions).toMatchObject({
       goal_knowledge_organization: "压缩 draft 更新目标完成度并追加说明增量。",
       result_compressed_draft_demo: "创建压缩 draft 编译验证结果节点。",
@@ -253,17 +377,100 @@ describe("ProjectWorkflow", () => {
       ],
     })
 
-    expect(drafted.stage).toBe("校验已通过")
+    expect(drafted.stage).toBe("图操作已生成")
     const command = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "operations.json"), "utf8"))
     expect(command.operations[0]).toMatchObject({
       type: "update_node",
       node_id: "goal_knowledge_organization",
       updates: {
         completion_score: 32,
-        description: fullDescription,
       },
     })
-    expect(command.operations[0].updates.description).not.toContain("基于标签易混淆点分析")
+    expect(command.operations[0].updates.description).toContain(fullDescription)
+    expect(command.operations[0].updates.description).toContain("历史记录：")
+    expect(command.operations[0].updates.description).toContain("用完整当前状态总结更新领域知识梳理目标")
+    expect(command.operations[0].updates.description).toContain("语料分析实验")
+    expect(command.operations[0].updates.description).not.toContain("\n- - [")
+    expect(command.operations[0].updates.description.split("历史记录：")[0]).not.toContain("基于标签易混淆点分析")
+    const previewGoal = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "preview_graph", "nodes", "goal", "goal_knowledge_organization.json"), "utf8"))
+    expect(previewGoal.description).toContain(fullDescription)
+    expect(previewGoal.description).toContain("历史记录：")
+    expect(previewGoal.description).toContain("用完整当前状态总结更新领域知识梳理目标")
+    const index = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "operation_index.json"), "utf8"))
+    expect(index.groups).toHaveLength(1)
+    expect(index.groups[0]).toMatchObject({
+      kind: "更新节点",
+      nodeIds: ["goal_knowledge_organization"],
+      edgeIds: [],
+    })
+  })
+
+  test("compressed draft preserves readable history from description instead of structured fallback history", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "人工验证历史记录合成逻辑。",
+      summary: "建立测试工作笔记。",
+    })
+    const nodeDir = path.join(directory, "nodes", "goal")
+    await fs.mkdir(nodeDir, { recursive: true })
+    await fs.writeFile(path.join(nodeDir, "goal_history_format.json"), JSON.stringify({
+      id: "goal_history_format",
+      type: "goal",
+      summary: "验证历史格式",
+      description: [
+        "这是当前目标说明。",
+        "",
+        "历史记录：",
+        "- [old_step_2] 旧的第二条可读历史。",
+        "- - [old_step_1] 旧数据里带重复 bullet 的第一条可读历史。",
+      ].join("\n"),
+      status: "in_progress",
+      completion_score: 10,
+      linked_work_blocks: [],
+      history: [
+        {
+          timestamp: "2025-01-01T00:00:00",
+          version: "old_step_1",
+          description: "发生变动",
+          serialized_data: "{}",
+        },
+        {
+          timestamp: "2025-01-02T00:00:00",
+          version: "old_step_2",
+          description: "发生变动",
+          serialized_data: "{}",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    await registerCompressedDraft({
+      change_id: "history_format_regression",
+      timestamp: "2026-07-06T10:00:00+08:00",
+      items: [
+        {
+          kind: "update_node",
+          node_id: "goal_history_format",
+          field_updates: { completion_score: 20 },
+          description_delta: "本轮新增当前说明。",
+          history: "[new_step] 本轮新增可读历史。",
+        },
+      ],
+    })
+
+    const command = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "operations.json"), "utf8"))
+    const description = command.operations[0].updates.description
+    expect(description).toContain("这是当前目标说明。")
+    expect(description).toContain("本轮新增当前说明。")
+    expect(description).toContain("历史记录：")
+    expect(description).toContain("[new_step] 本轮新增可读历史。")
+    expect(description).toContain("[old_step_2] 旧的第二条可读历史。")
+    expect(description).toContain("[old_step_1] 旧数据里带重复 bullet 的第一条可读历史。")
+    expect(description).not.toContain("\n- - [")
+    expect(description).not.toContain("\n- 发生变动")
+    const lines = description.split("历史记录：\n")[1].split("\n")
+    expect(lines[0]).toBe("- [new_step] 本轮新增可读历史。")
+    expect(lines[1]).toBe("- [old_step_2] 旧的第二条可读历史。")
+    expect(lines[2]).toBe("- [old_step_1] 旧数据里带重复 bullet 的第一条可读历史。")
   })
 
   test("uses jiedaidan step17 material and a damaged command to enter graph-operation revision", async () => {
@@ -291,7 +498,8 @@ describe("ProjectWorkflow", () => {
     expect(validated.recommendations.join("\n")).toContain("修订图操作")
     expect(validated.availableActions.map((item) => item.action)).toContain("生成图操作草案")
     expect(validated.availableActions.map((item) => item.action)).toContain("同步工作笔记变更")
-    expect(validated.blockedActions.find((item) => item.action === "生成预览")?.reason).toContain("校验未通过")
+    expect(validated.availableActions.map((item) => item.action)).not.toContain("生成预览")
+    expect(validated.blockedActions.map((item) => item.action)).not.toContain("生成预览")
   })
 
   test("uses jiedaidan step19 multi-source plan material for operations-only review feedback", async () => {
@@ -306,9 +514,8 @@ describe("ProjectWorkflow", () => {
       summary: "step19 包含工作归属、前序来源、结果和目标影响，足以生成图操作。",
     })
     await registerOperationDraft(await readStepCommand(19))
-    await action("校验图操作")
-    await action("生成预览")
     await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview_graph"))).resolves.toBeTruthy()
 
     const revised = await action("提出修订意见", {
       target: "图操作",
@@ -318,6 +525,7 @@ describe("ProjectWorkflow", () => {
     expect(revised.stage).toBe("图操作需修订")
     await expect(fs.stat(path.join(directory, "workflows", "active", "note.md"))).resolves.toBeTruthy()
     await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview_graph"))).rejects.toThrow()
   })
 
   test("regenerating operations invalidates validation and preview artifacts", async () => {
@@ -326,18 +534,19 @@ describe("ProjectWorkflow", () => {
     await action("更新工作笔记", { content: await readOriginalNote("knowledge_entry_point.txt"), summary: "使用 step18 对应原始工作笔记。" })
     const command = await readStepCommand(18)
     await registerOperationDraft(command)
-    await action("校验图操作")
-    await action("生成预览")
+    const originalPreview = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "preview.json"), "utf8"))
 
     const regenerated = await registerOperationDraft({
       ...command,
       change_id: "step18_knowledge_scheme_revised",
       description: "根据审核意见重新生成 step18 图操作草案。",
     }, "根据审核意见重新登记 step18 图操作草案。")
-    expect(regenerated.stage).toBe("校验已通过")
+    expect(regenerated.stage).toBe("图操作已生成")
     await expect(fs.stat(path.join(directory, "workflows", "active", "operations.json"))).resolves.toBeTruthy()
     await expect(fs.stat(path.join(directory, "workflows", "active", "validation.json"))).resolves.toBeTruthy()
-    await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
+    const regeneratedPreview = JSON.parse(await fs.readFile(path.join(directory, "workflows", "active", "preview.json"), "utf8"))
+    expect(regeneratedPreview.change_id).toBe("step18_knowledge_scheme_revised")
+    expect(regeneratedPreview.generatedAt).not.toBe(originalPreview.generatedAt)
   })
 
   test("requires operations.draft.json when registering graph operations", async () => {
@@ -748,7 +957,7 @@ describe("ProjectWorkflow", () => {
       passed: validation.passed,
       summary: "validation service 已写入校验结果。",
     })
-    expect(registered.stage).toBe("校验已通过")
+    expect(registered.stage).toBe("图操作已生成")
   })
 
   test("state machine syncs note state without managing downstream artifact cleanup", async () => {
@@ -780,8 +989,6 @@ describe("ProjectWorkflow", () => {
       sourcePath: "source/knowledge_entry_point.txt",
     })
     await registerOperationDraft(await readStepCommand(18))
-    await action("校验图操作")
-    await action("生成预览")
 
     const activeDir = path.join(directory, "workflows", "active")
     await expect(fs.stat(path.join(activeDir, "operations.json"))).resolves.toBeTruthy()
@@ -810,8 +1017,6 @@ describe("ProjectWorkflow", () => {
       summary: "使用 step18 对应原始工作笔记。",
     })
     await registerOperationDraft(await readStepCommand(18))
-    await action("校验图操作")
-    await action("生成预览")
 
     const activeDir = path.join(directory, "workflows", "active")
     const notePath = path.join(activeDir, "note.md")
@@ -843,8 +1048,6 @@ describe("ProjectWorkflow", () => {
     })
     await action("更新工作笔记", { content: note, summary: "使用 step18 对应原始工作笔记。" })
     await registerOperationDraft(command)
-    await action("校验图操作")
-    await action("生成预览")
 
     const activeDir = path.join(directory, "workflows", "active")
     await expect(fs.stat(path.join(activeDir, "operations.json"))).resolves.toBeTruthy()
@@ -892,7 +1095,7 @@ describe("ProjectWorkflow", () => {
       action: "放弃草案",
       requiresUserConfirmation: true,
     })
-    expect(started.blockedActions.find((item) => item.action === "应用图操作")?.reason).toContain("尚未生成可审核的预览")
+    expect(started.blockedActions.find((item) => item.action === "应用图操作")?.reason).toContain("尚未生成可审核的图操作预览")
 
     await replayStepsBefore(18)
     await action("更新工作笔记", {
@@ -900,9 +1103,8 @@ describe("ProjectWorkflow", () => {
       summary: "使用 step18 对应原始工作笔记。",
     })
     await registerOperationDraft(await readStepCommand(18))
-    await action("校验图操作")
-    const previewed = await action("生成预览")
-    const apply = previewed.availableActions.find((item) => item.action === "应用图操作")
+    const generated = await action("校验图操作")
+    const apply = generated.availableActions.find((item) => item.action === "应用图操作")
     expect(apply).toMatchObject({
       action: "应用图操作",
       requiresUserConfirmation: true,
@@ -953,15 +1155,22 @@ describe("ProjectWorkflow", () => {
 
     const discarded = await action("放弃草案")
 
-    expect(discarded.stage).toBe("笔记已生成")
+    expect(discarded.stage).toBeUndefined()
     expect(discarded.message).toContain("保留工作笔记")
-    expect(discarded.state?.sessionID).toBeUndefined()
-    expect(discarded.state?.warmupSessionID).toBe("ses_demo_warmup")
+    expect(discarded.state).toBeUndefined()
+    expect(discarded.data).toMatchObject({ preservedNote: true })
     await expect(fs.readFile(path.join(activeDir, "note.md"), "utf8")).resolves.toBe("这是一份需要保留的工作笔记。\n")
+    await expect(fs.stat(path.join(activeDir, "state.json"))).rejects.toThrow()
     await expect(fs.stat(path.join(activeDir, "messages.jsonl"))).rejects.toThrow()
     await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
     await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
     await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+
+    const restarted = await action("开始或恢复")
+    expect(restarted.stage).toBe("笔记已生成")
+    expect(restarted.data).toMatchObject({ restored: false, preservedNote: true })
+    const stateRaw = await fs.readFile(path.join(activeDir, "state.json"), "utf8")
+    expect(stateRaw).not.toContain("\"history\"")
   })
 
   test("discard removes the forked workflow chat session but keeps the warmup baseline session", async () => {
@@ -1004,9 +1213,9 @@ describe("ProjectWorkflow", () => {
     })
   })
 
-  test("dedicated apply action is guarded before and after preview generation", async () => {
+  test("dedicated apply action is guarded before and after graph operation preview is generated", async () => {
     await action("开始或恢复")
-    await expect(action("应用图操作", { confirm: true })).rejects.toThrow("尚未生成可审核的预览")
+    await expect(action("应用图操作", { confirm: true })).rejects.toThrow("尚未生成可审核的图操作预览")
 
     await replayStepsBefore(18)
     await action("更新工作笔记", {
@@ -1014,8 +1223,6 @@ describe("ProjectWorkflow", () => {
       summary: "使用 step18 对应原始工作笔记。",
     })
     await registerOperationDraft(await readStepCommand(18))
-    await action("校验图操作")
-    await action("生成预览")
 
     await expect(action("应用图操作", { confirm: false })).rejects.toThrow("应用图操作需要 payload.confirm = true")
     await expect(action("应用图操作", { confirm: true })).rejects.toThrow("当前版本只实现状态机、草案文件和校验/预览")

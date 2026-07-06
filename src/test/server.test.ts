@@ -332,11 +332,12 @@ describe("server routes", () => {
       const res = await app.fetch(new Request("http://localhost/project/workflow/operations?project=demo"))
       expect(res.status).toBe(200)
       const body = await res.json()
-      expect(body.workflow.stage).toBe("校验已通过")
+      expect(body.workflow.stage).toBe("图操作已生成")
       expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationNotes")?.content).toContain("图操作说明")
       expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationsDraft")?.content).toContain("demo_operations")
       expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationIndex")?.content).toContain("demo_operations")
       expect(body.files.find((file: { key: string; content?: string }) => file.key === "operations")?.content).toContain("demo_operations")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "preview")?.content).toContain("demo_operations")
     } finally {
       process.chdir(originalCwd)
     }

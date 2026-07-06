@@ -5,6 +5,8 @@ import { GraphEngine } from "@/graph/engine"
 import { EdgeType, GraphCommand, NodeType, type GraphCommand as GraphCommandData } from "@/graph/schema"
 import { GraphStorage } from "@/graph/storage"
 import { ProjectWorkflow } from "./state"
+import { loadExpandedGraph } from "../../standalone-graph/transform"
+import type { GraphPayload } from "../../standalone-graph/types"
 
 export namespace ProjectWorkflowExecution {
   export const OperationArtifactSnapshot = z.object({
@@ -41,6 +43,18 @@ export namespace ProjectWorkflowExecution {
     mode: z.string().optional(),
     operationCount: z.number().optional(),
     affectedIds: z.array(z.string()).optional(),
+    graphDirectory: z.string().optional(),
+    graph: z.unknown().optional(),
+    change: z.object({
+      createdNodeIds: z.array(z.string()).default([]),
+      updatedNodeIds: z.array(z.string()).default([]),
+      affectedNodeIds: z.array(z.string()).default([]),
+      createdEdgeIds: z.array(z.string()).default([]),
+      updatedEdgeIds: z.array(z.string()).default([]),
+      affectedEdgeIds: z.array(z.string()).default([]),
+      focusNodeId: z.string().optional(),
+      focusEdgeId: z.string().optional(),
+    }).optional(),
   }).passthrough()
   export type PreviewArtifact = z.infer<typeof PreviewArtifact>
 
@@ -141,6 +155,14 @@ export namespace ProjectWorkflowExecution {
     return path.join(activeDir(directory), file)
   }
 
+  function previewGraphDir(directory: string) {
+    return artifactPath(directory, "preview_graph")
+  }
+
+  function previewGraphBuildDir(directory: string) {
+    return artifactPath(directory, "preview_graph.building")
+  }
+
   async function readOptionalText(file: string) {
     return fs.readFile(file, "utf8").catch(() => undefined)
   }
@@ -181,6 +203,48 @@ export namespace ProjectWorkflowExecution {
     return `${base.trimEnd()}\n\n${delta.trim()}`
   }
 
+  function historySectionText(value: string | undefined) {
+    if (!value) return ""
+    const match = value.match(/\n{0,2}历史记录：\s*\n?([\s\S]*)$/u)
+    return match?.[1] || ""
+  }
+
+  function normalizeReadableHistoryLines(value: string | undefined) {
+    const section = value?.includes("历史记录：") ? historySectionText(value) : value || ""
+    const lines: string[] = []
+    for (const rawLine of section.split(/\r?\n/u)) {
+      const trimmed = rawLine.trim()
+      if (!trimmed) continue
+      const bulletMatch = trimmed.match(/^(?:[-*]\s*)+(.+)$/u)
+      if (bulletMatch?.[1]) {
+        lines.push(bulletMatch[1].trim())
+        continue
+      }
+      if (lines.length) lines[lines.length - 1] = `${lines[lines.length - 1]}\n${trimmed}`
+      else lines.push(trimmed)
+    }
+    return lines.filter((line) => line.trim())
+  }
+
+  function renderReadableHistory(lines: string[]) {
+    return lines.map((line) => `- ${line.replace(/\n/g, "\n  ")}`).join("\n")
+  }
+
+  function descriptionWithReadableHistory(
+    description: string | undefined,
+    existingDescription: string | undefined,
+    currentHistory: string | undefined,
+  ) {
+    const base = stripEmbeddedHistoryText(description || "")
+    const lines = [
+      ...normalizeReadableHistoryLines(currentHistory),
+      ...normalizeReadableHistoryLines(existingDescription),
+    ]
+    if (!lines.length) return base
+    const historySection = `历史记录：\n${renderReadableHistory(lines)}`
+    return base ? `${base}\n\n${historySection}` : historySection
+  }
+
   function timestampValue(input: WorkflowOperationDraft["timestamp"]) {
     return typeof input === "string" ? input : input.value
   }
@@ -192,6 +256,7 @@ export namespace ProjectWorkflowExecution {
 
     for (const item of draft.items) {
       if (item.kind === "create_node") {
+        const description = descriptionWithReadableHistory(item.description, undefined, item.history)
         operations.push({
           type: "create_node",
           temp_id: item.temp_id,
@@ -199,7 +264,7 @@ export namespace ProjectWorkflowExecution {
             ...item.fields,
             type: item.node_type,
             summary: item.summary,
-            description: stripEmbeddedHistory(item.description),
+            description,
           }) as Record<string, unknown> & { type: z.infer<typeof NodeType> },
         })
         if (item.history) historyDescriptions[item.temp_id] = item.history
@@ -208,11 +273,13 @@ export namespace ProjectWorkflowExecution {
 
       if (item.kind === "update_node") {
         const updates: Record<string, unknown> = { ...item.field_updates }
+        const node = await storage.getNodeById(item.node_id)
         if (item.description !== undefined) {
-          updates.description = stripEmbeddedHistory(item.description)
+          updates.description = descriptionWithReadableHistory(item.description, node?.description, item.history)
         } else if (item.description_delta !== undefined) {
-          const node = await storage.getNodeById(item.node_id)
-          updates.description = appendDescriptionDelta(node?.description, item.description_delta)
+          updates.description = descriptionWithReadableHistory(appendDescriptionDelta(node?.description, item.description_delta), node?.description, item.history)
+        } else if (item.history) {
+          updates.description = descriptionWithReadableHistory(node?.description, node?.description, item.history)
         }
         operations.push({
           type: "update_node",
@@ -230,17 +297,25 @@ export namespace ProjectWorkflowExecution {
           from_node: item.from_node,
           to_node: item.to_node,
           edge_type: item.edge_type,
-          description: item.description,
+          description: descriptionWithReadableHistory(item.description, undefined, item.history),
         })
         if (item.history && item.temp_id) historyDescriptions[item.temp_id] = item.history
         continue
       }
 
       if (item.kind === "update_edge") {
+        const edge = await storage.loadEdge(item.edge_id)
+        const nextDescription = item.new_description !== undefined
+          ? descriptionWithReadableHistory(item.new_description, edge?.description, item.history)
+          : item.description_delta !== undefined
+            ? descriptionWithReadableHistory(appendDescriptionDelta(edge?.description, item.description_delta), edge?.description, item.history)
+            : item.history
+              ? descriptionWithReadableHistory(edge?.description, edge?.description, item.history)
+              : undefined
         operations.push({
           type: "update_edge",
           edge_id: item.edge_id,
-          new_description: item.new_description ?? item.description_delta,
+          new_description: nextDescription,
           reason: item.reason,
         })
         if (item.history) historyDescriptions[item.edge_id] = item.history
@@ -257,30 +332,11 @@ export namespace ProjectWorkflowExecution {
   }
 
   function normalizeCommand(command: GraphCommandData): GraphCommandData {
-    return GraphCommand.parse({
-      ...command,
-      operations: command.operations.map((operation) => {
-        if (operation.type === "create_node") {
-          return {
-            ...operation,
-            data: {
-              ...operation.data,
-              description: stripEmbeddedHistory(operation.data.description),
-            },
-          }
-        }
-        if (operation.type === "update_node") {
-          return {
-            ...operation,
-            updates: {
-              ...operation.updates,
-              description: stripEmbeddedHistory(operation.updates.description),
-            },
-          }
-        }
-        return operation
-      }),
-    })
+    return GraphCommand.parse(command)
+  }
+
+  function graphEdgeRenderId(edge: { from_node_id: string; to_node_id: string; type: string }) {
+    return `${edge.from_node_id}|${edge.to_node_id}|${edge.type}`
   }
 
   function operationTargets(operation: GraphCommandData["operations"][number]) {
@@ -306,7 +362,183 @@ export namespace ProjectWorkflowExecution {
     return operation.edge_id
   }
 
-  function buildOperationIndex(command: GraphCommandData) {
+  function nodeLabelFromCommandOrStorage(input: {
+    nodeId: string
+    command: GraphCommandData
+    storageNodes: Map<string, { summary?: string; type?: string }>
+  }) {
+    const created = input.command.operations.find((operation) => operation.type === "create_node" && operation.temp_id === input.nodeId)
+    if (created?.type === "create_node") return String(created.data.summary || created.temp_id)
+    const existing = input.storageNodes.get(input.nodeId)
+    return existing?.summary || input.nodeId
+  }
+
+  type OperationIndexEdgeGroupInput = {
+    operation: Extract<GraphCommandData["operations"][number], { type: "create_edge" | "update_edge" }>
+    index: number
+    sourceNodeId: string
+    targetNodeId: string
+    edgeType: string
+    renderEdgeId: string
+    description?: string
+    historyTargetId?: string
+  }
+
+  async function buildOperationIndex(command: GraphCommandData, directory: string) {
+    const storage = new GraphStorage(directory)
+    const storageNodes = new Map<string, { summary?: string; type?: string }>()
+    const updateEdgeInfo = new Map<string, { sourceNodeId: string; targetNodeId: string; edgeType: string; renderEdgeId: string }>()
+    for (const operation of command.operations) {
+      if (operation.type === "update_node") {
+        const node = await storage.getNodeById(operation.node_id)
+        if (node) storageNodes.set(node.id, { summary: node.summary, type: node.type })
+      }
+      if (operation.type === "create_edge" || operation.type === "update_edge") {
+        const refs = operation.type === "create_edge"
+          ? [operation.from_node, operation.to_node]
+          : []
+        for (const ref of refs) {
+          if (!storageNodes.has(ref)) {
+            const node = await storage.getNodeById(ref)
+            if (node) storageNodes.set(node.id, { summary: node.summary, type: node.type })
+          }
+        }
+      }
+      if (operation.type === "update_edge") {
+        const edge = await storage.loadEdge(operation.edge_id)
+        if (edge) {
+          updateEdgeInfo.set(operation.edge_id, {
+            sourceNodeId: edge.from_node_id,
+            targetNodeId: edge.to_node_id,
+            edgeType: edge.type,
+            renderEdgeId: graphEdgeRenderId(edge),
+          })
+          for (const ref of [edge.from_node_id, edge.to_node_id]) {
+            if (!storageNodes.has(ref)) {
+              const node = await storage.getNodeById(ref)
+              if (node) storageNodes.set(node.id, { summary: node.summary, type: node.type })
+            }
+          }
+        }
+      }
+    }
+    const nodeIdsForOperation = (operation: GraphCommandData["operations"][number]) => {
+      if (operation.type === "create_node") return [operation.temp_id]
+      if (operation.type === "update_node") return [operation.node_id]
+      if (operation.type === "create_edge") return [operation.from_node, operation.to_node]
+      if (operation.type === "update_edge") {
+        const edge = updateEdgeInfo.get(operation.edge_id)
+        return edge ? [edge.sourceNodeId, edge.targetNodeId] : []
+      }
+      return []
+    }
+    const childNodeIdsForOperation = (operation: GraphCommandData["operations"][number]) => {
+      if (operation.type === "create_edge" || operation.type === "update_edge") return []
+      return nodeIdsForOperation(operation)
+    }
+    const edgeIdsForOperation = (operation: GraphCommandData["operations"][number]) => {
+      if (operation.type === "create_edge") return [`${operation.from_node}|${operation.to_node}|${operation.edge_type}`]
+      if (operation.type === "update_edge") return [updateEdgeInfo.get(operation.edge_id)?.renderEdgeId || operation.edge_id]
+      return []
+    }
+    const nodeOperationFor = (nodeId: string) => command.operations
+      .map((operation, index) => ({ operation, index }))
+      .find(({ operation }) =>
+        (operation.type === "create_node" && operation.temp_id === nodeId)
+        || (operation.type === "update_node" && operation.node_id === nodeId),
+      )
+    const childEntry = (operation: GraphCommandData["operations"][number], index: number) => ({
+      index,
+      kind: operationKind(operation),
+      title: operationTitle(operation),
+      targetIds: operationTargets(operation),
+      nodeIds: childNodeIdsForOperation(operation),
+      edgeIds: edgeIdsForOperation(operation),
+      history_entry: operationTargets(operation).map((target) => command.history_descriptions[target]).find(Boolean) || "",
+    })
+    const edgeGroup = (input: OperationIndexEdgeGroupInput) => {
+      const sourceTitle = nodeLabelFromCommandOrStorage({ nodeId: input.sourceNodeId, command, storageNodes })
+      const targetTitle = nodeLabelFromCommandOrStorage({ nodeId: input.targetNodeId, command, storageNodes })
+      const sourceChild = nodeOperationFor(input.sourceNodeId)
+      const targetChild = nodeOperationFor(input.targetNodeId)
+      const childCandidates = [sourceChild, { operation: input.operation, index: input.index }, targetChild].filter((child): child is { operation: GraphCommandData["operations"][number]; index: number } => !!child)
+      const seen = new Set<number>()
+      const children = childCandidates.filter((child) => {
+        if (seen.has(child.index)) return false
+        seen.add(child.index)
+        groupedOperationIndices.add(child.index)
+        return true
+      }).map((child) => childEntry(child.operation, child.index))
+      return {
+        index: input.index,
+        kind: "关系组",
+        title: `${sourceTitle} -[${input.edgeType}]-> ${targetTitle}`,
+        description: input.description || command.history_descriptions[input.historyTargetId || ""] || "",
+        sourceNodeId: input.sourceNodeId,
+        targetNodeId: input.targetNodeId,
+        edgeId: input.renderEdgeId,
+        targetIds: [input.sourceNodeId, input.renderEdgeId, input.targetNodeId],
+        nodeIds: [input.sourceNodeId, input.targetNodeId],
+        edgeIds: [input.renderEdgeId],
+        children,
+      }
+    }
+    const groupedOperationIndices = new Set<number>()
+    const edgeGroups = command.operations.flatMap((operation, index) => {
+      if (operation.type === "create_edge") {
+        return [edgeGroup({
+          operation,
+          index,
+          sourceNodeId: operation.from_node,
+          targetNodeId: operation.to_node,
+          edgeType: operation.edge_type,
+          renderEdgeId: `${operation.from_node}|${operation.to_node}|${operation.edge_type}`,
+          description: operation.description,
+          historyTargetId: operation.temp_id,
+        })]
+      }
+      if (operation.type === "update_edge") {
+        const edge = updateEdgeInfo.get(operation.edge_id)
+        if (!edge) return []
+        return [edgeGroup({
+          operation,
+          index,
+          sourceNodeId: edge.sourceNodeId,
+          targetNodeId: edge.targetNodeId,
+          edgeType: edge.edgeType,
+          renderEdgeId: edge.renderEdgeId,
+          description: operation.new_description,
+          historyTargetId: operation.edge_id,
+        })]
+      }
+      return []
+    })
+    const standaloneGroups = command.operations.flatMap((operation, index) => {
+      if (groupedOperationIndices.has(index)) return []
+      const nodeIds = nodeIdsForOperation(operation)
+      const edgeIds = edgeIdsForOperation(operation)
+      return [{
+        index,
+        kind: operationKind(operation),
+        title: operationTitle(operation),
+        description: operationTargets(operation).map((target) => command.history_descriptions[target]).find(Boolean) || "",
+        sourceNodeId: nodeIds[0] || "",
+        targetNodeId: nodeIds[1] || "",
+        edgeId: edgeIds[0] || "",
+        targetIds: operationTargets(operation),
+        nodeIds,
+        edgeIds,
+        children: [{
+          index,
+          kind: operationKind(operation),
+          title: operationTitle(operation),
+          targetIds: operationTargets(operation),
+          nodeIds,
+          edgeIds,
+          history_entry: operationTargets(operation).map((target) => command.history_descriptions[target]).find(Boolean) || "",
+        }],
+      }]
+    })
     return {
       generatedAt: new Date().toISOString(),
       change_id: command.change_id,
@@ -317,9 +549,12 @@ export namespace ProjectWorkflowExecution {
           kind: operationKind(operation),
           title: operationTitle(operation),
           targetIds: targets,
+          nodeIds: nodeIdsForOperation(operation),
+          edgeIds: edgeIdsForOperation(operation),
           history_entry: targets.map((target) => command.history_descriptions[target]).find(Boolean) || "",
         }
       }),
+      groups: [...edgeGroups, ...standaloneGroups],
     }
   }
 
@@ -357,13 +592,19 @@ export namespace ProjectWorkflowExecution {
       "validation.json",
       "preview.json",
     ]
-    await Promise.all(files.map((file) => fs.rm(artifactPath(input.directory, file), { force: true })))
+    await Promise.all([
+      ...files.map((file) => fs.rm(artifactPath(input.directory, file), { force: true })),
+      fs.rm(previewGraphDir(input.directory), { recursive: true, force: true }),
+      fs.rm(previewGraphBuildDir(input.directory), { recursive: true, force: true }),
+    ])
   }
 
   async function clearValidationAndPreview(directory: string) {
     await Promise.all([
       fs.rm(artifactPath(directory, "validation.json"), { force: true }),
       fs.rm(artifactPath(directory, "preview.json"), { force: true }),
+      fs.rm(previewGraphDir(directory), { recursive: true, force: true }),
+      fs.rm(previewGraphBuildDir(directory), { recursive: true, force: true }),
     ])
   }
 
@@ -388,6 +629,8 @@ export namespace ProjectWorkflowExecution {
       fs.rm(artifactPath(input.directory, "preview.json"), { force: true }),
       fs.rm(artifactPath(input.directory, "operation_index.json"), { force: true }),
       fs.rm(artifactPath(input.directory, "operations.json"), { force: true }),
+      fs.rm(previewGraphDir(input.directory), { recursive: true, force: true }),
+      fs.rm(previewGraphBuildDir(input.directory), { recursive: true, force: true }),
     ])
   }
 
@@ -465,7 +708,7 @@ export namespace ProjectWorkflowExecution {
       const command = normalizeCommand(await compileCompressedDraft(input.directory, draft.data))
       await Promise.all([
         fs.writeFile(artifactPath(input.directory, "operations.json"), JSON.stringify(command, null, 2) + "\n", "utf8"),
-        fs.writeFile(artifactPath(input.directory, "operation_index.json"), JSON.stringify(buildOperationIndex(command), null, 2) + "\n", "utf8"),
+        fs.writeFile(artifactPath(input.directory, "operation_index.json"), JSON.stringify(await buildOperationIndex(command, input.directory), null, 2) + "\n", "utf8"),
       ])
       return { ok: true as const, command }
     }
@@ -487,14 +730,14 @@ export namespace ProjectWorkflowExecution {
     const command = normalizeCommand(parsed.data)
     await Promise.all([
       fs.writeFile(artifactPath(input.directory, "operations.json"), JSON.stringify(command, null, 2) + "\n", "utf8"),
-      fs.writeFile(artifactPath(input.directory, "operation_index.json"), JSON.stringify(buildOperationIndex(command), null, 2) + "\n", "utf8"),
+      fs.writeFile(artifactPath(input.directory, "operation_index.json"), JSON.stringify(await buildOperationIndex(command, input.directory), null, 2) + "\n", "utf8"),
     ])
     return { ok: true as const, command }
   }
 
   export async function buildPreview(input: { directory: string }) {
     const validation = await readJsonFile(artifactPath(input.directory, "validation.json"), ValidationArtifact)
-    if (!validation.passed) throw new Error("最近一次校验未通过，不能生成预览。")
+    if (!validation.passed) throw new Error("最近一次校验未通过，不能生成图谱预览。")
     const command = await readJsonFile(artifactPath(input.directory, "operations.json"), GraphCommand)
     const affected = new Set<string>()
     for (const operation of command.operations) {
@@ -507,13 +750,65 @@ export namespace ProjectWorkflowExecution {
       }
       if (operation.type === "update_edge") affected.add(operation.edge_id)
     }
+    const tempDirectory = previewGraphBuildDir(input.directory)
+    const finalDirectory = previewGraphDir(input.directory)
+    let graph: GraphPayload | undefined
+    let change: PreviewArtifact["change"] | undefined
+    try {
+      await Promise.all([
+        fs.rm(artifactPath(input.directory, "preview.json"), { force: true }),
+        fs.rm(tempDirectory, { recursive: true, force: true }),
+      ])
+      await fs.mkdir(tempDirectory, { recursive: true })
+      for (const entry of ["nodes", "edges", "changes", "snapshots", "metadata"]) {
+        const source = path.join(input.directory, entry)
+        if (await fileExists(source)) {
+          await fs.cp(source, path.join(tempDirectory, entry), { recursive: true })
+        }
+      }
+      const engine = new GraphEngine(new GraphStorage(tempDirectory))
+      const result = await engine.executeCommand(command)
+      if (!result.success) throw new Error(`预览 dry-run 执行失败：${result.errors.join("; ")}`)
+      graph = await loadExpandedGraph(tempDirectory)
+      const storage = new GraphStorage(tempDirectory)
+      const createdEdgeIds = await Promise.all(Object.values(result.created_edges).map(async (id) => {
+        const edge = await storage.loadEdge(id)
+        return edge ? graphEdgeRenderId(edge) : id
+      }))
+      const updatedEdgeIds = await Promise.all(Object.keys(result.updated_edges).map(async (id) => {
+        const edge = await storage.loadEdge(id)
+        return edge ? graphEdgeRenderId(edge) : id
+      }))
+      const affectedEdgeIds = await Promise.all((result.affected_edges || []).map(async (id) => {
+        const edge = await storage.loadEdge(id)
+        return edge ? graphEdgeRenderId(edge) : id
+      }))
+      change = {
+        createdNodeIds: Object.values(result.created_nodes),
+        updatedNodeIds: Object.keys(result.updated_nodes).map((id) => result.created_nodes[id] || id),
+        affectedNodeIds: result.affected_nodes || [],
+        createdEdgeIds,
+        updatedEdgeIds,
+        affectedEdgeIds,
+        focusNodeId: Object.values(result.created_nodes)[0] || Object.keys(result.updated_nodes)[0],
+        focusEdgeId: createdEdgeIds[0] || updatedEdgeIds[0],
+      }
+      await fs.rm(finalDirectory, { recursive: true, force: true })
+      await fs.rename(tempDirectory, finalDirectory)
+    } catch (error) {
+      await fs.rm(tempDirectory, { recursive: true, force: true })
+      throw error
+    }
     const preview = PreviewArtifact.parse({
       generatedAt: new Date().toISOString(),
       change_id: command.change_id,
-      mode: "完整图谱预览",
+      mode: "full-graph",
       operationCount: command.operations.length,
       affectedIds: [...affected],
-      note: "当前版本只生成预览元数据；图谱渲染层后续读取 operations 后叠加高亮。",
+      graphDirectory: "workflows/active/preview_graph",
+      graph,
+      change,
+      note: "预览图谱由 workflows/active/preview_graph dry-run 生成，正式图数据尚未改变。",
     })
     await fs.writeFile(artifactPath(input.directory, "preview.json"), JSON.stringify(preview, null, 2) + "\n", "utf8")
     return preview
@@ -555,15 +850,26 @@ export namespace ProjectWorkflowExecution {
         await prepareOperationArtifactManifest({ directory, artifacts: artifacts as Record<string, unknown> })
       }
       const result = await ProjectWorkflow.runAction(input)
-      const compiled = await compileOperationDraft({ directory })
-      const validation = compiled.ok ? await validateOperations({ directory }) : compiled.validation
+      let validation: ValidationArtifact
+      let preview: PreviewArtifact | undefined
+      try {
+        const compiled = await compileOperationDraft({ directory })
+        validation = compiled.ok ? await validateOperations({ directory }) : compiled.validation
+        if (validation.passed) preview = await buildPreview({ directory })
+      } catch (error) {
+        validation = await writeValidation({
+          directory,
+          passed: false,
+          issues: [graphIssue(`图操作草案执行层处理失败：${error instanceof Error ? error.message : String(error)}`)],
+        })
+      }
       const registered = await ProjectWorkflow.runAction({
         project: input.project,
         directory,
         action: "校验图操作",
         payload: {
           passed: validation.passed,
-          summary: validation.passed ? "图操作草案通过自动校验。" : "图操作草案自动校验未通过，需要修订 operations.draft.json。",
+          summary: validation.passed ? "图操作草案通过自动校验，预览已同步生成。" : "图操作草案自动校验未通过，需要修订 operations.draft.json。",
         },
       })
       const refreshed = await ProjectWorkflow.getActive({ project: input.project, directory })
@@ -579,6 +885,11 @@ export namespace ProjectWorkflowExecution {
             issueCount: validation.issues.length,
             issues: validation.issues,
           },
+          preview: preview ? {
+            change_id: preview.change_id,
+            operationCount: preview.operationCount,
+            graphDirectory: preview.graphDirectory,
+          } : undefined,
         },
       }
     }
@@ -597,11 +908,6 @@ export namespace ProjectWorkflowExecution {
           summary: validation.passed ? "图操作草案通过校验。" : "图操作草案校验未通过，需要修订图操作。",
         },
       })
-    }
-
-    if (input.action === "生成预览") {
-      await buildPreview({ directory })
-      return ProjectWorkflow.runAction(input)
     }
 
     if (input.action === "提出修订意见") {
