@@ -313,6 +313,8 @@ describe("server routes", () => {
       await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
         change_id: "demo_operations",
         timestamp: "2026-07-06T10:00:00+08:00",
+        note_filename: "demo_operations_note.md",
+        changelog_entry: "[2026-07-06 10:00] demo_operations: 测试把工作笔记转成图操作草案(demo_operations)，用于验证工作推进页图操作产物接口。",
         items: [],
       }, null, 2) + "\n", "utf8")
       await ProjectWorkflowExecution.runAction({

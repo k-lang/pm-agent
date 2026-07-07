@@ -41,6 +41,7 @@ export namespace ProjectWorkflow {
     note: z.string().default("note.md"),
     noteReview: z.string().default("note_review.json"),
     operationNotes: z.string().default("operation_notes.md"),
+    changelogEntry: z.string().default("changelog_entry.txt"),
     operationsDraft: z.string().default("operations.draft.json"),
     operations: z.string().default("operations.json"),
     operationIndex: z.string().default("operation_index.json"),
@@ -69,6 +70,7 @@ export namespace ProjectWorkflow {
       note: "note.md",
       noteReview: "note_review.json",
       operationNotes: "operation_notes.md",
+      changelogEntry: "changelog_entry.txt",
       operationsDraft: "operations.draft.json",
       operations: "operations.json",
       operationIndex: "operation_index.json",
@@ -151,6 +153,9 @@ export namespace ProjectWorkflow {
 
   const ApplyPayload = z.object({
     confirm: z.boolean().default(false),
+    applied: z.boolean().optional(),
+    applyResultPath: z.string().optional(),
+    archivePath: z.string().optional(),
   })
 
   const NoteReviewPayload = z.object({
@@ -315,6 +320,7 @@ export namespace ProjectWorkflow {
     const keys: (keyof z.infer<typeof ArtifactPaths>)[] = [
       ...(options.includeNoteReview ? ["noteReview" as const] : []),
       "operationNotes",
+      "changelogEntry",
       "operationsDraft",
       "operations",
       "operationIndex",
@@ -683,7 +689,13 @@ export namespace ProjectWorkflow {
     if (request.action === "应用图操作") {
       const payload = ApplyPayload.parse(request.payload)
       if (!payload.confirm) throw new Error("应用图操作需要 payload.confirm = true，并且必须来自用户明确确认。")
-      throw new Error("当前版本只实现状态机、草案文件和校验/预览，不执行真实图数据写入。")
+      if (!payload.applied) throw new Error("应用图操作必须由执行层完成正式写图后登记，不能直接由状态机推进。")
+      const next = transition(state, "应用图操作", "已应用")
+      await writeState(directory, next)
+      return ok(project, directory, next, "图操作已应用到正式图数据。", {
+        applyResultPath: payload.applyResultPath,
+        archivePath: payload.archivePath,
+      })
     }
 
     throw new Error(`未支持的动作：${request.action}`)

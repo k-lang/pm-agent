@@ -26,7 +26,7 @@
 
 `operations.draft.json` 是压缩的结构化语义 delta，不是最终 `GraphCommand`。它只存模型必须判断的内容，能由代码派生的不要写。
 
-- 顶层必须包含 `change_id`、`timestamp`、`items`。
+- 顶层必须包含 `change_id`、`timestamp`、`note_filename`、`changelog_entry`、`items`。
 - 顶层使用 `items` 数组，不要使用 `operations` 或 `commands` 数组。
 - 每个 item 使用 `kind` 字段，不要使用 `type`、`command` 或 `op` 字段表示操作。
 - 合法 `kind` 只有：`create_node`、`update_node`、`create_edge`、`update_edge`。
@@ -44,9 +44,19 @@
 
 ### history 字段写法
 
-在 draft 里，模型只写每个 item 的 `history` 字符串。它是本轮新增到该节点或边上的历史说明，写清楚“为什么变更、依据是什么、影响是什么”。
+在 draft 里，模型只写每个 item 的 `history` 字符串。它是本轮新增到该节点或边上的一条可读历史说明，写清楚“为什么变更、依据是什么、影响是什么”。这条历史要尽量贴近旧图数据 description 里的格式：
 
-后端会把 `item.history` 编译成 `operations.json.history_descriptions`。正式图数据里的节点/边 `history[]`、`serialized_data` 快照和去循环引用都由图引擎追加和维护。
+- 开头使用 `[change_id]`，例如 `[step18_knowledge_scheme] ...`。
+- 前半段写本节点/边本次发生了什么：创建、状态变化、完成度变化、描述更新、结果产出或问题认识变化。
+- 后半段写图关系上下文：本次又和哪个目标、工作块、工作项、结果或问题建立/强化了联系，并写出节点 id，例如 `（结果节点id: result_x）`、`（工作块节点id: work_block_y）`。
+- 不要只写“更新状态”“创建节点”“建立关系”这类过短说明。
+
+后端会把 `item.history` 编译成 `operations.json.history_descriptions`。执行层会补齐缺失的 `[change_id]` 前缀，并根据本轮属性归属和边操作补充一部分确定性的图关系上下文；但语义主体必须由模型写好，不能把完整语义历史都推给代码。正式图数据里的节点/边 `history[]`、`serialized_data` 快照和去循环引用都由图引擎追加和维护。
+
+旧格式参考：
+
+- `[step18_knowledge_scheme] 目标领域知识梳理进度大幅提升，因知识梳理方案设计并验证成功，completion_score从30提升到60，status保持"in_progress"；此目标被知识梳理方案验证结果影响，找到可行的知识梳理方法并消除标签定义重叠现象（结果节点id: result_knowledge_organization_scheme）`
+- `[step18_knowledge_scheme] 创建工作项知识梳理方案设计并验证，通过深入分析偏好和额外知识点的特征发现区分方法；状态设置为finished，关联到work_block_knowledge_organization；工作项被领域知识梳理工作块归属（工作块节点id: work_block_knowledge_organization）`
 
 上一版常见错误必须避免：
 
@@ -117,7 +127,7 @@
 - `result -> goal` 才使用 `generates_result`、`adjusts_result` 或 `cancels_result`。
 - `work_item -> result` 使用 `creates` 或 `modifies_work`；不要写 `produces`。
 - `history` 是每个 item 内的一段本轮变更说明字符串。
-- 顶层必须是 `change_id`、`timestamp`、`items`；不要写 `operations`、`commands`，除非你是在处理兼容旧数据，而不是生成新草案。
+- 顶层必须是 `change_id`、`timestamp`、`note_filename`、`changelog_entry`、`items`；不要写 `operations`、`commands`，执行层不会把旧 GraphCommand 或旧 commands schema 当作新草案兼容处理。
 
 如果某个关系无法落到上面的合法组合，优先在 `operation_notes.md` 标成“需审核点”或追问用户，不要发明边类型。
 
@@ -204,7 +214,7 @@
 
 常见图更新：
 
-- 更新 `work_item.status`、`detail_url`、`description`
+- 更新 `work_item.status`、`description`；不要手写 `detail_url`，执行层会根据 `operations.draft.json.note_filename` 统一补到相关 work_item 上
 - 新建或更新 `result`、`issue`
 - 更新 `goal`、`work_block`
 - 创建 `creates`、`modifies_work`、`discovers`、`adjusts_result` 等边
@@ -250,13 +260,17 @@
 - 为什么这么更新。
 - 哪些节点/边映射不确定，需要用户确认。
 - 本次准备追加哪些 history 语义。
-- 本次 changelog 增量草稿。
+- 本次工作笔记归档文件名草稿。这个内容必须写入 `operations.draft.json.note_filename`，用语义化英文/拼音 snake_case 文件名，不能机械使用 change_id。
+- 本次 changelog 增量草稿。这个内容必须同时写入 `operations.draft.json.changelog_entry`，提交时后端会使用该字段追加 `changes/changelog.txt`。
 
 不要在 `operation_notes` 里贴大段 JSON。JSON 放到 `operations.draft.json`。
 
 ## operations.draft.json 写法
 
-`operations.draft.json` 是模型写出的压缩结构化图操作草案。它不是最终执行文件，必须使用后端能机械编译的语义 delta 结构：
+`operations.draft.json` 是模型写出的压缩结构化图操作草案。它不是最终执行文件，必须使用后端能机械编译的语义 delta 结构。顶层必须包含 `note_filename` 和 `changelog_entry`：
+
+- `note_filename`：当前 `workflows/active/note.md` 在确认提交后归档到 `notes/` 下的语义化文件名。必须根据工作笔记主题命名，例如 `knowledge_entry_point.md`、`distinction_sort.md`、`improvement_plan.md`。不要用 change_id 机械命名。后端会做安全转义、补 `.md` 后缀和冲突处理，并把最终路径补到相关 `work_item.detail_url`。
+- `changelog_entry`：本次要追加到 `changes/changelog.txt` 的完整记录。写法要像旧记录一样，用介绍项目进度的语言串起本轮工作、产生的结果或问题、对目标/工作块的影响，同时点明关键节点 ID。通常形如 `[YYYY-MM-DD HH:mm] change_id: ...`。
 
 - `create_node`：模型写 `node_type`、`summary`、`description`、必要 `fields` 和 `history`；执行层补齐默认字段并生成最终 `create_node.data`。
 - `update_node`：模型写要变更的 `field_updates`，并根据节点职责选择 `description` 或 `description_delta`。执行层会把 `description` 作为完整当前状态说明采用；若只提供 `description_delta`，执行层读取旧节点 description 后合并为最终 `updates.description`。
@@ -273,7 +287,7 @@
 
 判断标准：如果用户打开这个节点时需要直接看到“截至当前这个节点到底是什么状态、有什么结论、还有什么限制”，就写完整 `description`；如果只是给原说明补一个局部事实，才写 `description_delta`。
 
-`description` 写当前状态总结，`history` 写本轮为什么变、证据来自哪里、影响了什么。本次历史说明写入每个 item 的 `history`。执行层会从 draft 生成最终 `operations.json` 和 `history_descriptions`，并保留旧 `description` 里的可读 `历史记录：` 段，把本轮 `history` 插到最前面；图引擎在真正应用时负责追加节点/边结构化 `history[]` 和快照。
+`description` 写当前状态总结，`history` 写本轮为什么变、证据来自哪里、影响了什么，并按旧格式包含 `[change_id]` 和图关系上下文。本次历史说明写入每个 item 的 `history`。`note_filename` 写工作笔记归档文件名，`changelog_entry` 写本轮项目时间线记录，面向人阅读，不等同于 item history。执行层会从 draft 生成最终 `operations.json`、`history_descriptions` 和 `changelog_entry.txt`，并保留旧 `description` 里的可读 `历史记录：` 段，把本轮 `history` 插到最前面；图引擎在真正应用时负责追加节点/边结构化 `history[]` 和快照。
 
 示例：
 
@@ -281,6 +295,8 @@
 {
   "change_id": "workflow_x",
   "timestamp": "2026-07-06T10:00:00+08:00",
+  "note_filename": "pilot_validation_result.md",
+  "changelog_entry": "[2026-07-06 10:00] workflow_x: 完成某项阶段工作(work_item_x)，产生某项结果(result_z)，并推动某个目标(goal_y)进展；图数据新增工作项、结果节点及工作项到结果的 creates 关系",
   "items": [
     {
       "kind": "update_node",
@@ -290,7 +306,7 @@
         "completion_score": 40
       },
       "description": "目标当前状态总结：已完成试探性验证，验证结果支持继续推进；当前目标处于进行中状态，后续需要扩大样本范围并确认方案稳定性。",
-      "history": "因本轮试探性验证完成，目标状态和完成度更新。"
+      "history": "[workflow_x] 目标进度更新，因本轮试探性验证完成，completion_score从20提升到40，status保持\"in_progress\"；此目标被阶段验证结果影响，支持继续扩大样本范围（结果节点id: result_z）"
     }
   ]
 }
@@ -302,6 +318,8 @@
 {
   "change_id": "workflow_x",
   "timestamp": "2026-07-06T10:00:00+08:00",
+  "note_filename": "next_step_plan.md",
+  "changelog_entry": "[2026-07-06 10:00] workflow_x: 创建工作项(work_item_x)以推进工作块(work_block_y)，记录本轮计划或进展；图数据新增工作项节点并关联工作块属性",
   "items": [
     {
       "kind": "create_node",
@@ -313,7 +331,7 @@
         "status": "planned",
         "linked_work_block_id": "work_block_y"
       },
-      "history": "创建该工作项的本次历史说明"
+      "history": "[workflow_x] 创建工作项短标题，用于推进下一步计划；状态设置为planned，关联到work_block_y；工作项被对应工作块归属（工作块节点id: work_block_y）"
     }
   ]
 }
@@ -325,6 +343,8 @@
 {
   "change_id": "workflow_x",
   "timestamp": "2026-07-06T10:00:00+08:00",
+  "note_filename": "stage_result_review.md",
+  "changelog_entry": "[2026-07-06 10:00] workflow_x: 工作项(work_item_x)产生结果(result_z)，形成新的阶段产物；图数据新增工作项到结果的 creates 关系",
   "items": [
     {
       "kind": "create_edge",
@@ -333,7 +353,7 @@
       "to_node": "result_z",
       "edge_type": "creates",
       "description": "工作项产生结果",
-      "history": "建立工作项到结果的 creates 关系"
+      "history": "[workflow_x] 建立工作项到结果的creates关系，表示工作项短标题产出某项结果（工作项节点id: work_item_x；结果节点id: result_z）"
     }
   ]
 }

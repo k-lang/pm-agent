@@ -3,7 +3,7 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { spawnSync } from "child_process"
-import { loadCommandAndExecute } from "./engine"
+import { GraphEngine, loadCommandAndExecute } from "./engine"
 import { GraphSemanticValidator } from "./semantic-validation"
 import { GraphCommand } from "./schema"
 import { GraphStorage } from "./storage"
@@ -217,5 +217,34 @@ describe("graph engine", () => {
       "result_orphan",
       "issue_orphan",
     ])
+  })
+
+  test("history records strip duplicated version prefix from readable descriptions", async () => {
+    const root = path.join(OUTPUT_ROOT, "version-prefix")
+    await fs.rm(root, { recursive: true, force: true })
+    const engine = new GraphEngine(new GraphStorage(root))
+    const result = await engine.executeCommand(GraphCommand.parse({
+      change_id: "demo_change",
+      timestamp: "2026-07-06T10:00:00+08:00",
+      operations: [
+        {
+          type: "create_node",
+          temp_id: "goal_demo",
+          data: {
+            type: "goal",
+            summary: "演示目标",
+            description: "演示目标。\n\n历史记录：\n- [demo_change] 创建演示目标。",
+          },
+        },
+      ],
+      history_descriptions: {
+        goal_demo: "[demo_change] 创建演示目标。",
+      },
+    }))
+
+    expect(result.success).toBe(true)
+    const node = await new GraphStorage(root).getNodeById("goal_demo")
+    expect(node?.history[0]?.version).toBe("demo_change")
+    expect(node?.history[0]?.description).toBe("创建演示目标。")
   })
 })

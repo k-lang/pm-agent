@@ -148,6 +148,7 @@ function clearWorkflowView() {
   shownPermissionModalIds.clear()
   workflowAwaitingReply = reset.workflowAwaitingReply
   workflowStatusById.clear()
+  resetGraphPreview()
 }
 
 function replaceUrl() {
@@ -819,7 +820,7 @@ function renderOperationDraftPreview() {
   graphLoadedPreviewKey = ''
 
   const files = operationArtifactFiles()
-  const visibleFiles = files.filter((file) => ['operationNotes', 'operationsDraft', 'operations', 'operationIndex', 'validation', 'preview'].includes(file.key))
+  const visibleFiles = files.filter((file) => ['operationNotes', 'changelogEntry', 'operationsDraft', 'operations', 'operationIndex', 'validation', 'preview'].includes(file.key))
   if (!visibleFiles.some((file) => file.key === selectedOperationArtifactKey && file.exists)) {
     selectedOperationArtifactKey = visibleFiles.find((file) => file.exists)?.key || 'operationNotes'
   }
@@ -1610,7 +1611,25 @@ async function applyWorkflowFromButton() {
   const state = currentWorkflowState()
   const ok = confirm(`确认提交项目「${project.name}」的本轮图操作吗？\n\n当前阶段：${state.stage}\n\n提交后将进入正式图数据写入流程。`)
   if (!ok) return
-  alert('确认提交入口已预留。当前版本尚未实现正式写入图数据，请先继续审核图操作草案。')
+  btnApply.disabled = true
+  try {
+    const result = await fetchJson(API + `/project/workflow/action?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: '应用图操作', payload: { confirm: true } }),
+    })
+    alert(result.message || '图操作已应用。')
+    clearWorkflowView()
+    await loadWorkflow({ askRestore: false })
+    await loadWorkflowNote()
+    await loadWorkflowOperations()
+  } catch (error) {
+    alert(error.message || '应用图操作失败')
+    await loadWorkflow({ askRestore: false }).catch(() => {})
+    await loadWorkflowOperations().catch(() => {})
+  } finally {
+    updateTerminalActionButtons()
+  }
 }
 
 btnDiscardWorkflow.onclick = () => discardWorkflowFromButton()

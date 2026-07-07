@@ -5,6 +5,10 @@ import { GraphSemanticValidator, type GraphSemanticIssue } from "./semantic-vali
 
 export type GraphValidationIssue = GraphSemanticIssue
 
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
 type ExecuteResult = {
   success: boolean
   executed_operations: unknown[]
@@ -293,9 +297,13 @@ export class GraphEngine {
     return {
       timestamp,
       version,
-      description,
+      description: this.stripVersionPrefix(description, version),
       serialized_data: JSON.stringify(serializedValue, null, 2),
     }
+  }
+
+  private stripVersionPrefix(description: string, version: string) {
+    return description.replace(new RegExp(`^\\[${escapeRegExp(version)}\\]\\s*`, "u"), "")
   }
 
   private async createSnapshot(id: string, timestamp: string) {
