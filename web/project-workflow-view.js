@@ -451,6 +451,25 @@ export function renderResourceItem(resource, selectedResourcePath, metaText) {
   `
 }
 
+export function normalizeWorkflowMaximizedPanel(panel) {
+  return panel === 'workspace' || panel === 'chat' ? panel : ''
+}
+
+export function workflowMaximizeBodyClass(panel) {
+  const normalized = normalizeWorkflowMaximizedPanel(panel)
+  return normalized ? `workflow-maximized-${normalized}` : ''
+}
+
+export function workflowMaximizeButtonState(activePanel, panel) {
+  const normalizedPanel = normalizeWorkflowMaximizedPanel(panel)
+  const expanded = normalizeWorkflowMaximizedPanel(activePanel) === normalizedPanel && !!normalizedPanel
+  return {
+    expanded,
+    label: expanded ? '收起' : '展开',
+    title: expanded ? '恢复默认布局' : '展开当前区域',
+  }
+}
+
 export function permissionListUrl(project) {
   const suffix = project?.directory ? `?directory=${encodeURIComponent(project.directory)}` : ''
   return `/permission${suffix}`

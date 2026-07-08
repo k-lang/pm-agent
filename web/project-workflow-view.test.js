@@ -18,6 +18,8 @@ import {
   upsertWorkflowPermissionRecord,
   visibleWorkflowPermissionRecords,
   writeToolRecords,
+  workflowMaximizeBodyClass,
+  workflowMaximizeButtonState,
 } from "./project-workflow-view.js"
 
 function permission(overrides = {}) {
@@ -115,6 +117,24 @@ describe("project workflow view helpers", () => {
     expect(isEditTool("edit")).toBe(true)
     expect(isEditTool("apply_patch")).toBe(true)
     expect(isEditTool("workflow_action")).toBe(false)
+  })
+
+  test("describes workflow panel maximize state", () => {
+    expect(workflowMaximizeBodyClass("workspace")).toBe("workflow-maximized-workspace")
+    expect(workflowMaximizeBodyClass("chat")).toBe("workflow-maximized-chat")
+    expect(workflowMaximizeBodyClass("notes")).toBe("")
+
+    expect(workflowMaximizeButtonState("", "workspace")).toEqual({
+      expanded: false,
+      label: "展开",
+      title: "展开当前区域",
+    })
+    expect(workflowMaximizeButtonState("workspace", "workspace")).toEqual({
+      expanded: true,
+      label: "收起",
+      title: "恢复默认布局",
+    })
+    expect(workflowMaximizeButtonState("workspace", "chat").expanded).toBe(false)
   })
 
   test("keeps rejected permission diff visible when the permission request captured a real diff", () => {

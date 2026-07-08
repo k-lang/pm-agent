@@ -56,6 +56,9 @@ button:disabled {
 .btn-secondary { background: #374151; }
 .btn-secondary:hover { background: #4b5563; }
 .btn-secondary:disabled { background: #1f2937; color: #6b7280; }
+.btn-panel-toggle {
+  min-width: 56px;
+}
 .btn-primary-action {
   background: #059669;
   font-weight: 650;
@@ -94,6 +97,43 @@ button:disabled {
 }
 #layout.resizing {
   user-select: none;
+}
+body.workflow-maximized-workspace #app,
+body.workflow-maximized-chat #app {
+  width: 100%;
+  min-width: 1080px;
+  min-height: 100vh;
+}
+body.workflow-maximized-workspace #layout,
+body.workflow-maximized-chat #layout {
+  display: block;
+  min-height: 0;
+  max-height: none;
+}
+body.workflow-maximized-workspace #layout-resizer,
+body.workflow-maximized-chat #layout-resizer {
+  display: none;
+}
+body.workflow-maximized-workspace #chat-panel,
+body.workflow-maximized-chat #workspace-panel {
+  display: none;
+}
+body.workflow-maximized-workspace #workspace-panel,
+body.workflow-maximized-chat #chat-panel {
+  min-height: 480px;
+  height: calc(100vh - 128px);
+  max-height: none;
+  overflow: hidden;
+  resize: vertical;
+}
+body.workflow-maximized-workspace #graph-tab.active {
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+}
+body.workflow-maximized-workspace #workspace-panel {
+  padding: 10px;
+}
+body.workflow-maximized-chat #chat-panel {
+  padding: 10px;
 }
 .panel {
   background: #1f2937;
@@ -151,7 +191,7 @@ button:disabled {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-#project-status { color: #9ca3af; font-size: 12px; white-space: nowrap; }
+.workspace-top-actions,
 #project-status {
   display: flex;
   align-items: center;
@@ -159,6 +199,10 @@ button:disabled {
   flex-wrap: nowrap;
   justify-content: flex-end;
 }
+.workspace-top-actions {
+  min-width: 0;
+}
+#project-status { color: #9ca3af; font-size: 12px; white-space: nowrap; }
 .chat-actions {
   display: flex;
   align-items: center;
@@ -357,6 +401,9 @@ button:disabled {
   padding: 5px 8px;
   min-height: 28px;
   font-size: 12px;
+}
+.graph-preview-actions .btn-panel-toggle {
+  padding-inline: 10px;
 }
 #chat-log {
   flex: 1;
@@ -907,6 +954,20 @@ label { color: #cbd5e1; font-size: 13px; }
     grid-template-rows: auto auto auto;
     max-height: none;
     min-height: auto;
+  }
+  body.workflow-maximized-workspace #app,
+  body.workflow-maximized-chat #app {
+    min-width: 0;
+  }
+  body.workflow-maximized-workspace #layout,
+  body.workflow-maximized-chat #layout {
+    min-height: 0;
+    max-height: none;
+  }
+  body.workflow-maximized-workspace #workspace-panel,
+  body.workflow-maximized-chat #chat-panel {
+    min-height: 420px;
+    height: calc(100vh - 112px);
   }
   #layout-resizer { display: none; }
   .workspace-tab {

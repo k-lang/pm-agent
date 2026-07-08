@@ -10,6 +10,8 @@ import {
   renderWorkflowToolPart,
   resetWorkflowViewState,
   upsertWorkflowPermissionRecord as upsertWorkflowPermissionRecordList,
+  workflowMaximizeBodyClass,
+  workflowMaximizeButtonState,
   workflowPermissionDiff,
   workflowPermissionFile,
   workflowPermissionStatusText,
@@ -39,12 +41,14 @@ const btnGraphRefresh = document.getElementById('btn-graph-refresh')
 const btnGraphFit = document.getElementById('btn-graph-fit')
 const btnGraphZoomOut = document.getElementById('btn-graph-zoom-out')
 const btnGraphZoomIn = document.getElementById('btn-graph-zoom-in')
+const btnWorkspaceMaximize = document.getElementById('btn-workspace-maximize')
 const notePreview = document.getElementById('note-preview')
 const resourcePreview = document.getElementById('resource-preview')
 const chatLog = document.getElementById('chat-log')
 const chatHint = document.getElementById('chat-hint')
 const chatInput = document.getElementById('chat-input')
 const btnChatSend = document.getElementById('btn-chat-send')
+const btnChatMaximize = document.getElementById('btn-chat-maximize')
 const btnWarmup = document.getElementById('btn-warmup')
 const warmupStatus = document.getElementById('warmup-status')
 const operationList = document.getElementById('operation-list')
@@ -115,6 +119,7 @@ let workflowAwaitingReply = false
 let pendingUserText = ''
 let activePermissionReviewID = ''
 let permissionReplying = false
+let maximizedPanel = ''
 const workflowStatusById = new Map()
 const shownPermissionModalIds = new Set()
 
@@ -172,6 +177,7 @@ function clamp(value, min, max) {
 
 function applyChatHeight(height) {
   if (!layout) return
+  if (maximizedPanel) return
   const total = layout.clientHeight
   if (!total) return
   const resizerHeight = layoutResizer?.offsetHeight || 10
@@ -183,6 +189,7 @@ function applyChatHeight(height) {
 }
 
 function restoreChatHeight() {
+  if (maximizedPanel) return
   if (window.matchMedia('(max-width: 760px)').matches) {
     layout.style.gridTemplateRows = ''
     return
@@ -213,12 +220,45 @@ function setupLayoutResizer() {
     window.removeEventListener('pointerup', onUp)
   }
   layoutResizer.addEventListener('pointerdown', (event) => {
+    if (maximizedPanel) return
     event.preventDefault()
     dragging = true
     layout.classList.add('resizing')
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
   })
+}
+
+function updateMaximizeButton(button, panel) {
+  if (!button) return
+  const state = workflowMaximizeButtonState(maximizedPanel, panel)
+  button.textContent = state.label
+  button.title = state.title
+  button.setAttribute('aria-pressed', state.expanded ? 'true' : 'false')
+}
+
+function updateMaximizedLayout() {
+  document.body.classList.remove('workflow-maximized-workspace', 'workflow-maximized-chat')
+  const bodyClass = workflowMaximizeBodyClass(maximizedPanel)
+  if (bodyClass) document.body.classList.add(bodyClass)
+  if (!maximizedPanel) restoreChatHeight()
+  updateMaximizeButton(btnWorkspaceMaximize, 'workspace')
+  updateMaximizeButton(btnChatMaximize, 'chat')
+}
+
+function setMaximizedPanel(panel) {
+  const next = maximizedPanel === panel ? '' : panel
+  maximizedPanel = next
+  updateMaximizedLayout()
+  if (panel === 'chat' || next === 'chat') chatLog.scrollTop = chatLog.scrollHeight
+}
+
+function toggleWorkspaceMaximize() {
+  setMaximizedPanel('workspace')
+}
+
+function toggleChatMaximize() {
+  setMaximizedPanel('chat')
 }
 
 async function loadProjects() {
@@ -1500,6 +1540,8 @@ projectSelect.onchange = () => {
 for (const button of tabButtons) {
   button.onclick = () => setActiveTab(button.dataset.tab)
 }
+btnWorkspaceMaximize.onclick = toggleWorkspaceMaximize
+btnChatMaximize.onclick = toggleChatMaximize
 btnNewProject.onclick = openModal
 btnDetail.onclick = () => {
   const project = selectedProject()
