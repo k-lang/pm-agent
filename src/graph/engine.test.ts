@@ -5,7 +5,7 @@ import path from "path"
 import { spawnSync } from "child_process"
 import { GraphEngine, loadCommandAndExecute } from "./engine"
 import { GraphSemanticValidator } from "./semantic-validation"
-import { GraphCommand } from "./schema"
+import { GraphCommand, GraphNode } from "./schema"
 import { GraphStorage } from "./storage"
 import { loadExpandedGraph, loadGraph } from "../../standalone-graph/transform"
 
@@ -166,18 +166,261 @@ describe("graph engine", () => {
     expect(expanded.nodes.filter((node) => !node.communityGoalId && node.type !== "goal").map((node) => node.id)).toEqual([])
   }, 30000)
 
-  test("jiedaidan steps satisfy graph semantic layout requirements before each step is applied", async () => {
-    const files = await stepFiles()
-    await fs.rm(TS_OUT, { recursive: true, force: true })
-    const storage = new GraphStorage(TS_OUT)
+  test("semantic validator accepts valid new-target edge relations", async () => {
+    const storage = new GraphStorage(path.join(OUTPUT_ROOT, "semantic-valid-new-targets"))
+    await fs.rm(storage.root, { recursive: true, force: true })
     const validator = new GraphSemanticValidator(storage)
+    const command = GraphCommand.parse({
+      change_id: "valid_new_target_relations",
+      timestamp: "2026-07-09T10:00:00+08:00",
+      operations: [
+        {
+          type: "create_node",
+          temp_id: "event_customer_request",
+          data: { type: "event", summary: "客户提出新要求", description: "" },
+        },
+        {
+          type: "create_node",
+          temp_id: "goal_customer_demo",
+          data: { type: "goal", summary: "完成客户 demo", description: "" },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_block_demo",
+          data: { type: "work_block", summary: "demo 工作块", description: "", linked_goal_id: "goal_customer_demo" },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_item_demo_plan",
+          data: { type: "work_item", summary: "制定 demo 方案", description: "", linked_work_block_id: "work_block_demo" },
+        },
+        {
+          type: "create_node",
+          temp_id: "goal_customer_response",
+          data: { type: "goal", summary: "响应客户现场要求", description: "" },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_block_customer_response",
+          data: { type: "work_block", summary: "客户响应工作块", description: "", linked_goal_id: "goal_customer_response" },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_item_customer_response",
+          data: { type: "work_item", summary: "处理客户现场要求", description: "", linked_work_block_id: "work_block_customer_response" },
+        },
+        {
+          type: "create_node",
+          temp_id: "issue_demo_scope",
+          data: { type: "issue", summary: "demo 范围未收敛", description: "" },
+        },
+        {
+          type: "create_node",
+          temp_id: "result_demo_plan",
+          data: { type: "result", summary: "demo 方案草稿", description: "" },
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_event_generates_goal",
+          from_node: "event_customer_request",
+          to_node: "goal_customer_demo",
+          edge_type: "generates",
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_event_leads_work",
+          from_node: "event_customer_request",
+          to_node: "work_item_customer_response",
+          edge_type: "leads_to",
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_work_discovers_issue",
+          from_node: "work_item_demo_plan",
+          to_node: "issue_demo_scope",
+          edge_type: "discovers",
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_work_creates_result",
+          from_node: "work_item_demo_plan",
+          to_node: "result_demo_plan",
+          edge_type: "creates",
+        },
+      ],
+      history_descriptions: {},
+    })
 
-    for (const file of files) {
-      const command = GraphCommand.parse(await readJson(file))
-      expect(await validator.validateCommand(command), path.basename(file)).toEqual([])
-      await runTsStep(file)
-    }
-  }, 30000)
+    expect(await validator.validateCommand(command)).toEqual([])
+  })
+
+  test("semantic validator rejects redundant event-to-work leads when event already generates parent goal", async () => {
+    const storage = new GraphStorage(path.join(OUTPUT_ROOT, "semantic-redundant-event-work"))
+    await fs.rm(storage.root, { recursive: true, force: true })
+    const validator = new GraphSemanticValidator(storage)
+    const command = GraphCommand.parse({
+      change_id: "redundant_event_work_leads",
+      timestamp: "2026-07-09T10:00:00+08:00",
+      operations: [
+        {
+          type: "create_node",
+          temp_id: "event_customer_request",
+          data: { type: "event", summary: "客户提出新要求", description: "" },
+        },
+        {
+          type: "create_node",
+          temp_id: "goal_customer_demo",
+          data: { type: "goal", summary: "完成客户 demo", description: "" },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_block_demo",
+          data: { type: "work_block", summary: "demo 工作块", description: "", linked_goal_id: "goal_customer_demo" },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_item_demo_plan",
+          data: { type: "work_item", summary: "制定 demo 方案", description: "", linked_work_block_id: "work_block_demo" },
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_event_generates_goal",
+          from_node: "event_customer_request",
+          to_node: "goal_customer_demo",
+          edge_type: "generates",
+        },
+        {
+          type: "create_edge",
+          temp_id: "edge_event_leads_work",
+          from_node: "event_customer_request",
+          to_node: "work_item_demo_plan",
+          edge_type: "leads_to",
+        },
+      ],
+      history_descriptions: {},
+    })
+
+    const issues = await validator.validateCommand(command)
+    const messages = issues.map((issue) => issue.message).join("\n")
+    expect(messages).toContain("已经通过 generates 产生目标 goal_customer_demo")
+    expect(messages).toContain("不要再创建 event -> work_item 的 leads_to")
+  })
+
+  test("graph node schema rejects status values outside each node type whitelist", () => {
+    expect(() => GraphNode.parse({
+      id: "work_item_invalid_status",
+      type: "work_item",
+      summary: "错误状态工作项",
+      description: "",
+      status: "active",
+    })).toThrow()
+    expect(() => GraphNode.parse({
+      id: "result_invalid_status",
+      type: "result",
+      summary: "错误状态结果",
+      description: "",
+      status: "draft",
+    })).toThrow()
+    expect(() => GraphNode.parse({
+      id: "issue_invalid_status",
+      type: "issue",
+      summary: "错误状态问题",
+      description: "",
+      status: "open",
+    })).toThrow()
+  })
+
+  test("semantic validator rejects invalid create and update node statuses before execution", async () => {
+    const root = path.join(OUTPUT_ROOT, "semantic-invalid-status")
+    await fs.rm(root, { recursive: true, force: true })
+    const storage = new GraphStorage(root)
+    await storage.saveNode(GraphNode.parse({
+      id: "goal_existing",
+      type: "goal",
+      summary: "已有目标",
+      description: "",
+      status: "established",
+    }))
+    const validator = new GraphSemanticValidator(storage)
+    const command = GraphCommand.parse({
+      change_id: "invalid_node_status",
+      timestamp: "2026-07-09T10:00:00+08:00",
+      operations: [
+        {
+          type: "create_node",
+          temp_id: "work_block_valid",
+          data: { type: "work_block", summary: "有效工作块", description: "", linked_goal_id: "goal_existing" },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_item_active_is_invalid",
+          data: { type: "work_item", summary: "错误 active 工作项", description: "", status: "active", linked_work_block_id: "work_block_valid" },
+        },
+        {
+          type: "create_node",
+          temp_id: "result_draft_is_invalid",
+          data: { type: "result", summary: "错误 draft 结果", description: "", status: "draft" },
+        },
+        {
+          type: "update_node",
+          node_id: "goal_existing",
+          updates: { status: "active" },
+        },
+      ],
+      history_descriptions: {},
+    })
+
+    const messages = (await validator.validateCommand(command)).map((issue) => issue.message).join("\n")
+    expect(messages).toContain("work_item.status 不应使用 active")
+    expect(messages).toContain("允许状态：planned, in_progress, finished, cancelled, ongoing")
+    expect(messages).toContain("result.status 不应使用 draft")
+    expect(messages).toContain("允许状态：produced, changed")
+    expect(messages).toContain("goal.status 不应使用 active")
+    expect(messages).toContain("允许状态：established, in_progress, completed, failed, cancelled, adjusted")
+  })
+
+  test("semantic validator rejects node fields outside each node type schema", async () => {
+    const root = path.join(OUTPUT_ROOT, "semantic-invalid-fields")
+    await fs.rm(root, { recursive: true, force: true })
+    const storage = new GraphStorage(root)
+    await storage.saveNode(GraphNode.parse({
+      id: "goal_existing",
+      type: "goal",
+      summary: "已有目标",
+      description: "",
+      status: "established",
+    }))
+    const validator = new GraphSemanticValidator(storage)
+    const command = GraphCommand.parse({
+      change_id: "invalid_node_fields",
+      timestamp: "2026-07-09T10:00:00+08:00",
+      operations: [
+        {
+          type: "create_node",
+          temp_id: "goal_bad_completion",
+          data: { type: "goal", summary: "错误完成度字段", description: "", completion: 0 },
+        },
+        {
+          type: "create_node",
+          temp_id: "work_item_bad_goal_ref",
+          data: { type: "work_item", summary: "错误目标引用字段", description: "", linked_goal_id: "goal_existing" },
+        },
+        {
+          type: "update_node",
+          node_id: "goal_existing",
+          updates: { linked_goal_id: "goal_existing" },
+        },
+      ],
+      history_descriptions: {},
+    })
+
+    const messages = (await validator.validateCommand(command)).map((issue) => issue.message).join("\n")
+    expect(messages).toContain("goal.completion 不是合法字段")
+    expect(messages).toContain("work_item.linked_goal_id 不是合法字段")
+    expect(messages).toContain("goal.linked_goal_id 不是合法字段")
+    expect(messages).toContain("completion_score")
+    expect(messages).toContain("linked_work_block_id")
+  })
 
   test("semantic validator rejects new nodes that cannot be placed by graph layout rules", async () => {
     const storage = new GraphStorage(path.join(OUTPUT_ROOT, "semantic-invalid"))

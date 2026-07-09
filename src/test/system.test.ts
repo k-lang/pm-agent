@@ -6,6 +6,7 @@ import { SystemPrompt } from "../session/system"
 import { tmpdir } from "./fixture/fixture"
 import { ToolRegistry } from "../tool/registry"
 import { ModelID, ProviderID } from "../provider/schema"
+import { Permission } from "../permission"
 
 describe("session.system", () => {
   test("skills output is sorted by name and stable across calls", async () => {
@@ -98,8 +99,13 @@ description: ${description}
         fn: async () => {
           const workflow = await Agent.get("project_workflow")
           const warmup = await Agent.get("project_workflow_warmup")
+          const reviewer = await Agent.get("project_workflow_graph_operation_reviewer")
           const workflowPrompt = (await SystemPrompt.skills(workflow!)) ?? ""
           const warmupPrompt = await SystemPrompt.skills(warmup!)
+          const reviewerPrompt = (await SystemPrompt.skills(reviewer!)) ?? ""
+          const model = { providerID: ProviderID.make("test"), modelID: ModelID.make("gpt-5") }
+          const reviewerTools = await ToolRegistry.tools(model, reviewer!)
+          const reviewerSkillTool = reviewerTools.find((tool) => tool.id === "skill")
 
           expect(workflowPrompt).not.toContain("<name>project-workflow-context-warmup</name>")
           expect(workflowPrompt).toContain("<name>project-workflow-graph-operation-draft</name>")
@@ -107,6 +113,21 @@ description: ${description}
           expect(warmupPrompt).toContain("<name>project-workflow-context-warmup</name>")
           expect(warmupPrompt).not.toContain("<name>project-workflow-graph-operation-draft</name>")
           expect(warmupPrompt).not.toContain("<name>graph-project-reporting</name>")
+          expect(reviewer?.mode).toBe("subagent")
+          expect(reviewerPrompt).toContain("<name>project-workflow-graph-operation-draft</name>")
+          expect(reviewerPrompt).not.toContain("<name>project-workflow-context-warmup</name>")
+          expect(reviewerPrompt).not.toContain("<name>graph-project-reporting</name>")
+          expect(reviewerSkillTool).toBeDefined()
+          const loaded = await reviewerSkillTool!.execute({ name: "project-workflow-graph-operation-draft" }, {
+            sessionID: "test-session" as any,
+            messageID: "test-message" as any,
+            agent: reviewer!.name,
+            abort: new AbortController().signal,
+            messages: [],
+            metadata() {},
+            ask: async () => {},
+          })
+          expect(loaded.output).toContain('<skill_content name="project-workflow-graph-operation-draft">')
         },
       })
     } finally {
@@ -145,20 +166,34 @@ description: Warm up project workflow context.
         fn: async () => {
           const workflow = await Agent.get("project_workflow")
           const warmup = await Agent.get("project_workflow_warmup")
+          const reviewer = await Agent.get("project_workflow_graph_operation_reviewer")
           const model = { providerID: ProviderID.make("test"), modelID: ModelID.make("gpt-5") }
           const workflowTools = await ToolRegistry.tools(model, workflow!)
           const warmupTools = await ToolRegistry.tools(model, warmup!)
           const workflowIDs = workflowTools.map((tool) => tool.id)
           const warmupIDs = warmupTools.map((tool) => tool.id)
+          const taskTool = workflowTools.find((tool) => tool.id === "task")
 
           expect(workflowIDs).toContain("workflow_action")
           expect(workflowIDs).toContain("apply_patch")
+          expect(workflowIDs).toContain("task")
+          expect(taskTool?.description).toContain("project_workflow_graph_operation_reviewer")
+          expect(taskTool?.description).not.toContain("- general:")
+          expect(taskTool?.description).not.toContain("- explore:")
           expect(warmupIDs).not.toContain("workflow_action")
           expect(warmupIDs).not.toContain("apply_patch")
           expect(warmupIDs).not.toContain("edit")
           expect(warmupIDs).not.toContain("write")
           expect(warmupIDs).toContain("read")
           expect(warmupIDs).toContain("skill")
+          expect(Permission.evaluate("task", "project_workflow_graph_operation_reviewer", workflow!.permission).action).not.toBe("deny")
+          expect(Permission.evaluate("task", "general", workflow!.permission).action).toBe("deny")
+          expect(Permission.evaluate("write", "*", reviewer!.permission).action).toBe("deny")
+          expect(Permission.evaluate("edit", "*", reviewer!.permission).action).toBe("deny")
+          expect(Permission.evaluate("apply_patch", "*", reviewer!.permission).action).toBe("deny")
+          expect(Permission.evaluate("workflow_action", "*", reviewer!.permission).action).toBe("deny")
+          expect(Permission.evaluate("read", "*", reviewer!.permission).action).toBe("allow")
+          expect(Permission.evaluate("skill", "project-workflow-graph-operation-draft", reviewer!.permission).action).toBe("allow")
         },
       })
     } finally {

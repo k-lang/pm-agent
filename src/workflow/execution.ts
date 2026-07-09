@@ -2,7 +2,7 @@ import fs from "fs/promises"
 import path from "path"
 import z from "zod"
 import { GraphEngine } from "@/graph/engine"
-import { EdgeType, GraphCommand, NodeType, type GraphCommand as GraphCommandData } from "@/graph/schema"
+import { EdgeType, GraphCommand, NODE_DRAFT_FIELD_KEYS, NodeType, type GraphCommand as GraphCommandData } from "@/graph/schema"
 import { GraphStorage } from "@/graph/storage"
 import { ProjectWorkflow } from "./state"
 import { loadExpandedGraph } from "../../standalone-graph/transform"
@@ -135,11 +135,27 @@ export namespace ProjectWorkflowExecution {
     UpdateEdgeDraftItem,
   ])
 
+  function validateDraftNodeFields(
+    ctx: z.RefinementCtx,
+    path: (string | number)[],
+    nodeType: z.infer<typeof NodeType>,
+    fields: Record<string, unknown>,
+  ) {
+    const allowed = NODE_DRAFT_FIELD_KEYS[nodeType]
+    for (const field of Object.keys(fields)) {
+      if (allowed.includes(field)) continue
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [...path, field],
+        message: `${nodeType}.${field} 不是合法 draft 字段，允许字段：${allowed.join(", ")}。summary/description 请写在 item 顶层，反向列表和派生字段由执行层维护。`,
+      })
+    }
+  }
+
   const WorkflowOperationDraft = z.object({
     change_id: z.string(),
     timestamp: TimestampDraft,
     note_filename: z.string().min(1, "必须写入语义化工作笔记文件名"),
-    description: z.string().optional(),
     changelog_entry: z.string().min(1, "必须写入本次 changelog 增量"),
     items: z.array(OperationDraftItem),
     review_notes: z.array(z.string()).default([]),
@@ -168,22 +184,29 @@ export namespace ProjectWorkflowExecution {
         message: "note_filename 必须是根据工作笔记主题生成的语义化文件名，不能机械使用 change_id。",
       })
     }
-    for (const field of ["operations", "commands", "history_descriptions", "operation_index", "validation", "preview"]) {
+    for (const field of ["description", "operations", "commands", "history_descriptions", "operation_index", "validation", "preview"]) {
       if (field in draft) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: [field],
-          message: `压缩 draft 顶层不允许写 ${field}；请只写 change_id、timestamp、note_filename、changelog_entry、items，并把历史说明写入每个 item.history。`,
+          message: `压缩 draft 顶层不允许写 ${field}；请只写 change_id、timestamp、note_filename、changelog_entry、items，并把自然语言说明写入 operation_notes.md，把历史说明写入每个 item.history。`,
         })
       }
     }
     draft.items.forEach((item, index) => {
+      if (item.kind === "create_node") {
+        validateDraftNodeFields(ctx, ["items", index, "fields"], item.node_type, item.fields)
+      }
       if (item.kind === "create_node" && ("linked_work_blocks" in item.fields || "work_items" in item.fields)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ["items", index, "fields"],
           message: "压缩 draft 不允许写 linked_work_blocks/work_items 反向派生列表；请只写 linked_goal_id 或 linked_work_block_id，反向列表由图引擎维护。",
         })
+      }
+      if (item.kind === "update_node") {
+        const createdNode = draft.items.find((candidate) => candidate.kind === "create_node" && candidate.temp_id === item.node_id)
+        if (createdNode?.kind === "create_node") validateDraftNodeFields(ctx, ["items", index, "field_updates"], createdNode.node_type, item.field_updates)
       }
       if (item.kind === "update_node" && ("linked_work_blocks" in item.field_updates || "work_items" in item.field_updates)) {
         ctx.addIssue({
@@ -314,10 +337,21 @@ export namespace ProjectWorkflowExecution {
   function appendHistoryContexts(line: string, contexts: string[]) {
     const additions = contexts
       .map((context) => context.trim())
-      .filter((context, index, values) => context && values.indexOf(context) === index && !line.includes(context))
+      .filter((context, index, values) => context && values.indexOf(context) === index && !historyAlreadyCoversContext(line, context))
     if (!additions.length) return line
     const base = line.replace(/[。；;]\s*$/u, "")
     return `${base}；${additions.join("；")}`
+  }
+
+  function historyAlreadyCoversContext(line: string, context: string) {
+    if (line.includes(context)) return true
+    return contextNodeIds(context).some((nodeID) => line.includes(nodeID))
+  }
+
+  function contextNodeIds(context: string) {
+    return [...context.matchAll(/(?:事件|问题|目标|工作项|工作块|结果|节点)节点id:\s*([^）；\s]+)/gu)]
+      .map((match) => match[1])
+      .filter(Boolean)
   }
 
   function formatCurrentHistory(changeID: string, currentHistory: string | undefined, contexts: string[] = []) {

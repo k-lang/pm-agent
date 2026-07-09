@@ -53,7 +53,6 @@ describe("ProjectWorkflow", () => {
     return {
       change_id: command.change_id,
       timestamp: command.timestamp,
-      description: command.description,
       note_filename: options.noteFilename ?? "workflow_progress_note.md",
       changelog_entry: testChangelogEntry(command, options.changelogEntry),
       items: command.operations.map((operation: any) => {
@@ -1071,6 +1070,465 @@ describe("ProjectWorkflow", () => {
     expect(validation.issues.map((issue: { message: string }) => issue.message).join("\n")).toContain("affects_issue")
   })
 
+  test("automatic validation rejects event adjusts newly created goal", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "6 月 1 日，客户原成熟产品路线受阻，自研 agent 框架提前成为短期主路径，需要快速形成粗版架构方案。\n",
+      summary: "使用首轮项目初始化材料生成工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_event_adjusts_new_goal",
+      timestamp: "2026-06-01T10:00:00+08:00",
+      note_filename: "agent_framework_acceleration.md",
+      changelog_entry: "[2026-06-01 10:00] bad_event_adjusts_new_goal: 测试首轮图操作中 event 不应 adjusts 本轮新建 goal。",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "goal_phone_app_agent_framework",
+          node_type: "goal",
+          summary: "建设手机端智能助手自研 agent 框架",
+          description: "客户成熟产品路线受阻后，自研 agent 框架提前成为短期主路径。",
+          fields: { status: "active" },
+          history: "创建手机端智能助手自研 agent 框架目标。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "event_mature_product_skill_gap",
+          node_type: "event",
+          summary: "成熟产品无法满足 skill 等硬性需求",
+          description: "成熟产品无法满足 skill 等硬性需求且供应商不愿定制。",
+          history: "创建成熟产品路线受阻事件。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_event_adjusts_new_goal",
+          from_node: "event_mature_product_skill_gap",
+          to_node: "goal_phone_app_agent_framework",
+          edge_type: "adjusts",
+          description: "错误地把新目标识别写成已有目标被调整。",
+          history: "错误建立 event 到本轮新建 goal 的 adjusts 关系。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误 event->adjusts->new goal 草案。",
+      change_id: "bad_event_adjusts_new_goal",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("adjusts 表示调整、取消、影响或修改已有对象")
+    expect(messages).toContain("goal_phone_app_agent_framework 是本轮新建")
+  })
+
+  test("automatic validation rejects node statuses outside type whitelist from compressed draft", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "2026-07-05，客户提出需要制定手机端智能助手粗版架构方案，但该工作尚未实际启动。\n",
+      summary: "使用非法状态草案测试自动校验。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_node_statuses",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      note_filename: "architecture_status_validation.md",
+      changelog_entry: "[2026-07-05 10:00] bad_node_statuses: 测试节点状态必须符合类型白名单。",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "goal_mobile_assistant_architecture",
+          node_type: "goal",
+          summary: "形成手机端智能助手粗版架构",
+          description: "需要形成手机端智能助手粗版架构。",
+          fields: { status: "established" },
+          history: "创建手机端智能助手粗版架构目标。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "work_block_architecture",
+          node_type: "work_block",
+          summary: "架构方案工作块",
+          description: "围绕粗版架构方案开展工作。",
+          fields: { status: "active", linked_goal_id: "goal_mobile_assistant_architecture" },
+          history: "创建架构方案工作块。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "work_item_architecture_plan",
+          node_type: "work_item",
+          summary: "制定粗版架构方案",
+          description: "客户提出需要制定粗版架构方案，但尚未实际启动。",
+          fields: { status: "active", linked_work_block_id: "work_block_architecture" },
+          history: "错误地把尚未启动的工作项写成 active。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "event_customer_architecture_request",
+          node_type: "event",
+          summary: "客户要求制定粗版架构方案",
+          description: "客户提出需要制定手机端智能助手粗版架构方案。",
+          fields: { status: "occurred" },
+          history: "创建客户要求事件。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "issue_architecture_scope",
+          node_type: "issue",
+          summary: "架构范围尚未收敛",
+          description: "粗版架构范围和边界尚未收敛。",
+          fields: { status: "open" },
+          history: "错误地把 issue 状态写成 open。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "result_architecture_draft",
+          node_type: "result",
+          summary: "粗版架构草稿",
+          description: "测试非法 result 状态。",
+          fields: { status: "draft" },
+          history: "错误地把 result 状态写成 draft。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_event_triggers_issue",
+          from_node: "event_customer_architecture_request",
+          to_node: "issue_architecture_scope",
+          edge_type: "triggers",
+          description: "客户要求触发架构范围需澄清的问题。",
+          history: "建立客户要求到架构范围问题的触发关系。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_issue_generates_goal",
+          from_node: "issue_architecture_scope",
+          to_node: "goal_mobile_assistant_architecture",
+          edge_type: "generates_goal",
+          description: "架构范围问题促成形成粗版架构目标。",
+          history: "建立问题到目标的促成关系。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记非法节点状态草案。",
+      change_id: "bad_node_statuses",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("work_item.status 不应使用 active")
+    expect(messages).toContain("issue.status 不应使用 open")
+    expect(messages).toContain("result.status 不应使用 draft")
+  })
+
+  test("compressed draft rejects node fields outside each node type schema", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "2026-07-05，客户提出需要制定手机端智能助手粗版架构方案，但该工作尚未实际启动。\n",
+      summary: "使用错误字段草案测试自动校验。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_node_fields",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      note_filename: "architecture_field_validation.md",
+      changelog_entry: "[2026-07-05 10:00] bad_node_fields: 测试节点字段必须符合类型白名单。",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "goal_mobile_assistant_architecture",
+          node_type: "goal",
+          summary: "形成手机端智能助手粗版架构",
+          description: "需要形成手机端智能助手粗版架构。",
+          fields: { status: "established", completion: 0 },
+          history: "错误地把 goal 完成度写成 completion。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "work_block_architecture",
+          node_type: "work_block",
+          summary: "架构方案工作块",
+          description: "围绕粗版架构方案开展工作。",
+          fields: { status: "active", linked_goal_id: "goal_mobile_assistant_architecture", priority: "high" },
+          history: "错误地给 work_block 写入 schema 外 priority。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "work_item_architecture_plan",
+          node_type: "work_item",
+          summary: "制定粗版架构方案",
+          description: "客户提出需要制定粗版架构方案，但尚未实际启动。",
+          fields: { status: "planned", linked_work_block_id: "work_block_architecture", linked_goal_id: "goal_mobile_assistant_architecture" },
+          history: "错误地给 work_item 写入 linked_goal_id。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误节点字段草案。",
+      change_id: "bad_node_fields",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("goal.completion 不是合法 draft 字段")
+    expect(messages).toContain("work_block.priority 不是合法 draft 字段")
+    expect(messages).toContain("work_item.linked_goal_id 不是合法 draft 字段")
+    expect(messages).toContain("completion_score")
+    expect(messages).toContain("linked_work_block_id")
+  })
+
+  test("automatic validation rejects issue adjusts newly created goal", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "发现压缩交付窗口问题，因此需要设立手机端智能助手 demo 与上线目标。\n",
+      summary: "使用问题和新目标材料生成工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_issue_adjusts_new_goal",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      note_filename: "issue_adjusts_new_goal.md",
+      changelog_entry: "[2026-07-05 10:00] bad_issue_adjusts_new_goal: 测试 issue 不应 adjusts 本轮新建 goal。",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "issue_compressed_delivery_window",
+          node_type: "issue",
+          summary: "压缩交付窗口下 demo 边界未收敛",
+          description: "当前交付窗口被压缩，需要澄清 demo 范围、集成边界和上线责任。",
+          history: "创建压缩交付窗口问题。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "goal_mobile_agent_demo_launch",
+          node_type: "goal",
+          summary: "手机端智能助手 demo 与上线",
+          description: "为应对交付窗口压缩，设立手机端智能助手 demo 与上线目标。",
+          history: "创建手机端智能助手 demo 与上线目标。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_bad_issue_adjusts_new_goal",
+          from_node: "issue_compressed_delivery_window",
+          to_node: "goal_mobile_agent_demo_launch",
+          edge_type: "adjusts_goal",
+          description: "错误地把新目标设立写成已有目标被问题调整。",
+          history: "错误建立 issue 到本轮新建 goal 的 adjusts_goal 关系。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误 issue->adjusts_goal->new goal 草案。",
+      change_id: "bad_issue_adjusts_new_goal",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("adjusts_goal 表示调整、取消、影响或修改已有对象")
+    expect(messages).toContain("goal_mobile_agent_demo_launch 是本轮新建")
+  })
+
+  test("automatic validation rejects result adjusts newly created goal", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "形成自研方案替代定位，因此需要设立手机端智能助手 demo 与上线目标。\n",
+      summary: "使用结果和新目标材料生成工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_result_adjusts_new_goal",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      note_filename: "result_adjusts_new_goal.md",
+      changelog_entry: "[2026-07-05 10:00] bad_result_adjusts_new_goal: 测试 result 不应 adjusts 本轮新建 goal。",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "result_self_developed_positioning",
+          node_type: "result",
+          summary: "自研方案定位为短期替代方案",
+          description: "本轮形成自研 agent 框架需要承担短期替代角色的阶段结论。",
+          history: "创建自研方案定位结果。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "goal_mobile_agent_demo_launch",
+          node_type: "goal",
+          summary: "手机端智能助手 demo 与上线",
+          description: "基于自研方案替代定位，设立手机端智能助手 demo 与上线目标。",
+          history: "创建手机端智能助手 demo 与上线目标。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_bad_result_adjusts_new_goal",
+          from_node: "result_self_developed_positioning",
+          to_node: "goal_mobile_agent_demo_launch",
+          edge_type: "adjusts_result",
+          description: "错误地把新目标设立写成已有目标被结果调整。",
+          history: "错误建立 result 到本轮新建 goal 的 adjusts_result 关系。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误 result->adjusts_result->new goal 草案。",
+      change_id: "bad_result_adjusts_new_goal",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("adjusts_result 表示调整、取消、影响或修改已有对象")
+    expect(messages).toContain("goal_mobile_agent_demo_launch 是本轮新建")
+  })
+
+  test("automatic validation rejects issue-to-goal with event-only generates edge type", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "发现缺乏精准评测数据的问题，因此需要设立构建评测数据集目标。\n",
+      summary: "使用问题促成目标的材料生成工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_issue_goal_generates",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      note_filename: "issue_goal_validation.md",
+      changelog_entry: "[2026-07-05 10:00] bad_issue_goal_generates: 测试 issue -> goal 不应使用 event 专用 generates。",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "issue_missing_eval_dataset",
+          node_type: "issue",
+          summary: "缺乏精准评测数据",
+          description: "当前缺乏精准评测数据，影响模型效果判断。",
+          history: "创建缺乏精准评测数据问题。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "goal_build_eval_dataset",
+          node_type: "goal",
+          summary: "构建精准评测数据集",
+          description: "为解决缺乏精准评测数据的问题，设立构建评测数据集目标。",
+          history: "创建构建精准评测数据集目标。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_bad_issue_generates_goal",
+          from_node: "issue_missing_eval_dataset",
+          to_node: "goal_build_eval_dataset",
+          edge_type: "generates",
+          description: "错误地使用 event -> goal 的 generates 描述 issue 促成 goal。",
+          history: "错误建立 issue 到 goal 的 generates 关系。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误 issue->generates->goal 草案。",
+      change_id: "bad_issue_goal_generates",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("issue -> goal 不应使用 generates")
+    expect(messages).toContain("generates_goal")
+  })
+
+  test("automatic validation rejects redundant event-to-work leads under generated goal", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "2026-07-05，客户提出需要制定手机端智能助手粗版架构方案，因此形成 demo 与上线目标，并计划先制定粗版架构方案。\n",
+      summary: "使用事件生成目标并派生工作项的材料生成工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_redundant_event_work_leads",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      note_filename: "event_goal_work_validation.md",
+      changelog_entry: "[2026-07-05 10:00] bad_redundant_event_work_leads: 测试 event 生成目标后不应重复直连该目标下工作项。",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "event_customer_architecture_request",
+          node_type: "event",
+          summary: "客户要求制定粗版架构方案",
+          description: "客户提出需要制定手机端智能助手粗版架构方案。",
+          history: "创建客户要求事件。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "goal_mobile_agent_demo_launch",
+          node_type: "goal",
+          summary: "手机端智能助手 demo 与上线",
+          description: "客户要求促成手机端智能助手 demo 与上线目标。",
+          history: "创建手机端智能助手 demo 与上线目标。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "work_block_architecture",
+          node_type: "work_block",
+          summary: "架构方案工作块",
+          description: "围绕粗版架构方案开展工作。",
+          fields: { linked_goal_id: "goal_mobile_agent_demo_launch" },
+          history: "创建架构方案工作块。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "work_item_rough_architecture_plan",
+          node_type: "work_item",
+          summary: "制定粗版架构方案",
+          description: "计划制定手机端智能助手粗版架构方案。",
+          fields: { status: "planned", linked_work_block_id: "work_block_architecture" },
+          history: "创建粗版架构方案计划工作项。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_event_generates_goal",
+          from_node: "event_customer_architecture_request",
+          to_node: "goal_mobile_agent_demo_launch",
+          edge_type: "generates",
+          description: "客户要求促成 demo 与上线目标。",
+          history: "建立客户要求到目标的生成关系。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_event_leads_to_work_item",
+          from_node: "event_customer_architecture_request",
+          to_node: "work_item_rough_architecture_plan",
+          edge_type: "leads_to",
+          description: "错误地在事件生成目标后又直接连到该目标下的工作项。",
+          history: "错误建立事件到派生工作项的重复直连关系。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记冗余 event->work_item 草案。",
+      change_id: "bad_redundant_event_work_leads",
+      artifacts: { operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("已经通过 generates 产生目标 goal_mobile_agent_demo_launch")
+    expect(messages).toContain("不要再创建 event -> work_item 的 leads_to")
+  })
+
   test("compressed draft schema rejects top-level history_descriptions array", async () => {
     await action("开始或恢复")
     await action("更新工作笔记", {
@@ -1098,6 +1556,112 @@ describe("ProjectWorkflow", () => {
     const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
     expect(messages).toContain("history_descriptions")
     expect(messages).toContain("压缩 draft 顶层不允许写")
+  })
+
+  test("compressed draft schema rejects top-level description", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "准备登记一版首轮建图草案。\n",
+      summary: "人工写入一份用于生成图操作草案的工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operation_notes.md"), "# 图操作说明\n\n说明应写在这里。\n", "utf8")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "bad_top_level_description",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      note_filename: "top_level_description_validation.md",
+      description: "错误地把自然语言说明写进 draft 顶层。",
+      changelog_entry: "[2026-07-05 10:00] bad_top_level_description: 测试顶层 description 错误。",
+      items: [],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记错误 description 结构草案。",
+      change_id: "bad_top_level_description",
+      artifacts: { operationNotes: true, operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作需修订")
+    const validation = JSON.parse(await fs.readFile(path.join(activeDir, "validation.json"), "utf8"))
+    expect(validation.passed).toBe(false)
+    const messages = validation.issues.map((issue: { message: string }) => issue.message).join("\n")
+    expect(messages).toContain("description")
+    expect(messages).toContain("自然语言说明写入 operation_notes.md")
+  })
+
+  test("compiled history does not duplicate deterministic contexts already covered by node ids", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "2026-07-05，客户要求快速建立项目主线并规划第一项工作。\n",
+      summary: "使用首轮建图材料生成工作笔记。",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "operation_notes.md"), "# 图操作说明\n\n测试 history 去重。\n", "utf8")
+    await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+      change_id: "history_context_dedupe",
+      timestamp: "2026-07-05T10:00:00+08:00",
+      note_filename: "initial_project_plan.md",
+      changelog_entry: "[2026-07-05 10:00] history_context_dedupe: 测试 history 上下文去重。",
+      items: [
+        {
+          kind: "create_node",
+          temp_id: "event_customer_request",
+          node_type: "event",
+          summary: "客户提出项目要求",
+          description: "客户提出项目要求。",
+          fields: { status: "occurred" },
+          history: "[history_context_dedupe] 创建客户提出项目要求事件，并说明它产生项目主目标（目标节点id: goal_customer_project）。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "goal_customer_project",
+          node_type: "goal",
+          summary: "完成客户项目目标",
+          description: "完成客户项目目标。",
+          fields: { status: "established" },
+          history: "[history_context_dedupe] 创建客户项目目标，该目标由客户要求事件产生，并由启动工作块承接（事件节点id: event_customer_request；工作块节点id: work_block_startup）。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "work_block_startup",
+          node_type: "work_block",
+          summary: "启动工作块",
+          description: "承接项目启动工作。",
+          fields: { status: "active", linked_goal_id: "goal_customer_project" },
+          history: "[history_context_dedupe] 创建启动工作块，归属于客户项目目标（目标节点id: goal_customer_project）。",
+        },
+        {
+          kind: "create_node",
+          temp_id: "work_item_initial_plan",
+          node_type: "work_item",
+          summary: "制定初始计划",
+          description: "计划制定初始方案。",
+          fields: { status: "planned", linked_work_block_id: "work_block_startup" },
+          history: "[history_context_dedupe] 创建制定初始计划工作项，归属于启动工作块（工作块节点id: work_block_startup）。",
+        },
+        {
+          kind: "create_edge",
+          temp_id: "edge_event_generates_goal",
+          from_node: "event_customer_request",
+          to_node: "goal_customer_project",
+          edge_type: "generates",
+          description: "客户要求产生项目目标。",
+          history: "[history_context_dedupe] 创建客户要求事件到客户项目目标的 generates 关系（事件节点id: event_customer_request；目标节点id: goal_customer_project）。",
+        },
+      ],
+    }, null, 2) + "\n", "utf8")
+
+    const registered = await action("生成图操作草案", {
+      summary: "登记 history 去重草案。",
+      change_id: "history_context_dedupe",
+      artifacts: { operationNotes: true, operationsDraft: true },
+    })
+    expect(registered.stage).toBe("图操作已生成")
+    const command = JSON.parse(await fs.readFile(path.join(activeDir, "operations.json"), "utf8"))
+    expect(command.history_descriptions.event_customer_request).not.toContain("事件通过generates关系连接")
+    expect(command.history_descriptions.goal_customer_project).not.toContain("此目标被客户提出项目要求通过generates关系连接")
+    expect(command.history_descriptions.work_block_startup).not.toContain("工作块服务于")
+    expect(command.history_descriptions.work_item_initial_plan).not.toContain("工作项被启动工作块归属")
+    expect(command.history_descriptions.edge_event_generates_goal).not.toContain("；建立客户提出项目要求到完成客户项目目标的generates关系")
   })
 
   test("compressed draft schema rejects derived reverse relationship lists", async () => {

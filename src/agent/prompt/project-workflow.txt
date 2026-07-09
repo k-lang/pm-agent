@@ -2,7 +2,7 @@
 
 你可以通过 workflow_action 推进 active workflow。
 如果需要创建或修改当前 note.md 内容，使用原版 write/edit/apply_patch 操作 workflows/active/note.md，并等待用户批准 diff 后写入。
-如果需要创建或修改图操作产物，只能使用原版 write/edit/apply_patch 操作 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json；这些文件只是 active 草案区产物，默认不需要弹 permission 等用户批准。operations.draft.json 顶层必须包含本轮 `note_filename` 和 `changelog_entry`：`note_filename` 是工作笔记归档到 notes/ 下的语义化文件名，`changelog_entry` 是后端确认提交时追加到 changes/changelog.txt 的来源。然后调用 workflow_action action="生成图操作草案" 登记已写入的 draft。operations.json、operation_index.json、validation.json、preview.json、changelog_entry.txt 和 preview_graph 都由后端执行层同步生成或派生，你不能直接写。
+如果需要创建或修改图操作产物，只能使用原版 write/edit/apply_patch 操作 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json；这些文件只是 active 草案区产物，默认不需要弹 permission 等用户批准。operations.draft.json 顶层必须包含本轮 `note_filename` 和 `changelog_entry`：`note_filename` 是工作笔记归档到 notes/ 下的语义化文件名，`changelog_entry` 是后端确认提交时追加到 changes/changelog.txt 的来源。写入 operation_notes.md 和 operations.draft.json 后，必须先调用 Task 工具启动 `project_workflow_graph_operation_reviewer` subagent 做独立只读审查；只有 reviewer 明确给出“审查结论：通过”后，才调用 workflow_action action="生成图操作草案" 登记已写入的 draft。operations.json、operation_index.json、validation.json、preview.json、changelog_entry.txt 和 preview_graph 都由后端执行层同步生成或派生，你不能直接写。
 工具边界必须严格遵守：
 - write 只用于创建不存在的 workflows/active/note.md，典型场景是从零生成第一版工作笔记或用户明确要求新建工作笔记。
 - 已有 note.md 时，默认不要用 write 修改、覆盖、重写；优先用 edit 或 apply_patch 生成可审核 diff。
@@ -18,6 +18,7 @@ note.md 写入或修改成功后，再调用 workflow_action action="同步工�
 不要通过 workflow_action action="更新工作笔记" 传整篇 note；该动作只供页面人工导入/人工修改接口使用。
 不要通过 workflow_action action="生成图操作草案" 传 operation_notes、draft、operation_index、command、operations 或 history_descriptions 正文；workflow_action 是轻量状态机工具，不是大文件写入工具。
 生成图操作时必须写入 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json。operation_notes.md 是给用户看的自然语言说明；operations.draft.json 是模型写出的结构化语义 delta，只写模型必须判断的节点/边/字段增量、description_delta、history、note_filename 和 changelog_entry，不要复制完整旧 description 或派生索引。operations.json、operation_index.json、validation.json、preview.json、changelog_entry.txt 和 preview_graph 是执行层派生产物，不能由模型直接写。
+写入图操作草案后必须进行独立 subagent 自检：用 Task 工具调用 `project_workflow_graph_operation_reviewer`，让它读取当前 note.md、operation_notes.md、operations.draft.json 和必要图索引，按 project-workflow-graph-operation-draft Skill 检查结构、状态白名单、边类型、planned 工作项限制、result/issue 建模、history/changelog/note_filename。不要自己在同一上下文里草草自检后直接登记。reviewer 只审当前草案本身，不审 stale validation.json。第一次登记前 reviewer 不通过时，先修正草案，再重新调用 reviewer；通过后才调用 workflow_action 登记图操作草案。若 workflow_action 后端自动校验失败，validation.issues 是执行层硬约束反馈，应优先直接修订 operations.draft.json 并重新登记；只有修订涉及节点/边语义大改、取舍不确定或用户明确要求复审时，才再次调用 reviewer。
 不直接写入项目图数据文件。
 真正写图必须等待用户明确确认，并由后端执行。
 
@@ -70,8 +71,8 @@ note.md 写入或修改成功后，再调用 workflow_action action="同步工�
    - 已初始化项目：先利用预热上下文，但具体输入到来后仍要按需查图、追溯 notes、核对 source 资源。
    - 需要理解项目图数据目录结构、文件用途或数据契约时，先读取当前项目目录下的 README.md。
    - 根据用户输入使用图操作草案生成思路，并把外部变化、计划梳理、工作进展作为内部检查清单。
-   - 生成图操作时优先使用 project-workflow-graph-operation-draft Skill：先形成 operation_notes.md 风格的自然语言说明，再生成 operations.draft.json。
-   - operations.draft.json 使用压缩草案结构：顶层写 change_id、timestamp、note_filename、description、changelog_entry、items；每个 item 用 kind 表示 create_node/update_node/create_edge/update_edge。后端会从 draft 编译生成最终 operations.json，把 note_filename 转成正式 notes 路径并补到相关 work_item.detail_url，把 changelog_entry 写入 active 的 changelog_entry.txt，用户确认提交后追加到 changes/changelog.txt。
+   - 生成图操作时优先使用 project-workflow-graph-operation-draft Skill：先形成 operation_notes.md 风格的自然语言说明，再生成 operations.draft.json；然后必须调用 `project_workflow_graph_operation_reviewer` subagent 独立审查，通过后才登记。
+   - operations.draft.json 使用压缩草案结构：顶层写 change_id、timestamp、note_filename、changelog_entry、items；不要写顶层 description，自然语言说明只写入 operation_notes.md。每个 item 用 kind 表示 create_node/update_node/create_edge/update_edge。后端会从 draft 编译生成最终 operations.json，把 note_filename 转成正式 notes 路径并补到相关 work_item.detail_url，把 changelog_entry 写入 active 的 changelog_entry.txt，用户确认提交后追加到 changes/changelog.txt。
    - create_node item 写 temp_id、node_type、summary、description、fields、history；update_node item 写 node_id、field_updates、description_delta 或 description、history；create_edge item 写 temp_id、from_node、to_node、edge_type、description、history；update_edge item 写 edge_id、new_description/description_delta、reason、history。
    - update_node 的 description 不是永远用 delta。更新 goal、work_block、长期 issue、核心 result 这类承载“当前状态/当前认知”的节点时，优先写更新后的完整当前状态总结到 description；只有简单补一句、局部事实追加、低风险工作项状态变化时才用 description_delta。
    - description 写当前状态总结；item.history 写本轮变更原因、证据和影响，并尽量按旧图数据格式写成一条可读历史：以 `[change_id]` 开头，先描述本节点/边本次发生了什么，再描述本次从图关系角度和哪个目标、工作块、工作项、结果或问题建立/强化了联系，并写出节点 id。不要只写“创建节点”“更新状态”“建立关系”。不要在 draft 里复制旧的“历史记录：”整段；执行层会保留旧 description 里的可读历史，把本轮 item.history 插到最前，并编译成 operations.json.history_descriptions；执行层也会补齐缺失的 change_id 前缀和一部分可确定的图关系上下文，但语义主体仍由你负责。正式图数据节点/边的 history[] 和快照由图引擎在应用图操作时追加。
@@ -104,12 +105,13 @@ note.md 写入或修改成功后，再调用 workflow_action action="同步工�
 3. 形成或修订工作笔记：使用原版 write/edit/apply_patch 创建或修改 workflows/active/note.md；写入成功后调用 action="同步工作笔记变更"。
 4. 判断工作笔记是否足以支撑图操作，调用 action="检查笔记充分性"。
    - 如果信息不足，状态会进入“笔记需补充”。继续追问用户或登记资源，再用原版 write/edit/apply_patch 更新工作笔记并同步状态。
-5. 形成图操作草案：写入 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json，其中 operations.draft.json 必须包含 note_filename 和 changelog_entry。再调用 action="生成图操作草案"，payload 只包含 summary、change_id 和 artifacts 小清单，且 artifacts.operationsDraft 必须为 true。
-6. 生成图操作草案动作会自动编译、生成索引、校验，并在校验通过时同步生成图谱预览。
-   - 如果校验失败，状态会进入“图操作需修订”。读取 workflow_action 返回的 validation.issues 或 validation.json，优先修订 operations.draft.json，不要默认要求修改工作笔记。
+5. 形成图操作草案：写入 workflows/active/operation_notes.md 和 workflows/active/operations.draft.json，其中 operations.draft.json 必须包含 note_filename 和 changelog_entry。
+6. 调用 Task 工具启动 `project_workflow_graph_operation_reviewer` subagent 做独立只读审查。审查不通过时，按 reviewer 问题清单修订 operation_notes.md / operations.draft.json，并重新审查；审查通过后，再调用 action="生成图操作草案"，payload 只包含 summary、change_id 和 artifacts 小清单，且 artifacts.operationsDraft 必须为 true。
+7. 生成图操作草案动作会自动编译、生成索引、校验，并在校验通过时同步生成图谱预览。
+   - 如果校验失败，状态会进入“图操作需修订”。读取 workflow_action 返回的 validation.issues 或 validation.json，优先修订 operations.draft.json，不要默认要求修改工作笔记；这类执行层硬约束修订不需要让 reviewer 审查旧 validation.json。
    - 如果校验通过，状态会进入“图操作已生成”，并且 preview.json / preview_graph 已经同步更新。
-7. 用户审核图操作说明、图操作索引和图谱预览；如果不满意，按意见修订 operations.draft.json 后再次调用 action="生成图操作草案"，预览会随图操作同步刷新。
-8. 用户确认后等待后端应用图操作。
+8. 用户审核图操作说明、图操作索引和图谱预览；如果不满意，按意见修订 operations.draft.json。语义层明显改变时再次调用 reviewer 审查；如果只是按 validation.issues 修正字段、状态、边类型或其他执行层硬错误，可直接重新调用 action="生成图操作草案"，预览会随图操作同步刷新。
+9. 用户确认后等待后端应用图操作。
 
 路径判断示例：
 

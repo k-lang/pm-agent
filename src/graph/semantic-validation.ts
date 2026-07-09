@@ -1,4 +1,4 @@
-import { GraphCommand, type EdgeType, type GraphOperation, type NodeType } from "./schema"
+import { GraphCommand, NODE_CREATE_DATA_KEYS, NODE_MUTABLE_FIELD_KEYS, NODE_STATUS_VALUES, type EdgeType, type NodeType } from "./schema"
 import { GraphStorage } from "./storage"
 
 export type GraphSemanticIssue = {
@@ -46,7 +46,7 @@ export function validateEdgeRelation(fromType: NodeType, toType: NodeType, edgeT
       goal: ["subgoal"],
     },
     issue: {
-      goal: ["generates", "generates_goal", "adjusts_goal", "cancels_goal"],
+      goal: ["generates_goal", "adjusts_goal", "cancels_goal"],
     },
     result: {
       issue: ["affects_issue"],
@@ -60,6 +60,44 @@ export function validateEdgeRelation(fromType: NodeType, toType: NodeType, edgeT
     return `${fromType} -> ${toType} 不应使用 ${edgeType}，允许类型：${allowedTypes.length ? allowedTypes.join(", ") : "无"}。`
   }
   return undefined
+}
+
+function edgeTargetExistenceIssue(edgeType: EdgeType, target: NodeRef) {
+  const newTargetTypes = new Set<EdgeType>(["generates", "triggers", "forms", "creates", "generates_goal", "generates_result"])
+  const existingTargetTypes = new Set<EdgeType>([
+    "adjusts",
+    "cancels",
+    "affects",
+    "modifies",
+    "modifies_work",
+    "adjusts_goal",
+    "cancels_goal",
+    "affects_issue",
+    "adjusts_result",
+    "cancels_result",
+  ])
+  if (newTargetTypes.has(edgeType) && !target.isNew) {
+    return `${edgeType} 表示产生或触发新对象，目标节点 ${target.id} 已存在；请改用调整/影响类边，或不要创建这条边。`
+  }
+  if (existingTargetTypes.has(edgeType) && target.isNew) {
+    return `${edgeType} 表示调整、取消、影响或修改已有对象，目标节点 ${target.id} 是本轮新建；请改用产生/触发/创建类边，或把关系写入节点描述。`
+  }
+  return undefined
+}
+
+function nodeStatusIssue(nodeType: NodeType, status: unknown) {
+  if (status === undefined) return undefined
+  const allowed: readonly string[] = NODE_STATUS_VALUES[nodeType]
+  if (typeof status !== "string" || !allowed.includes(status)) {
+    return `${nodeType}.status 不应使用 ${String(status)}，允许状态：${allowed.join(", ")}。`
+  }
+  return undefined
+}
+
+function unknownFieldIssues(nodeType: NodeType, data: Record<string, unknown>, allowed: readonly string[]) {
+  return Object.keys(data)
+    .filter((field) => !allowed.includes(field))
+    .map((field) => `${nodeType}.${field} 不是合法字段，允许字段：${allowed.join(", ")}。`)
 }
 
 export class GraphSemanticValidator {
@@ -79,6 +117,23 @@ export class GraphSemanticValidator {
 
     parsed.operations.forEach((operation, index) => {
       if (operation.type === "create_node") {
+        const statusIssue = nodeStatusIssue(operation.data.type, operation.data.status)
+        if (statusIssue) {
+          issues.push({
+            severity: "error",
+            operationIndex: index,
+            nodeId: operation.temp_id,
+            message: statusIssue,
+          })
+        }
+        for (const message of unknownFieldIssues(operation.data.type, operation.data, NODE_CREATE_DATA_KEYS[operation.data.type])) {
+          issues.push({
+            severity: "error",
+            operationIndex: index,
+            nodeId: operation.temp_id,
+            message,
+          })
+        }
         newNodeIds.add(operation.temp_id)
         nodes.set(operation.temp_id, {
           id: operation.temp_id,
@@ -90,7 +145,26 @@ export class GraphSemanticValidator {
       }
       if (operation.type === "update_node") {
         const node = nodes.get(operation.node_id)
-        if (node) nodes.set(operation.node_id, { ...node, data: { ...node.data, ...operation.updates }, operationIndex: index })
+        if (node) {
+          const statusIssue = nodeStatusIssue(node.type, operation.updates.status)
+          if (statusIssue) {
+            issues.push({
+              severity: "error",
+              operationIndex: index,
+              nodeId: operation.node_id,
+              message: statusIssue,
+            })
+          }
+          for (const message of unknownFieldIssues(node.type, operation.updates, NODE_MUTABLE_FIELD_KEYS[node.type])) {
+            issues.push({
+              severity: "error",
+              operationIndex: index,
+              nodeId: operation.node_id,
+              message,
+            })
+          }
+          nodes.set(operation.node_id, { ...node, data: { ...node.data, ...operation.updates }, operationIndex: index })
+        }
       }
       if (operation.type === "create_edge") {
         edges.push({ from: operation.from_node, to: operation.to_node, type: operation.edge_type, operationIndex: index })
@@ -109,7 +183,17 @@ export class GraphSemanticValidator {
           message: relationIssue,
         })
       }
+      const targetExistenceIssue = edgeTargetExistenceIssue(edge.type as EdgeType, to)
+      if (targetExistenceIssue) {
+        issues.push({
+          severity: "error",
+          operationIndex: edge.operationIndex,
+          message: targetExistenceIssue,
+        })
+      }
     }
+
+    this.validateRedundantEventWorkLeads(issues, nodes, edges)
 
     for (const nodeId of newNodeIds) {
       const node = nodes.get(nodeId)
@@ -177,6 +261,36 @@ export class GraphSemanticValidator {
     }
   }
 
+  private validateRedundantEventWorkLeads(issues: GraphSemanticIssue[], nodes: Map<string, NodeRef>, edges: EdgeRef[]) {
+    const generatedGoalsByEvent = new Map<string, Set<string>>()
+    for (const edge of edges) {
+      if (edge.type !== "generates") continue
+      const from = nodes.get(edge.from)
+      const to = nodes.get(edge.to)
+      if (from?.type !== "event" || to?.type !== "goal") continue
+      const goals = generatedGoalsByEvent.get(edge.from) ?? new Set<string>()
+      goals.add(edge.to)
+      generatedGoalsByEvent.set(edge.from, goals)
+    }
+
+    for (const edge of edges.filter((item) => item.operationIndex !== undefined && item.type === "leads_to")) {
+      const generatedGoals = generatedGoalsByEvent.get(edge.from)
+      if (!generatedGoals?.size) continue
+      const from = nodes.get(edge.from)
+      const to = nodes.get(edge.to)
+      if (from?.type !== "event" || to?.type !== "work_item") continue
+      for (const goalId of generatedGoals) {
+        if (!this.isWorkItemUnderGoal(edge.to, goalId, nodes, edges)) continue
+        issues.push({
+          severity: "error",
+          operationIndex: edge.operationIndex,
+          message: `event ${edge.from} 已经通过 generates 产生目标 ${goalId}，work_item ${edge.to} 又通过工作块归属于该目标；不要再创建 event -> work_item 的 leads_to，除非事件直接导致该工作项且不是通过目标/工作块派生。`,
+        })
+        break
+      }
+    }
+  }
+
   private topGoalFor(nodeId: string, nodes: Map<string, NodeRef>, edges: EdgeRef[], seen = new Set<string>()): string | null {
     if (seen.has(nodeId)) return null
     seen.add(nodeId)
@@ -200,6 +314,28 @@ export class GraphSemanticValidator {
     }
     if (node.type === "issue" || node.type === "event") return this.inferCommunity(nodeId, nodes, edges)
     return null
+  }
+
+  private isWorkItemUnderGoal(workItemId: string, goalId: string, nodes: Map<string, NodeRef>, edges: EdgeRef[]) {
+    const workItem = nodes.get(workItemId)
+    if (workItem?.type !== "work_item") return false
+    const blockId = workItem.data.linked_work_block_id
+    if (typeof blockId !== "string") return false
+    const block = nodes.get(blockId)
+    if (block?.type !== "work_block") return false
+    const linkedGoalId = block.data.linked_goal_id
+    if (typeof linkedGoalId !== "string") return false
+    return this.goalMatchesOrDescendsFrom(linkedGoalId, goalId, nodes, edges)
+  }
+
+  private goalMatchesOrDescendsFrom(candidateGoalId: string, ancestorGoalId: string, nodes: Map<string, NodeRef>, edges: EdgeRef[], seen = new Set<string>()): boolean {
+    if (candidateGoalId === ancestorGoalId) return true
+    if (seen.has(candidateGoalId)) return false
+    seen.add(candidateGoalId)
+    const goal = nodes.get(candidateGoalId)
+    if (goal?.type !== "goal") return false
+    const parentEdges = edges.filter((edge) => edge.type === "subgoal" && edge.to === candidateGoalId)
+    return parentEdges.some((edge) => this.goalMatchesOrDescendsFrom(edge.from, ancestorGoalId, nodes, edges, seen))
   }
 
   private findProducingWorkBlock(nodeId: string, nodes: Map<string, NodeRef>, edges: EdgeRef[]) {

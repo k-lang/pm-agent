@@ -16,6 +16,7 @@ import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import PROMPT_PROJECT_WORKFLOW from "./prompt/project-workflow.txt"
 import PROMPT_PROJECT_WORKFLOW_WARMUP from "./prompt/project-workflow-warmup.txt"
+import PROMPT_PROJECT_WORKFLOW_GRAPH_OPERATION_REVIEWER from "./prompt/project-workflow-graph-operation-reviewer.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
 import { Global } from "@/global"
@@ -215,6 +216,10 @@ export namespace Agent {
           Permission.fromConfig({
             "*": "deny",
             workflow_action: "allow",
+            task: {
+              "*": "deny",
+              project_workflow_graph_operation_reviewer: "allow",
+            },
             edit: {
               "*": "deny",
               [path.relative(Instance.worktree, path.join(Instance.directory, "workflows", "active", "note.md")).replaceAll("\\", "/")]: "ask",
@@ -230,6 +235,29 @@ export namespace Agent {
           user,
         ),
         prompt: PROMPT_PROJECT_WORKFLOW,
+      },
+      project_workflow_graph_operation_reviewer: {
+        name: "project_workflow_graph_operation_reviewer",
+        description: "项目工作推进图操作草案只读审查 Agent。用于在主 Agent 登记图操作草案前，按图操作 Skill 和图引擎约束检查 operation_notes.md 与 operations.draft.json。",
+        mode: "subagent",
+        native: true,
+        hidden: true,
+        options: {},
+        permission: Permission.merge(
+          defaults,
+          Permission.fromConfig({
+            "*": "deny",
+            read: "allow",
+            grep: "allow",
+            glob: "allow",
+            skill: {
+              "*": "deny",
+              "project-workflow-graph-operation-draft": "allow",
+            },
+          }),
+          user,
+        ),
+        prompt: PROMPT_PROJECT_WORKFLOW_GRAPH_OPERATION_REVIEWER,
       },
       project_workflow_warmup: {
         name: "project_workflow_warmup",
