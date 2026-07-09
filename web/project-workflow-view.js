@@ -470,6 +470,10 @@ export function workflowMaximizeButtonState(activePanel, panel) {
   }
 }
 
+export function canShowWorkflowGraphPreview(graphInitialized, hasDraftPreviewGraph) {
+  return !!graphInitialized || !!hasDraftPreviewGraph
+}
+
 export function permissionListUrl(project) {
   const suffix = project?.directory ? `?directory=${encodeURIComponent(project.directory)}` : ''
   return `/permission${suffix}`

@@ -1,5 +1,6 @@
 import {
   allWorkflowDiffRecords as collectWorkflowDiffRecords,
+  canShowWorkflowGraphPreview,
   esc,
   markWorkflowPermissionRecord as markWorkflowPermissionRecords,
   mergeWorkflowPermissionRecords as mergeWorkflowPermissionRecordList,
@@ -122,6 +123,7 @@ let permissionReplying = false
 let maximizedPanel = ''
 const workflowStatusById = new Map()
 const shownPermissionModalIds = new Set()
+const previewRenderKeys = new WeakMap()
 
 const TERMINAL_STAGES = new Set(['已应用', '已取消'])
 const CHAT_HEIGHT_KEY = 'pm-agent.workflow.chatHeight.v2'
@@ -135,6 +137,18 @@ async function fetchJson(url, options) {
 
 function selectedProject() {
   return projects.find((project) => project.name === projectName) || projects[0] || null
+}
+
+function setPreviewHtml(element, key, html) {
+  if (!element) return false
+  if (previewRenderKeys.get(element) === key) return false
+  element.innerHTML = html
+  previewRenderKeys.set(element, key)
+  return true
+}
+
+function resetPreviewRenderKey(element) {
+  if (element) previewRenderKeys.delete(element)
 }
 
 function clearWorkflowView() {
@@ -153,6 +167,8 @@ function clearWorkflowView() {
   shownPermissionModalIds.clear()
   workflowAwaitingReply = reset.workflowAwaitingReply
   workflowStatusById.clear()
+  resetPreviewRenderKey(notePreview)
+  resetPreviewRenderKey(graphPreview)
   resetGraphPreview()
 }
 
@@ -293,13 +309,13 @@ async function loadWorkflowNote() {
 
 async function loadWorkflowOperations() {
   const project = selectedProject()
-  workflowOperations = null
   if (!project) {
+    workflowOperations = null
     renderOperationPreview()
     return
   }
   workflowOperationsLoading = true
-  renderOperationPreview()
+  if (!workflowOperations) renderOperationPreview()
   try {
     const result = await fetchJson(API + `/project/workflow/operations?project=${encodeURIComponent(project.name)}`)
     workflowOperations = result || null
@@ -548,11 +564,14 @@ function setActiveTab(tab) {
 }
 
 function setGraphPreviewPlaceholder(message) {
-  graphRenderer?.destroy()
+  if (graphRenderer) {
+    graphRenderer.destroy()
+    resetPreviewRenderKey(graphPreview)
+  }
   graphRenderer = null
   graphLoadedProject = ''
   graphLoadedPreviewKey = ''
-  graphPreview.innerHTML = `<div class="placeholder">${message}</div>`
+  setPreviewHtml(graphPreview, `placeholder:${message}`, `<div class="placeholder">${esc(message)}</div>`)
 }
 
 function resetGraphPreview() {
@@ -619,7 +638,8 @@ function graphPreviewOptions() {
 }
 
 function renderGraphPreviewStatus(project, ready) {
-  const canLoad = !!project && ready
+  const hasDraftPreviewGraph = !!workflowPreviewGraph()
+  const canLoad = !!project && canShowWorkflowGraphPreview(ready, hasDraftPreviewGraph)
   btnGraphRefresh.disabled = !canLoad || graphLoading
   btnGraphFit.disabled = !graphRenderer
   btnGraphZoomOut.disabled = !graphRenderer
@@ -629,16 +649,16 @@ function renderGraphPreviewStatus(project, ready) {
     graphPreviewStatus.textContent = '未选择项目'
     return
   }
-  if (!ready) {
+  if (!canLoad) {
     graphPreviewStatus.textContent = '等待第一次图提交'
     return
   }
   if (graphLoading) {
-    graphPreviewStatus.textContent = '当前图谱加载中'
+    graphPreviewStatus.textContent = hasDraftPreviewGraph ? '草案图谱加载中' : '当前图谱加载中'
     return
   }
   if (graphError) {
-    graphPreviewStatus.textContent = '当前图谱加载失败'
+    graphPreviewStatus.textContent = hasDraftPreviewGraph ? '草案图谱加载失败' : '当前图谱加载失败'
     return
   }
   if (graphRenderer && graphLoadedProject === project.name && graphLoadedPreviewKey === graphPreviewKey(project)) {
@@ -653,17 +673,19 @@ function renderGraphPreview(project, ready) {
     renderOperationDraftPreview()
     return
   }
+  const hasDraftPreviewGraph = !!workflowPreviewGraph()
+  const canLoad = !!project && canShowWorkflowGraphPreview(ready, hasDraftPreviewGraph)
   renderGraphPreviewStatus(project, ready)
   if (!project) {
     setGraphPreviewPlaceholder('点击“新建项目”创建项目目录和基础结构。')
     return
   }
-  if (!ready) {
+  if (!canLoad) {
     setGraphPreviewPlaceholder('项目目录已创建。第一次图数据提交前，这里将展示项目初始化 Skill 生成的初始图草案。')
     return
   }
   if (graphLoading) {
-    setGraphPreviewPlaceholder('当前图谱加载中...')
+    setGraphPreviewPlaceholder(hasDraftPreviewGraph ? '草案图谱加载中...' : '当前图谱加载中...')
     return
   }
   if (graphError) {
@@ -677,18 +699,20 @@ function renderGraphPreview(project, ready) {
 
 async function ensureGraphPreviewLoaded({ force = false } = {}) {
   const project = selectedProject()
-  if (!project?.graphInitialized) return
+  const hasDraftPreviewGraph = !!workflowPreviewGraph()
+  if (!project || !canShowWorkflowGraphPreview(project.graphInitialized, hasDraftPreviewGraph)) return
   const key = graphPreviewKey(project)
   if (!force && graphRenderer && graphLoadedProject === project.name && graphLoadedPreviewKey === key) return
 
   const loadSeq = ++graphLoadSeq
   graphLoading = true
   graphError = ''
-  renderGraphPreview(project, true)
+  renderGraphPreview(project, project.graphInitialized)
   try {
     const payload = workflowPreviewGraph() || await fetchJson(graphPreviewApi(project))
     if (loadSeq !== graphLoadSeq || selectedProject()?.name !== project.name) return
     graphRenderer?.destroy()
+    resetPreviewRenderKey(graphPreview)
     graphRenderer = new ProjectGraphRenderer({
       root: graphPreview,
       view: 'expanded',
@@ -707,8 +731,8 @@ async function ensureGraphPreviewLoaded({ force = false } = {}) {
   } finally {
     if (loadSeq !== graphLoadSeq || selectedProject()?.name !== project.name) return
     graphLoading = false
-    renderGraphPreviewStatus(project, true)
-    if (graphError) renderGraphPreview(project, true)
+    renderGraphPreviewStatus(project, project.graphInitialized)
+    if (graphError) renderGraphPreview(project, project.graphInitialized)
   }
 }
 
@@ -854,7 +878,10 @@ function renderOperationDraftPreview() {
   btnGraphZoomOut.disabled = true
   btnGraphZoomIn.disabled = true
   graphPreviewStatus.textContent = workflowOperationsLoading ? '说明加载中' : '说明只读'
-  graphRenderer?.destroy()
+  if (graphRenderer) {
+    graphRenderer.destroy()
+    resetPreviewRenderKey(graphPreview)
+  }
   graphRenderer = null
   graphLoadedProject = ''
   graphLoadedPreviewKey = ''
@@ -865,20 +892,21 @@ function renderOperationDraftPreview() {
     selectedOperationArtifactKey = visibleFiles.find((file) => file.exists)?.key || 'operationNotes'
   }
   const selected = operationArtifactByKey(selectedOperationArtifactKey)
-  if (workflowOperationsLoading) {
-    graphPreview.innerHTML = '<div class="placeholder">图操作说明加载中...</div>'
+  if (workflowOperationsLoading && !visibleFiles.some((file) => file.exists)) {
+    setPreviewHtml(graphPreview, 'operation-draft:loading', '<div class="placeholder">图操作说明加载中...</div>')
   } else if (workflowOperations?.error) {
-    graphPreview.innerHTML = `<div class="placeholder">${esc(workflowOperations.error)}</div>`
+    setPreviewHtml(graphPreview, `operation-draft:error:${workflowOperations.error}`, `<div class="placeholder">${esc(workflowOperations.error)}</div>`)
   } else if (!selected?.exists) {
-    graphPreview.innerHTML = '<div class="placeholder">生成图操作草案后，这里会展示自然语言说明、operations.draft.json、代码生成的 operations.json 和校验结果。需要修改时请在下方聊天框提出意见。</div>'
+    setPreviewHtml(graphPreview, 'operation-draft:empty', '<div class="placeholder">生成图操作草案后，这里会展示自然语言说明、operations.draft.json、代码生成的 operations.json 和校验结果。需要修改时请在下方聊天框提出意见。</div>')
   } else if (selected.type === 'json') {
     let content = selected.content || ''
     try {
       content = JSON.stringify(JSON.parse(content), null, 2)
     } catch {}
-    graphPreview.innerHTML = `<pre class="operation-draft-content">${esc(content)}</pre>`
+    setPreviewHtml(graphPreview, `operation-draft:${selected.key}:${content}`, `<pre class="operation-draft-content">${esc(content)}</pre>`)
   } else {
-    graphPreview.innerHTML = `<pre class="operation-draft-content">${esc(selected.content || '')}</pre>`
+    const content = selected.content || ''
+    setPreviewHtml(graphPreview, `operation-draft:${selected.key}:${content}`, `<pre class="operation-draft-content">${esc(content)}</pre>`)
   }
 
   operationList.innerHTML = visibleFiles.map((file) => `
@@ -1296,27 +1324,27 @@ function renderNotes() {
   if (btnImportNoteFile) btnImportNoteFile.disabled = !project || noteLoading || noteImporting
   if (btnPasteNote) btnPasteNote.disabled = !project || noteLoading || noteImporting
   if (!project) {
-    notePreview.innerHTML = '<div class="placeholder">选择项目后可以导入、粘贴或生成工作笔记。</div>'
+    setPreviewHtml(notePreview, 'note:no-project', '<div class="placeholder">选择项目后可以导入、粘贴或生成工作笔记。</div>')
     noteList.innerHTML = '<div class="placeholder">还没有项目。</div>'
     return
   }
   if (noteLoading) {
-    notePreview.innerHTML = '<div class="placeholder">正在加载工作笔记...</div>'
+    setPreviewHtml(notePreview, 'note:loading', '<div class="placeholder">正在加载工作笔记...</div>')
     noteList.innerHTML = '<div class="placeholder">正在加载...</div>'
     return
   }
   if (workflowNote?.error) {
-    notePreview.innerHTML = `<div class="placeholder">${esc(workflowNote.error)}</div>`
+    setPreviewHtml(notePreview, `note:error:${workflowNote.error}`, `<div class="placeholder">${esc(workflowNote.error)}</div>`)
     noteList.innerHTML = '<div class="placeholder">加载失败。</div>'
     return
   }
   if (!workflowNote?.exists) {
-    notePreview.innerHTML = `
+    setPreviewHtml(notePreview, 'note:empty', `
       <div class="note-empty">
         <h4>还没有工作笔记</h4>
         <p>工作笔记可以人工导入，也可以让 AI 根据对话整理生成；导入后仍可继续让 AI 辅助修改。</p>
       </div>
-    `
+    `)
     noteList.innerHTML = `
       <div class="note-info">
         <strong>可选方式</strong>
@@ -1327,7 +1355,7 @@ function renderNotes() {
     `
     return
   }
-  notePreview.innerHTML = `<pre class="note-content">${esc(workflowNote.content || '')}</pre>`
+  setPreviewHtml(notePreview, `note:content:${workflowNote.content || ''}`, `<pre class="note-content">${esc(workflowNote.content || '')}</pre>`)
   const state = currentWorkflowState()
   noteList.innerHTML = `
     <div class="note-info">
@@ -1355,6 +1383,7 @@ function renderWorkspace() {
     return
   }
   const ready = !!project.graphInitialized
+  const hasDraftPreviewGraph = !!workflowPreviewGraph()
   const state = currentWorkflowState()
   workspaceSubtitle.textContent = `${project.name} / ${project.directory}`
   projectStatus.innerHTML = `
@@ -1364,14 +1393,14 @@ function renderWorkspace() {
   btnDetail.disabled = !ready
   btnGraph.disabled = !ready
   updateTerminalActionButtons()
-  if (!ready || graphLoadedProject !== project.name || graphLoadedPreviewKey !== graphPreviewKey(project)) {
+  if (!canShowWorkflowGraphPreview(ready, hasDraftPreviewGraph) || graphLoadedProject !== project.name || graphLoadedPreviewKey !== graphPreviewKey(project)) {
     graphRenderer?.destroy()
     graphRenderer = null
     graphLoadedProject = ''
     graphLoadedPreviewKey = ''
   }
   renderGraphPreview(project, ready)
-  if (ready || graphPreviewMode === 'draft') renderOperationPreview()
+  if (ready || hasDraftPreviewGraph || graphPreviewMode === 'draft') renderOperationPreview()
   else operationList.innerHTML = '<div class="placeholder">等待项目初始化 Skill 生成第一批图操作：初始事件/目标/工作块/工作项等。</div>'
   renderResources()
   renderNotes()

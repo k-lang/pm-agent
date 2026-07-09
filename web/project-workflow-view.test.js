@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   allWorkflowDiffRecords,
+  canShowWorkflowGraphPreview,
   editToolRecords,
   isEditTool,
   isWriteTool,
@@ -135,6 +136,12 @@ describe("project workflow view helpers", () => {
       title: "恢复默认布局",
     })
     expect(workflowMaximizeButtonState("workspace", "chat").expanded).toBe(false)
+  })
+
+  test("allows graph preview before first graph submit when draft preview graph exists", () => {
+    expect(canShowWorkflowGraphPreview(false, true)).toBe(true)
+    expect(canShowWorkflowGraphPreview(false, false)).toBe(false)
+    expect(canShowWorkflowGraphPreview(true, false)).toBe(true)
   })
 
   test("keeps rejected permission diff visible when the permission request captured a real diff", () => {
