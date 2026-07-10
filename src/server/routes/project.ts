@@ -148,7 +148,11 @@ function sourceRegistryPath(directory: string) {
 async function readProjectState(directory: string) {
   const raw = await fs.readFile(projectStatePath(directory), "utf8").catch(() => undefined)
   if (!raw) return ProjectStateFile.parse({ graphInitialized: await inferGraphInitialized(directory) })
-  return ProjectStateFile.parse(JSON.parse(raw))
+  const state = ProjectStateFile.parse(JSON.parse(raw))
+  if (!state.graphInitialized && await inferGraphInitialized(directory)) {
+    return { ...state, graphInitialized: true }
+  }
+  return state
 }
 
 async function hasJsonFiles(dir: string): Promise<boolean> {

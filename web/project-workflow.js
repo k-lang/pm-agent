@@ -321,7 +321,7 @@ async function loadWorkflowOperations() {
     workflowOperations = result || null
     if (result?.workflow) workflow = result.workflow
     if (activeTab === 'graph' && graphPreviewMode === 'map') {
-      await ensureGraphPreviewLoaded({ force: true }).catch(() => {})
+      await ensureGraphPreviewLoaded().catch(() => {})
     }
   } catch (error) {
     workflowOperations = { files: [], error: error.message || '图操作草稿加载失败' }

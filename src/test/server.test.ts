@@ -135,6 +135,35 @@ describe("server routes", () => {
     expect(body.directory).toBe(tmp.path)
   })
 
+  test("GET /project/directories infers initialized graph when project state is stale", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "stale-state")
+      await fs.mkdir(path.join(projectDir, "metadata"), { recursive: true })
+      await fs.mkdir(path.join(projectDir, "nodes", "goal"), { recursive: true })
+      await fs.mkdir(path.join(projectDir, "edges"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "nodes", "goal", "goal_demo.json"), "{}", "utf8")
+      await fs.writeFile(path.join(projectDir, "edges", "edge_demo.json"), "{}", "utf8")
+      await fs.writeFile(
+        path.join(projectDir, "metadata", "project_state.json"),
+        JSON.stringify({ graphInitialized: false }, null, 2) + "\n",
+        "utf8",
+      )
+
+      const res = await app.fetch(new Request("http://localhost/project/directories"))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.find((project: { name: string; graphInitialized: boolean }) => project.name === "stale-state")).toMatchObject({
+        graphInitialized: true,
+      })
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
   test("GET /mcp/ returns object", async () => {
     await using tmp = await tmpdir()
     const app = Server.createApp({})

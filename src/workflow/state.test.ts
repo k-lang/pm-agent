@@ -2075,6 +2075,8 @@ describe("ProjectWorkflow", () => {
     expect(changelog).toContain("产生知识梳理方案验证结果")
     expect(changelog).toContain("推动知识梳理目标")
     expect(changelog).not.toContain("图数据变化")
+    const projectState = JSON.parse(await fs.readFile(path.join(directory, "metadata", "project_state.json"), "utf8"))
+    expect(projectState.graphInitialized).toBe(true)
   })
 
   test("apply archives workflow note with semantic filename and avoids existing note collisions", async () => {

@@ -239,6 +239,19 @@ export namespace ProjectWorkflowExecution {
     return artifactPath(directory, "apply_backup.building")
   }
 
+  function projectStatePath(directory: string) {
+    return path.join(directory, "metadata", "project_state.json")
+  }
+
+  async function markProjectGraphInitialized(directory: string) {
+    const statePath = projectStatePath(directory)
+    const existing = await fs.readFile(statePath, "utf8")
+      .then((content) => JSON.parse(content) as Record<string, unknown>)
+      .catch(() => ({} as Record<string, unknown>))
+    await fs.mkdir(path.dirname(statePath), { recursive: true })
+    await fs.writeFile(statePath, JSON.stringify({ ...existing, graphInitialized: true }, null, 2) + "\n", "utf8")
+  }
+
   function appliedRoot(directory: string) {
     return path.join(directory, "workflows", "applied")
   }
@@ -1395,6 +1408,7 @@ export namespace ProjectWorkflowExecution {
     }
 
     await cleanupArchivedApplyBackup(path.join(input.directory, archivePath)).catch(() => undefined)
+    await markProjectGraphInitialized(input.directory).catch(() => undefined)
     const refreshed = await ProjectWorkflow.getActive({ project: input.project, directory: input.directory })
     return {
       ...refreshed,
