@@ -38,6 +38,10 @@ const ProjectDirectoryQuery = z.object({
   selectedQuestionID: z.string().optional(),
 })
 
+const ProjectSummaryRunQuery = ProjectDirectoryQuery.extend({
+  source: ProjectDetail.SummarySource.default("manual"),
+})
+
 const ProjectNameQuery = z.object({
   project: z.string(),
   path: z.string().optional().default(""),
@@ -1095,10 +1099,10 @@ export const ProjectRoutes = lazy(() =>
           ...errors(400),
         },
       }),
-      validator("query", ProjectDirectoryQuery),
+      validator("query", ProjectSummaryRunQuery),
       async (c) => {
         const query = c.req.valid("query")
-        const summary = await ProjectDetail.runSummary({ directory: resolveGraphDirectory(query), source: "manual" })
+        const summary = await ProjectDetail.runSummary({ directory: resolveGraphDirectory(query), source: query.source })
         return c.json(sanitizeProjectPayload(summary, query.project))
       },
     )

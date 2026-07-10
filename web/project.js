@@ -209,10 +209,29 @@ function qaBaselineReady() {
   return detail?.currentSummary?.status === 'completed'
 }
 
+function summaryStatusLabel(summary) {
+  if (!summary) return '未生成'
+  const statusLabels = {
+    pending: '待生成',
+    running: '生成中',
+    completed: '已生成',
+    expired: '已过期',
+    failed: '生成失败',
+  }
+  const sourceLabels = {
+    auto: '自动',
+    manual: '手动',
+  }
+  const status = statusLabels[summary.status] || summary.status
+  const source = sourceLabels[summary.source] || summary.source
+  return `${status} · ${source} · ${summary.sessionID}`
+}
+
 function qaBaselineMessage() {
   const current = detail?.currentSummary
   if (!current) return '项目总结尚未生成，请先生成项目总结后再提问。'
   if (current.status === 'running') return '项目总结正在生成，完成后会开放项目问答。'
+  if (current.status === 'expired') return '项目总结已过期，请先重新生成项目总结后再提问。'
   if (current.status === 'failed') return '项目总结生成失败，请重新生成项目总结后再提问。'
   if (current.status !== 'completed') return `项目总结当前状态为 ${current.status}，暂不能提问。`
   return ''
@@ -316,7 +335,7 @@ async function loadDetail() {
 function renderSummary() {
   const current = detail?.currentSummary
   currentSummarySessionId = current?.sessionID || null
-  summaryStatusEl.textContent = current ? `${current.status} · ${current.sessionID}` : '未生成'
+  summaryStatusEl.textContent = summaryStatusLabel(current)
   summaryEditor.value = current?.summaryText || ''
   summaryPreview.innerHTML = current?.summaryText ? renderAssistantMarkdown(current.summaryText, 'summary') : ''
   summaryPreview.classList.toggle('hidden', isEditingSummary)
@@ -535,11 +554,12 @@ async function renderQuestions() {
 }
 
 async function runSummary(auto = false) {
-  const summary = await fetchJson(API + '/project/summary/run?project=' + encodeURIComponent(projectName), { method: 'POST' })
+  const source = auto ? 'auto' : 'manual'
+  const summary = await fetchJson(API + '/project/summary/run?project=' + encodeURIComponent(projectName) + '&source=' + source, { method: 'POST' })
   detail.currentSummary = summary
   detail.summaries = [summary, ...(detail.summaries || [])]
   renderSummary()
-  summaryStatusEl.textContent = auto ? '生成中...' : `running · ${summary.sessionID}`
+  summaryStatusEl.textContent = `${auto ? '生成中 · 自动' : '生成中 · 手动'} · ${summary.sessionID}`
 }
 
 function startSummaryEdit() {

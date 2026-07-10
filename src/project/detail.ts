@@ -15,7 +15,7 @@ import { Provider } from "@/provider/provider"
 import { ProviderID } from "@/provider/schema"
 
 export namespace ProjectDetail {
-  export const SummaryStatus = z.enum(["pending", "running", "completed", "failed"])
+  export const SummaryStatus = z.enum(["pending", "running", "completed", "expired", "failed"])
   export const SummarySource = z.enum(["auto", "manual"])
   export const QuestionMode = z.enum(["question", "followup"])
 
@@ -30,6 +30,7 @@ export namespace ProjectDetail {
     summaryText: z.string().optional(),
     reportPath: z.string().optional(),
     reportLinkPath: z.string().optional(),
+    graphVersion: z.string().optional(),
     time: z.object({
       created: z.number(),
       updated: z.number(),
@@ -177,6 +178,46 @@ export namespace ProjectDetail {
     return linkPath
   }
 
+  const ApplyResultFile = z.object({
+    appliedAt: z.string().optional(),
+    change_id: z.string().optional(),
+    success: z.boolean().optional(),
+    snapshot: z.string().optional(),
+  })
+
+  export async function currentGraphVersion(directory: string) {
+    const appliedRoot = path.join(directory, "workflows", "applied")
+    const appliedEntries = await fs.readdir(appliedRoot, { withFileTypes: true }).catch(() => [])
+    const appliedResults = await Promise.all(appliedEntries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        const raw = await fs.readFile(path.join(appliedRoot, entry.name, "apply_result.json"), "utf8").catch(() => undefined)
+        if (!raw) return undefined
+        const parsed = ApplyResultFile.safeParse(JSON.parse(raw))
+        if (!parsed.success || parsed.data.success === false) return undefined
+        const version = parsed.data.snapshot || parsed.data.change_id
+        if (!version) return undefined
+        return {
+          version,
+          appliedAt: parsed.data.appliedAt ? Date.parse(parsed.data.appliedAt) || 0 : 0,
+        }
+      }))
+    const latestApplied = appliedResults
+      .filter((value): value is { version: string; appliedAt: number } => !!value)
+      .sort((a, b) => b.appliedAt - a.appliedAt)[0]
+    if (latestApplied) return latestApplied.version
+    return undefined
+  }
+
+  async function withComputedSummaryStatus(directory: string, summary: SummaryRecord): Promise<SummaryRecord> {
+    if (summary.status !== "completed") return summary
+    const currentVersion = await currentGraphVersion(directory)
+    if (summary.graphVersion && currentVersion && summary.graphVersion !== currentVersion) {
+      return { ...summary, status: "expired" }
+    }
+    return summary
+  }
+
   function summaryFromRow(row: typeof ProjectSummaryRecordTable.$inferSelect): SummaryRecord {
     return {
       id: row.id,
@@ -189,6 +230,7 @@ export namespace ProjectDetail {
       summaryText: row.summary_text ?? undefined,
       reportPath: row.report_path ?? undefined,
       reportLinkPath: row.report_link_path ?? undefined,
+      graphVersion: row.graph_version ?? undefined,
       time: {
         created: row.time_created,
         updated: row.time_updated,
@@ -324,14 +366,14 @@ export namespace ProjectDetail {
 
     return Promise.all(summaries.map(async (summary) => {
       const source = await readCurrentReport(input.directory, summary.reportPath)
-      return {
+      return withComputedSummaryStatus(input.directory, {
         ...summary,
         summaryText: source.reportPath === summary.reportPath ? source.summaryText ?? summary.summaryText : summary.summaryText,
         reportPath: source.reportPath === summary.reportPath ? source.reportPath ?? summary.reportPath : summary.reportPath,
         reportLinkPath: summary.isCurrentBaseline
           ? source.reportLinkPath ?? summary.reportLinkPath
           : summary.reportLinkPath,
-      }
+      })
     }))
   })
 
@@ -391,12 +433,12 @@ export namespace ProjectDetail {
     if (!row) return undefined
     const summary = summaryFromRow(row)
     const report = await readCurrentReport(input.directory, summary.reportPath, summary.status === "completed")
-    return {
+    return withComputedSummaryStatus(input.directory, {
       ...summary,
       summaryText: report.summaryText ?? summary.summaryText,
       reportPath: report.reportPath ?? summary.reportPath,
       reportLinkPath: report.reportLinkPath ?? summary.reportLinkPath,
-    }
+    })
   })
 
   async function selectedThread(questions: QuestionRecord[], selectedQuestionID?: string) {
@@ -440,6 +482,7 @@ export namespace ProjectDetail {
       source: SummarySource.default("manual"),
     }),
     async (input) => {
+      const graphVersion = await currentGraphVersion(input.directory)
       const session = await Instance.provide({
         directory: input.directory,
         fn: () => Session.create({ title: "项目总结" }),
@@ -470,6 +513,7 @@ export namespace ProjectDetail {
           summary_text: null,
           report_path: null,
           report_link_path: linkPath,
+          graph_version: graphVersion ?? null,
           time_created: now,
           time_updated: now,
         }).run()
@@ -503,6 +547,7 @@ export namespace ProjectDetail {
                 summary_text: report.summaryText ?? null,
                 report_path: resolvedReportPath ?? null,
                 report_link_path: reportLinkPath ?? null,
+                graph_version: graphVersion ?? null,
                 time_updated: Date.now(),
               })
               .where(eq(ProjectSummaryRecordTable.id, recordID))
@@ -533,6 +578,7 @@ export namespace ProjectDetail {
         summary_text: null,
         report_path: null,
         report_link_path: linkPath,
+        graph_version: graphVersion ?? null,
         time_created: now,
         time_updated: now,
       })
@@ -651,6 +697,9 @@ export namespace ProjectDetail {
       const baseline = await currentSummary({ directory: input.directory })
       if (!baseline) {
         throw new NamedError.Unknown({ message: `No baseline summary for project: ${input.directory}` })
+      }
+      if (baseline.status !== "completed") {
+        throw new NamedError.Unknown({ message: `Project summary is ${baseline.status}; regenerate the project summary before asking questions.` })
       }
 
       let sessionID: SessionID

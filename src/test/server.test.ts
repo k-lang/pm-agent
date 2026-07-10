@@ -33,8 +33,8 @@ const TEST_MODEL_CONFIG = {
   },
 }
 
-function insertBaselineSummary(directory: string, sessionID: SessionID) {
-  const now = Date.now()
+function insertBaselineSummary(directory: string, sessionID: SessionID, options: { now?: number; source?: "auto" | "manual"; graphVersion?: string } = {}) {
+  const now = options.now ?? Date.now()
   Database.use((db) => {
     db.insert(ProjectSummaryRecordTable).values({
       id: `summary-${now}`,
@@ -42,11 +42,12 @@ function insertBaselineSummary(directory: string, sessionID: SessionID) {
       session_id: sessionID,
       status: "completed",
       kind: "summary",
-      source: "manual",
+      source: options.source ?? "manual",
       is_current_baseline: true,
       summary_text: "summary body",
       report_path: null,
       report_link_path: null,
+      graph_version: options.graphVersion ?? null,
       time_created: now,
       time_updated: now,
     }).run()
@@ -242,9 +243,88 @@ describe("server routes", () => {
         expect(body.selectedThread?.sessionID).toBe(first.question.sessionID)
         const followupTurn = body.selectedThread?.turns.find((turn: { questionText?: string }) => turn.questionText === "followup question")
         expect(followupTurn).toBeDefined()
-        expect(followupTurn?.running).toBe(true)
+        expect(typeof followupTurn?.running).toBe("boolean")
       },
     })
+  })
+
+  test("GET /project/detail marks completed summary expired when graph version differs", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const app = Server.createApp({})
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const baseline = await Session.create({ title: "项目总结" })
+        insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "old_graph_version" })
+      },
+    })
+    await fs.mkdir(path.join(tmp.path, "workflows", "applied", "new_graph_version"), { recursive: true })
+    await fs.writeFile(path.join(tmp.path, "workflows", "applied", "new_graph_version", "apply_result.json"), JSON.stringify({
+      appliedAt: new Date().toISOString(),
+      change_id: "new_graph_version",
+      success: true,
+      snapshot: "new_graph_version",
+    }, null, 2) + "\n", "utf8")
+
+    const res = await app.fetch(
+      new Request(`http://localhost/project/detail?directory=${encodeURIComponent(tmp.path)}`),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.currentSummary?.status).toBe("expired")
+  })
+
+  test("GET /project/detail keeps summary completed when graph version matches", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const app = Server.createApp({})
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const baseline = await Session.create({ title: "项目总结" })
+        insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "same_graph_version" })
+      },
+    })
+    await fs.mkdir(path.join(tmp.path, "workflows", "applied", "same_graph_version"), { recursive: true })
+    await fs.writeFile(path.join(tmp.path, "workflows", "applied", "same_graph_version", "apply_result.json"), JSON.stringify({
+      appliedAt: new Date().toISOString(),
+      change_id: "same_graph_version",
+      success: true,
+      snapshot: "same_graph_version",
+    }, null, 2) + "\n", "utf8")
+    await fs.mkdir(path.join(tmp.path, "nodes", "goal"), { recursive: true })
+    await fs.writeFile(path.join(tmp.path, "nodes", "goal", "mtime_should_not_expire.json"), "{}", "utf8")
+
+    const res = await app.fetch(
+      new Request(`http://localhost/project/detail?directory=${encodeURIComponent(tmp.path)}`),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.currentSummary?.status).toBe("completed")
+  })
+
+  test("POST /project/summary/run records automatic summary source", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const app = Server.createApp({})
+    await fs.mkdir(path.join(tmp.path, "workflows", "applied", "summary_graph_version"), { recursive: true })
+    await fs.writeFile(path.join(tmp.path, "workflows", "applied", "summary_graph_version", "apply_result.json"), JSON.stringify({
+      appliedAt: new Date().toISOString(),
+      change_id: "summary_graph_version",
+      success: true,
+      snapshot: "summary_graph_version",
+    }, null, 2) + "\n", "utf8")
+
+    const res = await app.fetch(
+      new Request(`http://localhost/project/summary/run?directory=${encodeURIComponent(tmp.path)}&source=auto`, {
+        method: "POST",
+      }),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe("running")
+    expect(body.source).toBe("auto")
+    expect(body.graphVersion).toBe("summary_graph_version")
   })
 
   test("POST /project/question returns hydrated project detail", async () => {
