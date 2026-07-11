@@ -439,12 +439,13 @@ export function renderWorkflowToolPart(part, message = null) {
   return `<div class="message-tool">${esc(title)} · ${esc(status)}</div>`
 }
 
-export function renderResourceItem(resource, selectedResourcePath, metaText) {
+export function renderResourceItem(resource, selectedResourcePath, metaText, options = {}) {
+  const showDelete = options.showDelete !== false
   return `
     <div class="resource-item ${resource.path === selectedResourcePath ? 'active' : ''}" role="button" tabindex="0" data-path="${esc(resource.path)}">
       <span class="resource-row">
         <span class="resource-name">${esc(resource.originalName || resource.name)}</span>
-        <button type="button" class="resource-delete" data-path="${esc(resource.path)}" title="删除资源">删除</button>
+        ${showDelete ? `<button type="button" class="resource-delete" data-path="${esc(resource.path)}" title="删除资源">删除</button>` : ''}
       </span>
       <span class="resource-meta">${esc(metaText)}</span>
     </div>

@@ -480,6 +480,77 @@ async function previewSourceResource(project: string, relativePath: string) {
   }
 }
 
+function resolveNotePath(project: string, relativePath = "") {
+  const directory = projectDirectoryForName(project)
+  const notesRoot = path.resolve(directory, "notes")
+  const clean = relativePath.replace(/^\/+/, "").replace(/^notes\/+/, "")
+  const resolved = path.resolve(notesRoot, clean)
+  if (resolved !== notesRoot && !resolved.startsWith(notesRoot + path.sep)) {
+    badRequest("Path escapes project notes directory")
+  }
+  return {
+    directory,
+    notesRoot,
+    noteRelativePath: clean,
+    projectRelativePath: clean ? `notes/${clean}` : "notes",
+    resolved,
+  }
+}
+
+async function listProjectNotes(project: string) {
+  const { directory, notesRoot } = resolveNotePath(project)
+  await ensureExistingProject(directory)
+  const entries = await fs.readdir(notesRoot, { withFileTypes: true }).catch(() => [] as Dirent[])
+  const notes: z.infer<typeof SourceResource>[] = []
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.name === ".DS_Store") continue
+    const full = path.join(notesRoot, entry.name)
+    const stats = await fs.stat(full)
+    notes.push(SourceResource.parse({
+      id: `note:${entry.name}`,
+      name: entry.name,
+      originalName: entry.name,
+      path: `notes/${entry.name}`,
+      size: stats.size,
+      mimeType: contentTypeForPath(full),
+      uploadedAt: stats.mtime.toISOString(),
+      previewable: isPreviewableSourcePath(full),
+    }))
+  }
+  notes.sort((a, b) => (b.uploadedAt || "").localeCompare(a.uploadedAt || "") || a.name.localeCompare(b.name))
+  return notes
+}
+
+async function previewProjectNote(project: string, relativePath: string) {
+  const { directory, resolved, projectRelativePath, noteRelativePath } = resolveNotePath(project, relativePath)
+  await ensureExistingProject(directory)
+  if (!noteRelativePath) badRequest("Note path is required")
+  const stats = await fs.stat(resolved).catch(() => undefined)
+  if (!stats || !stats.isFile()) badRequest("Note file not found")
+  const previewable = isPreviewableSourcePath(resolved)
+  const resource = {
+    name: path.basename(resolved),
+    path: projectRelativePath,
+    size: stats.size,
+    mimeType: contentTypeForPath(resolved),
+    previewable,
+  }
+  if (!previewable) {
+    return {
+      ...resource,
+      type: "unsupported" as const,
+      content: "",
+      message: "当前只支持预览 .txt、.md、.markdown 工作笔记。",
+    }
+  }
+  const content = await fs.readFile(resolved, "utf8")
+  return {
+    ...resource,
+    type: "text" as const,
+    content,
+  }
+}
+
 async function readWorkflowNote(project: string) {
   const directory = projectDirectoryForName(project)
   await ensureExistingProject(directory)
@@ -502,33 +573,20 @@ async function readWorkflowOperationArtifacts(project: string) {
 async function importWorkflowNote(input: {
   project: string
   content: string
-  sourcePath?: string
-  sourceName?: string
+  source?: "manual_import" | "manual_edit"
+  summary?: string
 }) {
   const directory = projectDirectoryForName(input.project)
   await ensureExistingProject(directory)
   await ProjectWorkflow.runAction({ project: input.project, directory, action: "开始或恢复", payload: {} })
-  if (input.sourcePath) {
-    await ProjectWorkflow.runAction({
-      project: input.project,
-      directory,
-      action: "登记资源",
-      payload: {
-        path: input.sourcePath,
-        title: input.sourceName ?? input.sourcePath,
-        note: "人工导入工作笔记时保留的原始文件。",
-      },
-    })
-  }
   await ProjectWorkflowExecution.writeNote({ directory, content: input.content })
   const workflow = await ProjectWorkflowExecution.runAction({
     project: input.project,
     directory,
     action: "同步工作笔记变更",
     payload: {
-      summary: input.sourcePath ? `人工导入工作笔记：${input.sourceName ?? input.sourcePath}` : "人工修改工作笔记。",
-      source: input.sourcePath ? "manual_import" : "manual_edit",
-      sourcePath: input.sourcePath,
+      summary: input.summary ?? "人工修改工作笔记。",
+      source: input.source ?? "manual_edit",
     },
   })
   return WorkflowNote.parse({
@@ -546,35 +604,11 @@ async function importWorkflowNoteFromFile(project: string, file: File) {
   if (buffer.byteLength > maxBytes) badRequest("工作笔记文件不能超过 1MB")
   const content = buffer.toString("utf8")
   if (!content.trim()) badRequest("工作笔记内容不能为空")
-
-  const target = await uniqueSourceFilePath(project, file.name)
-  await fs.mkdir(target.sourceRoot, { recursive: true })
-  await fs.writeFile(target.resolved, buffer)
-
-  const now = new Date().toISOString()
-  const resource = SourceResource.parse({
-    id: ulid(),
-    name: path.basename(target.resolved),
-    originalName: file.name,
-    path: target.projectRelativePath,
-    size: buffer.byteLength,
-    mimeType: file.type || contentTypeForPath(target.resolved),
-    uploadedAt: now,
-    previewable: true,
-  })
-  const registry = await readSourceRegistry(target.directory)
-  await writeSourceRegistry(target.directory, {
-    resources: [
-      resource,
-      ...registry.resources.filter((item) => item.path !== resource.path),
-    ],
-  })
-
   return importWorkflowNote({
     project,
     content,
-    sourcePath: resource.path,
-    sourceName: resource.originalName,
+    source: "manual_import",
+    summary: `人工导入工作笔记：${file.name}`,
   })
 }
 
@@ -1039,6 +1073,35 @@ export const ProjectRoutes = lazy(() =>
       async (c) => {
         const query = c.req.valid("query")
         return c.json(await deleteSourceResource(query.project, query.path))
+      },
+    )
+    .get(
+      "/notes",
+      describeRoute({
+        summary: "List archived project notes",
+        operationId: "project.notesList",
+        responses: {
+          200: { description: "Archived project notes", content: { "application/json": { schema: resolver(SourceResource.array()) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectOnlyQuery),
+      async (c) => c.json(await listProjectNotes(c.req.valid("query").project)),
+    )
+    .get(
+      "/notes/preview",
+      describeRoute({
+        summary: "Preview archived project note",
+        operationId: "project.notesPreview",
+        responses: {
+          200: { description: "Archived project note preview", content: { "application/json": { schema: resolver(z.any()) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectSourceQuery),
+      async (c) => {
+        const query = c.req.valid("query")
+        return c.json(await previewProjectNote(query.project, query.path))
       },
     )
     .get(

@@ -72,9 +72,13 @@
             </div>
             <aside class="side-index">
               <div class="side-header">
-                <h3>资源文档 <span>上传到 source</span></h3>
+                <h3>资源索引 <span>资料与过往笔记</span></h3>
               </div>
               <div id="resource-actions">
+                <div class="segment-control" aria-label="资源类型">
+                  <button id="btn-resource-mode-source" type="button" class="active">用户已上传资料</button>
+                  <button id="btn-resource-mode-notes" type="button">过往工作笔记</button>
+                </div>
                 <button id="btn-upload-resource" type="button" class="btn-secondary">上传资源</button>
                 <input id="resource-file" type="file" class="hidden">
               </div>

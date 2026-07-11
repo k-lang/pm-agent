@@ -670,9 +670,20 @@ body.workflow-maximized-chat #chat-panel {
   padding-inline: 10px;
 }
 #resource-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   padding-bottom: 10px;
 }
 #resource-actions button { width: 100%; }
+#resource-actions .segment-control {
+  width: 100%;
+}
+#resource-actions .segment-control button {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
 #note-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;

@@ -57,6 +57,8 @@ const operationSideTitle = document.getElementById('operation-side-title')
 const noteList = document.getElementById('note-list')
 const resourceList = document.getElementById('resource-list')
 const btnUploadResource = document.getElementById('btn-upload-resource')
+const btnResourceModeSource = document.getElementById('btn-resource-mode-source')
+const btnResourceModeNotes = document.getElementById('btn-resource-mode-notes')
 const resourceFile = document.getElementById('resource-file')
 const btnImportNoteFile = document.getElementById('btn-import-note-file')
 const btnPasteNote = document.getElementById('btn-paste-note')
@@ -86,6 +88,8 @@ const btnRejectPermissionReview = document.getElementById('btn-reject-permission
 const btnApprovePermissionReview = document.getElementById('btn-approve-permission-review')
 let activeTab = 'notes'
 let resources = []
+let archivedNotes = []
+let resourceMode = 'source'
 let workflowNote = null
 let selectedResourcePath = ''
 let resourceLoading = false
@@ -335,6 +339,7 @@ async function loadResources() {
   const project = selectedProject()
   const previousResourcePath = selectedResourcePath
   resources = []
+  archivedNotes = []
   selectedResourcePath = ''
   if (!project) {
     renderResources()
@@ -343,8 +348,14 @@ async function loadResources() {
   resourceLoading = true
   renderResources()
   try {
-    resources = await fetchJson(API + `/project/source?project=${encodeURIComponent(project.name)}`) || []
-    if (previousResourcePath && resources.some((resource) => resource.path === previousResourcePath)) {
+    const [sourceResources, notes] = await Promise.all([
+      fetchJson(API + `/project/source?project=${encodeURIComponent(project.name)}`),
+      fetchJson(API + `/project/notes?project=${encodeURIComponent(project.name)}`),
+    ])
+    resources = sourceResources || []
+    archivedNotes = notes || []
+    const visibleResources = resourceMode === 'notes' ? archivedNotes : resources
+    if (previousResourcePath && visibleResources.some((resource) => resource.path === previousResourcePath)) {
       selectedResourcePath = previousResourcePath
     }
   } catch (error) {
@@ -1277,7 +1288,12 @@ function formatBytes(size) {
 
 function renderResources() {
   const project = selectedProject()
-  if (btnUploadResource) btnUploadResource.disabled = !project || resourceLoading
+  if (btnResourceModeSource) btnResourceModeSource.classList.toggle('active', resourceMode === 'source')
+  if (btnResourceModeNotes) btnResourceModeNotes.classList.toggle('active', resourceMode === 'notes')
+  if (btnUploadResource) {
+    btnUploadResource.disabled = !project || resourceLoading || resourceMode !== 'source'
+    btnUploadResource.classList.toggle('hidden', resourceMode !== 'source')
+  }
   if (!project) {
     resourcePreview.innerHTML = '<div class="placeholder">选择项目后可以上传和预览资源。</div>'
     resourceList.innerHTML = '<div class="placeholder">还没有项目。</div>'
@@ -1287,13 +1303,18 @@ function renderResources() {
     resourceList.innerHTML = '<div class="placeholder">正在加载资源...</div>'
     return
   }
-  if (!resources.length) {
-    resourcePreview.innerHTML = '<div class="placeholder">可以上传 txt、md 或其他附件；当前只支持预览 txt 和 markdown。</div>'
-    resourceList.innerHTML = '<div class="placeholder">还没有项目资源。</div>'
+  const visibleResources = resourceMode === 'notes' ? archivedNotes : resources
+  const emptyPreview = resourceMode === 'notes'
+    ? '图操作提交后，active 工作笔记会归档到 notes/，这里会展示过往工作笔记。'
+    : '可以上传 txt、md 或其他附件；当前只支持预览 txt 和 markdown。'
+  const emptyList = resourceMode === 'notes' ? '还没有过往工作笔记。' : '还没有用户上传资料。'
+  if (!visibleResources.length) {
+    resourcePreview.innerHTML = `<div class="placeholder">${esc(emptyPreview)}</div>`
+    resourceList.innerHTML = `<div class="placeholder">${esc(emptyList)}</div>`
     return
   }
-  resourceList.innerHTML = resources.map((resource) => `
-    ${renderResourceItem(resource, selectedResourcePath, `${formatBytes(resource.size)}${resource.previewable ? ' / 可预览' : ' / 附件'}`)}
+  resourceList.innerHTML = visibleResources.map((resource) => `
+    ${renderResourceItem(resource, selectedResourcePath, `${formatBytes(resource.size)}${resource.previewable ? ' / 可预览' : ' / 附件'}`, { showDelete: resourceMode === 'source' })}
   `).join('')
   for (const item of Array.from(resourceList.querySelectorAll('.resource-item'))) {
     item.onclick = () => previewResource(item.dataset.path)
@@ -1705,6 +1726,20 @@ async function applyWorkflowFromButton() {
 
 btnDiscardWorkflow.onclick = () => discardWorkflowFromButton()
 btnApply.onclick = () => applyWorkflowFromButton()
+btnResourceModeSource.onclick = () => {
+  if (resourceMode === 'source') return
+  resourceMode = 'source'
+  selectedResourcePath = ''
+  resourcePreview.innerHTML = '<div class="placeholder">选择用户上传资料进行预览。</div>'
+  renderResources()
+}
+btnResourceModeNotes.onclick = () => {
+  if (resourceMode === 'notes') return
+  resourceMode = 'notes'
+  selectedResourcePath = ''
+  resourcePreview.innerHTML = '<div class="placeholder">选择过往工作笔记进行预览。</div>'
+  renderResources()
+}
 
 resourceFile.onchange = async () => {
   const project = selectedProject()
@@ -1767,7 +1802,10 @@ async function previewResource(resourcePath) {
   renderResources()
   resourcePreview.innerHTML = '<div class="placeholder">正在读取预览...</div>'
   try {
-    const preview = await fetchJson(API + `/project/source/preview?project=${encodeURIComponent(project.name)}&path=${encodeURIComponent(resourcePath)}`)
+    const endpoint = resourceMode === 'notes' || resourcePath.startsWith('notes/')
+      ? '/project/notes/preview'
+      : '/project/source/preview'
+    const preview = await fetchJson(API + `${endpoint}?project=${encodeURIComponent(project.name)}&path=${encodeURIComponent(resourcePath)}`)
     if (preview.type === 'text') {
       resourcePreview.innerHTML = `<pre class="resource-preview-text">${esc(preview.content)}</pre>`
       return

@@ -370,6 +370,17 @@ describe("project workflow view helpers", () => {
     expect(html).not.toContain('<button type="button" class="resource-item')
   })
 
+  test("renders archived note resource without delete button", () => {
+    const html = renderResourceItem({
+      path: "notes/past.md",
+      originalName: "past.md",
+      name: "past.md",
+    }, "notes/past.md", "42 B / 可预览", { showDelete: false })
+
+    expect(html).toContain('data-path="notes/past.md"')
+    expect(html).not.toContain('resource-delete')
+  })
+
   test("builds permission URLs with project directory so replies hit the correct instance", () => {
     const project = { directory: "/tmp/project graph/demo" }
 

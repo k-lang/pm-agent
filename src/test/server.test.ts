@@ -520,7 +520,7 @@ describe("server routes", () => {
     }
   })
 
-  test("POST /project/workflow/note/import accepts markdown file and registers source resource", async () => {
+  test("POST /project/workflow/note/import accepts markdown file without registering source resource", async () => {
     await using tmp = await tmpdir()
     const originalCwd = process.cwd()
     process.chdir(tmp.path)
@@ -540,16 +540,43 @@ describe("server routes", () => {
       const body = await res.json()
       expect(body).toMatchObject({ exists: true, content: "# Imported\n\nbody\n", path: "workflows/active/note.md" })
       await expect(fs.readFile(path.join(projectDir, "workflows", "active", "note.md"), "utf8")).resolves.toBe("# Imported\n\nbody\n")
-      const registry = JSON.parse(await fs.readFile(path.join(projectDir, "metadata", "source_resources.json"), "utf8"))
-      expect(registry.resources).toHaveLength(1)
-      expect(registry.resources[0]).toMatchObject({
-        originalName: "note.md",
-        path: "source/note.md",
+      await expect(fs.stat(path.join(projectDir, "metadata", "source_resources.json"))).rejects.toThrow()
+      await expect(fs.stat(path.join(projectDir, "source", "note.md"))).rejects.toThrow()
+      await expect(fs.stat(path.join(projectDir, "workflows", "active", "resources.json"))).rejects.toThrow()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("GET /project/notes lists and previews archived work notes", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "notes"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await fs.writeFile(path.join(projectDir, "notes", "past_note.md"), "# Past note\n\nbody\n", "utf8")
+
+      const listRes = await app.fetch(new Request("http://localhost/project/notes?project=demo"))
+      expect(listRes.status).toBe(200)
+      const notes = await listRes.json()
+      expect(notes).toHaveLength(1)
+      expect(notes[0]).toMatchObject({
+        originalName: "past_note.md",
+        path: "notes/past_note.md",
         previewable: true,
       })
-      await expect(fs.readFile(path.join(projectDir, "source", "note.md"), "utf8")).resolves.toBe("# Imported\n\nbody\n")
-      const resourcesRaw = await fs.readFile(path.join(projectDir, "workflows", "active", "resources.json"), "utf8")
-      expect(resourcesRaw).toContain("source/note.md")
+
+      const previewRes = await app.fetch(new Request("http://localhost/project/notes/preview?project=demo&path=notes%2Fpast_note.md"))
+      expect(previewRes.status).toBe(200)
+      const preview = await previewRes.json()
+      expect(preview).toMatchObject({
+        type: "text",
+        path: "notes/past_note.md",
+        content: "# Past note\n\nbody\n",
+      })
     } finally {
       process.chdir(originalCwd)
     }
