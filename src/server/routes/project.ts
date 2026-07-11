@@ -1,5 +1,5 @@
 import fs from "fs/promises"
-import type { Dirent } from "fs"
+import type { Dirent, Stats } from "fs"
 import path from "path"
 import { Buffer } from "buffer"
 import { ulid } from "ulid"
@@ -312,8 +312,22 @@ function sanitizeSourceFileName(input: string) {
 }
 
 function isPreviewableSourcePath(filePath: string) {
+  return isTextPreviewPath(filePath) || isHtmlPreviewPath(filePath) || isImagePreviewPath(filePath)
+}
+
+function isTextPreviewPath(filePath: string) {
   const ext = path.extname(filePath).toLowerCase()
   return ext === ".txt" || ext === ".md" || ext === ".markdown"
+}
+
+function isHtmlPreviewPath(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase()
+  return ext === ".html" || ext === ".htm"
+}
+
+function isImagePreviewPath(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase()
+  return ext === ".png" || ext === ".jpg" || ext === ".jpeg" || ext === ".gif" || ext === ".webp" || ext === ".svg"
 }
 
 function resolveSourcePath(project: string, relativePath = "") {
@@ -371,7 +385,7 @@ async function listSourceResources(project: string) {
     const resourcePath = `source/${entry.name}`
     const recorded = byPath.get(resourcePath)
     resources.push(SourceResource.parse({
-      id: recorded?.id ?? ulid(stats.mtimeMs),
+      id: recorded?.id ?? ulid(Math.floor(stats.mtimeMs)),
       name: entry.name,
       originalName: recorded?.originalName ?? entry.name,
       path: resourcePath,
@@ -403,10 +417,72 @@ async function deleteSourceResource(project: string, relativePath: string) {
 function contentTypeForPath(filePath: string) {
   const ext = path.extname(filePath).toLowerCase()
   if (ext === ".json") return "application/json"
-  if (ext === ".md") return "text/markdown"
+  if (ext === ".md" || ext === ".markdown") return "text/markdown"
   if (ext === ".txt" || ext === ".log") return "text/plain"
+  if (ext === ".html" || ext === ".htm") return "text/html"
+  if (ext === ".png") return "image/png"
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg"
+  if (ext === ".gif") return "image/gif"
+  if (ext === ".webp") return "image/webp"
+  if (ext === ".svg") return "image/svg+xml"
   if (ext === ".yaml" || ext === ".yml") return "application/yaml"
   return "text/plain"
+}
+
+type PreviewResourceInfo = {
+  name: string
+  path: string
+  size: number
+  mimeType: string
+  previewable: boolean
+}
+
+function sourceRawUrl(project: string, relativePath: string) {
+  return `/project/source/raw?project=${encodeURIComponent(project)}&path=${encodeURIComponent(relativePath)}`
+}
+
+function noteRawUrl(project: string, relativePath: string) {
+  return `/project/notes/raw?project=${encodeURIComponent(project)}&path=${encodeURIComponent(relativePath)}`
+}
+
+async function previewResolvedResource(
+  resource: PreviewResourceInfo,
+  resolved: string,
+  stats: Stats,
+  unsupportedMessage: string,
+  options: { imageUrl?: string } = {},
+) {
+  if (!resource.previewable) {
+    return {
+      ...resource,
+      type: "unsupported" as const,
+      content: "",
+      message: unsupportedMessage,
+    }
+  }
+  if (isImagePreviewPath(resolved)) {
+    return {
+      ...resource,
+      type: "image" as const,
+      content: "",
+      imageUrl: options.imageUrl,
+    }
+  }
+  const maxTextPreviewBytes = 512 * 1024
+  if (stats.size > maxTextPreviewBytes) {
+    return {
+      ...resource,
+      type: "too_large" as const,
+      content: "",
+      message: "文件超过 512KB，当前版本暂不预览大文本或 HTML 文件。",
+    }
+  }
+  const content = await fs.readFile(resolved, "utf8")
+  return {
+    ...resource,
+    type: isHtmlPreviewPath(resolved) ? "html" as const : "text" as const,
+    content,
+  }
 }
 
 async function listProjectFiles(project: string, relativePath?: string) {
@@ -455,29 +531,48 @@ async function previewSourceResource(project: string, relativePath: string) {
     mimeType: contentTypeForPath(resolved),
     previewable,
   }
-  if (!previewable) {
-    return {
-      ...resource,
-      type: "unsupported" as const,
-      content: "",
-      message: "当前只支持预览 .txt、.md、.markdown 文件；该文件已保存，可作为附件引用。",
-    }
+  return previewResolvedResource(
+    resource,
+    resolved,
+    stats,
+    "当前只支持预览文本、Markdown、HTML 和常见图片文件；该文件已保存，可作为附件引用。",
+    { imageUrl: sourceRawUrl(project, projectRelativePath) },
+  )
+}
+
+async function readImageFileResponse(input: { resolved: string; resourcePath: string; request: Request }) {
+  if (!isImagePreviewPath(input.resolved)) badRequest("Only image resources can be read as binary preview")
+  const stats = await fs.stat(input.resolved).catch(() => undefined)
+  if (!stats || !stats.isFile()) badRequest("Image file not found")
+
+  const etag = `"image-${Buffer.from(input.resourcePath).toString("base64url")}-${stats.size}-${Math.floor(stats.mtimeMs)}"`
+  if (input.request.headers.get("if-none-match") === etag) {
+    return new Response(null, {
+      status: 304,
+      headers: {
+        ETag: etag,
+        "Cache-Control": "private, max-age=300",
+      },
+    })
   }
-  const maxPreviewBytes = 512 * 1024
-  if (stats.size > maxPreviewBytes) {
-    return {
-      ...resource,
-      type: "too_large" as const,
-      content: "",
-      message: "文件超过 512KB，当前版本暂不预览大文本文件。",
-    }
-  }
-  const content = await fs.readFile(resolved, "utf8")
-  return {
-    ...resource,
-    type: "text" as const,
-    content,
-  }
+
+  return new Response(Bun.file(input.resolved), {
+    headers: {
+      "Content-Type": contentTypeForPath(input.resolved),
+      "Content-Length": String(stats.size),
+      "Cache-Control": "private, max-age=300",
+      ETag: etag,
+      "Last-Modified": stats.mtime.toUTCString(),
+      "X-Content-Type-Options": "nosniff",
+    },
+  })
+}
+
+async function readSourceImageResource(project: string, relativePath: string, request: Request) {
+  const { directory, resolved, projectRelativePath, sourceRelativePath } = resolveSourcePath(project, relativePath)
+  await ensureExistingProject(directory)
+  if (!sourceRelativePath) badRequest("Source file path is required")
+  return readImageFileResponse({ resolved, resourcePath: projectRelativePath, request })
 }
 
 function resolveNotePath(project: string, relativePath = "") {
@@ -535,20 +630,20 @@ async function previewProjectNote(project: string, relativePath: string) {
     mimeType: contentTypeForPath(resolved),
     previewable,
   }
-  if (!previewable) {
-    return {
-      ...resource,
-      type: "unsupported" as const,
-      content: "",
-      message: "当前只支持预览 .txt、.md、.markdown 工作笔记。",
-    }
-  }
-  const content = await fs.readFile(resolved, "utf8")
-  return {
-    ...resource,
-    type: "text" as const,
-    content,
-  }
+  return previewResolvedResource(
+    resource,
+    resolved,
+    stats,
+    "当前只支持预览文本、Markdown、HTML 和常见图片文件。",
+    { imageUrl: noteRawUrl(project, projectRelativePath) },
+  )
+}
+
+async function readNoteImageResource(project: string, relativePath: string, request: Request) {
+  const { directory, resolved, projectRelativePath, noteRelativePath } = resolveNotePath(project, relativePath)
+  await ensureExistingProject(directory)
+  if (!noteRelativePath) badRequest("Note path is required")
+  return readImageFileResponse({ resolved, resourcePath: projectRelativePath, request })
 }
 
 async function readWorkflowNote(project: string) {
@@ -598,7 +693,7 @@ async function importWorkflowNote(input: {
 }
 
 async function importWorkflowNoteFromFile(project: string, file: File) {
-  if (!isPreviewableSourcePath(file.name)) badRequest("工作笔记导入只支持 .txt、.md、.markdown 文件")
+  if (!isTextPreviewPath(file.name)) badRequest("工作笔记导入只支持 .txt、.md、.markdown 文件")
   const maxBytes = 1024 * 1024
   const buffer = Buffer.from(await file.arrayBuffer())
   if (buffer.byteLength > maxBytes) badRequest("工作笔记文件不能超过 1MB")
@@ -1052,7 +1147,7 @@ export const ProjectRoutes = lazy(() =>
           payload: {
             path: resource.path,
             title: resource.originalName,
-            note: resource.previewable ? "上传的文本资源，可在工作推进页预览。" : "上传的附件资源，当前版本不支持内容预览。",
+            note: resource.previewable ? "上传的资源可在工作推进页预览。" : "上传的附件资源，当前版本不支持内容预览。",
           },
         }).catch(() => undefined)
 
@@ -1105,6 +1200,23 @@ export const ProjectRoutes = lazy(() =>
       },
     )
     .get(
+      "/notes/raw",
+      describeRoute({
+        summary: "Read image archived project note",
+        operationId: "project.notesRaw",
+        responses: {
+          200: { description: "Image archived project note" },
+          304: { description: "Image archived project note not modified" },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectSourceQuery),
+      async (c) => {
+        const query = c.req.valid("query")
+        return readNoteImageResource(query.project, query.path, c.req.raw)
+      },
+    )
+    .get(
       "/source/preview",
       describeRoute({
         summary: "Preview project source resource",
@@ -1118,6 +1230,23 @@ export const ProjectRoutes = lazy(() =>
       async (c) => {
         const query = c.req.valid("query")
         return c.json(await previewSourceResource(query.project, query.path))
+      },
+    )
+    .get(
+      "/source/raw",
+      describeRoute({
+        summary: "Read image source resource",
+        operationId: "project.sourceRaw",
+        responses: {
+          200: { description: "Image source resource" },
+          304: { description: "Image source resource not modified" },
+          ...errors(400),
+        },
+      }),
+      validator("query", ProjectSourceQuery),
+      async (c) => {
+        const query = c.req.valid("query")
+        return readSourceImageResource(query.project, query.path, c.req.raw)
       },
     )
     .get(

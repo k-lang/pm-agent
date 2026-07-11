@@ -558,14 +558,20 @@ describe("server routes", () => {
       await fs.mkdir(path.join(projectDir, "notes"), { recursive: true })
       await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
       await fs.writeFile(path.join(projectDir, "notes", "past_note.md"), "# Past note\n\nbody\n", "utf8")
+      await fs.writeFile(path.join(projectDir, "notes", "past_diagram.svg"), "<svg></svg>\n", "utf8")
 
       const listRes = await app.fetch(new Request("http://localhost/project/notes?project=demo"))
       expect(listRes.status).toBe(200)
       const notes = await listRes.json()
-      expect(notes).toHaveLength(1)
-      expect(notes[0]).toMatchObject({
+      expect(notes).toHaveLength(2)
+      expect(notes.find((item: { path: string }) => item.path === "notes/past_note.md")).toMatchObject({
         originalName: "past_note.md",
         path: "notes/past_note.md",
+        previewable: true,
+      })
+      expect(notes.find((item: { path: string }) => item.path === "notes/past_diagram.svg")).toMatchObject({
+        originalName: "past_diagram.svg",
+        path: "notes/past_diagram.svg",
         previewable: true,
       })
 
@@ -577,6 +583,93 @@ describe("server routes", () => {
         path: "notes/past_note.md",
         content: "# Past note\n\nbody\n",
       })
+
+      const imagePreviewRes = await app.fetch(new Request("http://localhost/project/notes/preview?project=demo&path=notes%2Fpast_diagram.svg"))
+      expect(imagePreviewRes.status).toBe(200)
+      const imagePreview = await imagePreviewRes.json()
+      expect(imagePreview).toMatchObject({
+        type: "image",
+        path: "notes/past_diagram.svg",
+        mimeType: "image/svg+xml",
+        content: "",
+        imageUrl: "/project/notes/raw?project=demo&path=notes%2Fpast_diagram.svg",
+      })
+
+      const rawRes = await app.fetch(new Request("http://localhost/project/notes/raw?project=demo&path=notes%2Fpast_diagram.svg"))
+      expect(rawRes.status).toBe(200)
+      expect(rawRes.headers.get("content-type")).toBe("image/svg+xml")
+      expect(await rawRes.text()).toBe("<svg></svg>\n")
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("GET /project/source previews html and image resources", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      const sourceDir = path.join(projectDir, "source")
+      await fs.mkdir(sourceDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await fs.writeFile(path.join(sourceDir, "overview.html"), "<main><h1>Overview</h1></main>\n", "utf8")
+      await fs.writeFile(
+        path.join(sourceDir, "diagram.svg"),
+        '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><text x="4" y="20">demo</text></svg>',
+        "utf8",
+      )
+
+      const listRes = await app.fetch(new Request("http://localhost/project/source?project=demo"))
+      expect(listRes.status).toBe(200)
+      const resources = await listRes.json()
+      expect(resources.find((item: { path: string }) => item.path === "source/overview.html")).toMatchObject({
+        previewable: true,
+      })
+      expect(resources.find((item: { path: string }) => item.path === "source/diagram.svg")).toMatchObject({
+        previewable: true,
+      })
+
+      const htmlRes = await app.fetch(new Request("http://localhost/project/source/preview?project=demo&path=source%2Foverview.html"))
+      expect(htmlRes.status).toBe(200)
+      const htmlPreview = await htmlRes.json()
+      expect(htmlPreview).toMatchObject({
+        type: "html",
+        path: "source/overview.html",
+        mimeType: "text/html",
+        content: "<main><h1>Overview</h1></main>\n",
+      })
+
+      const imageRes = await app.fetch(new Request("http://localhost/project/source/preview?project=demo&path=source%2Fdiagram.svg"))
+      expect(imageRes.status).toBe(200)
+      const imagePreview = await imageRes.json()
+      expect(imagePreview).toMatchObject({
+        type: "image",
+        path: "source/diagram.svg",
+        mimeType: "image/svg+xml",
+        content: "",
+        imageUrl: "/project/source/raw?project=demo&path=source%2Fdiagram.svg",
+      })
+      expect(imagePreview.dataUrl).toBeUndefined()
+
+      const rawRes = await app.fetch(new Request("http://localhost/project/source/raw?project=demo&path=source%2Fdiagram.svg"))
+      expect(rawRes.status).toBe(200)
+      expect(rawRes.headers.get("content-type")).toBe("image/svg+xml")
+      expect(rawRes.headers.get("cache-control")).toBe("private, max-age=300")
+      expect(rawRes.headers.get("x-content-type-options")).toBe("nosniff")
+      const rawContent = await rawRes.text()
+      expect(rawContent).toContain("<svg")
+
+      const etag = rawRes.headers.get("etag")
+      expect(etag).toBeTruthy()
+      const cachedRes = await app.fetch(new Request("http://localhost/project/source/raw?project=demo&path=source%2Fdiagram.svg", {
+        headers: { "If-None-Match": etag || "" },
+      }))
+      expect(cachedRes.status).toBe(304)
+
+      const htmlRawRes = await app.fetch(new Request("http://localhost/project/source/raw?project=demo&path=source%2Foverview.html"))
+      expect(htmlRawRes.status).toBe(400)
     } finally {
       process.chdir(originalCwd)
     }
@@ -601,6 +694,30 @@ describe("server routes", () => {
       expect(res.status).toBe(400)
       await expect(fs.stat(path.join(projectDir, "workflows", "active", "note.md"))).rejects.toThrow()
       await expect(fs.stat(path.join(projectDir, "source", "note.pdf"))).rejects.toThrow()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("POST /project/workflow/note/import rejects html preview files", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      const form = new FormData()
+      form.append("file", new File(["<h1>not a note</h1>"], "note.html", { type: "text/html" }))
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
+        method: "POST",
+        body: form,
+      }))
+      expect(res.status).toBe(400)
+      await expect(fs.stat(path.join(projectDir, "workflows", "active", "note.md"))).rejects.toThrow()
+      await expect(fs.stat(path.join(projectDir, "source", "note.html"))).rejects.toThrow()
     } finally {
       process.chdir(originalCwd)
     }

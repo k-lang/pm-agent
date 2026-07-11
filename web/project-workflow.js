@@ -1306,7 +1306,7 @@ function renderResources() {
   const visibleResources = resourceMode === 'notes' ? archivedNotes : resources
   const emptyPreview = resourceMode === 'notes'
     ? '图操作提交后，active 工作笔记会归档到 notes/，这里会展示过往工作笔记。'
-    : '可以上传 txt、md 或其他附件；当前只支持预览 txt 和 markdown。'
+    : '可以上传 txt、md、html、图片或其他附件；当前支持预览文本、Markdown、HTML 和常见图片。'
   const emptyList = resourceMode === 'notes' ? '还没有过往工作笔记。' : '还没有用户上传资料。'
   if (!visibleResources.length) {
     resourcePreview.innerHTML = `<div class="placeholder">${esc(emptyPreview)}</div>`
@@ -1808,6 +1808,19 @@ async function previewResource(resourcePath) {
     const preview = await fetchJson(API + `${endpoint}?project=${encodeURIComponent(project.name)}&path=${encodeURIComponent(resourcePath)}`)
     if (preview.type === 'text') {
       resourcePreview.innerHTML = `<pre class="resource-preview-text">${esc(preview.content)}</pre>`
+      return
+    }
+    if (preview.type === 'image') {
+      const imageUrl = preview.imageUrl || preview.dataUrl || ''
+      resourcePreview.innerHTML = `
+        <div class="resource-preview-image-wrap">
+          <img class="resource-preview-image" src="${esc(imageUrl)}" alt="${esc(preview.name || resourcePath)}">
+        </div>
+      `
+      return
+    }
+    if (preview.type === 'html') {
+      resourcePreview.innerHTML = `<iframe class="resource-preview-frame" sandbox srcdoc="${esc(preview.content || '')}" title="${esc(preview.name || resourcePath)}"></iframe>`
       return
     }
     resourcePreview.innerHTML = `
