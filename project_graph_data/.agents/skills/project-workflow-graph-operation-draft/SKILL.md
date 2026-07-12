@@ -11,6 +11,12 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 你不是直接修改正式图数据，也不要直接写最终 `operations.json`。你要先生成给人看的自然语言说明，再生成压缩的结构化 `operations.draft.json`，把它们写入 active workflow 草案区，最后通过 `workflow_action` 登记这些草案产物已经写好。后端执行层会从 draft 编译生成 `operations.json`、`operation_index.json`、`validation.json`、`preview.json` 和 `preview_graph`；校验通过时，图谱预览会同步生成。用户审核的是自然语言化的图操作说明、代码派生的图操作索引和图谱预览，不是让用户手改内部 JSON。
 
+## 使用前提
+
+只有在用户明确要求或明确同意生成/预览/更新图操作、更新项目图谱、生成图操作草案之后，主 Agent 才能使用本 Skill。工作笔记充分、状态机允许生成图操作，只代表“可以建议进入下一步”，不代表可以自动生成。若用户尚未明确授权，主 Agent 应先询问是否现在生成图操作草案。
+
+本 Skill 只处理图操作说明和图操作草案，不负责写工作笔记。`workflows/active/note.md` 只能记录项目事实、背景材料、计划调整、工作过程、结果、评审结论、影响评估、附件引用和待确认问题；不要把图操作、项目图谱、节点、边、校验、预览或 operations 文件信息写进工作笔记。
+
 ## 必须独立审查
 
 写入 `workflows/active/operation_notes.md` 和 `workflows/active/operations.draft.json` 后，不要直接调用 `workflow_action` 登记图操作草案。必须先调用 Task 工具启动 `project_workflow_graph_operation_reviewer` subagent 做独立只读审查。
@@ -235,7 +241,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 结果 `result` 表达工作产物、结论或验证结果带来的影响：
 
-- `result -> issue` 用 `affects_issue`：结果改变了对问题的认识、严重性、处理方式或解决进度。
+- `result -> issue` 用 `affects_issue`：结果直接修正了对问题的认识、严重性、处理方式或认知边界。它不是“问题解决度推进”的主表达；issue 的 `status` / `resolution_score` 通常应由具体 `work_item` 的分析、验证、修复、复盘和后续 `update_node issue` 推进。
 - `result -> goal` 用 `generates_result`：结果促成一个新目标或使目标成立。
 - `result -> goal` 用 `adjusts_result`：结果改变已有目标的状态、范围、完成度或判断。
 - `result -> goal` 用 `cancels_result`：结果使已有目标不再成立。
