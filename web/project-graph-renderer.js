@@ -15,7 +15,7 @@ const LAYOUT = {
   eventGapY: 180,
   eventOffsetX: 360,
   issueY: 240,
-  issueGapX: 300,
+  issueGapX: NODE_SIZE.issue.width + 120,
   goalY: 510,
   subgoalY: 840,
   topWorkBlockY: 1200,
@@ -93,6 +93,11 @@ function groupBy(items, getKey) {
   return map
 }
 
+function centeredRowWidth(count, nodeWidth, centerGap) {
+  if (!count) return 0
+  return nodeWidth + (count - 1) * centerGap
+}
+
 function getNodeSize(type) {
   return NODE_SIZE[type] || { width: 180, height: 60 }
 }
@@ -151,7 +156,7 @@ function buildCollapsedCommunities(nodes) {
 }
 
 function measureCollapsedCommunity(community) {
-  const issueWidth = Math.max(1, community.issues.length) * LAYOUT.issueGapX
+  const issueWidth = centeredRowWidth(community.issues.length, NODE_SIZE.issue.width, LAYOUT.issueGapX)
   const topWorkWidth = Math.max(1, community.topWorkBlocks.length) * LAYOUT.topWorkGapX
   const subgoalBranchWidth = community.subgoalColumns.reduce((sum, column) => {
     const workWidth = Math.max(1, column.workBlocks.length) * 165
@@ -369,7 +374,7 @@ function placeHolderExpandedWidth(cluster, edges) {
 }
 
 function measureExpandedCommunity(community, edges) {
-  const issueWidth = Math.max(1, community.issues.length) * LAYOUT.issueGapX
+  const issueWidth = centeredRowWidth(community.issues.length, NODE_SIZE.issue.width, LAYOUT.issueGapX)
   const topWidth = community.topBlocks.reduce((sum, cluster) => sum + placeHolderExpandedWidth(cluster, edges), 0)
   const subWidth = community.subgoalColumns.reduce((sum, column) => sum + Math.max(LAYOUT.subgoalGapX, column.blocks.reduce((inner, cluster) => inner + placeHolderExpandedWidth(cluster, edges), 0) || LAYOUT.subgoalGapX), 0)
   return Math.max(600, issueWidth, topWidth + (topWidth && subWidth ? LAYOUT.branchGapX : 0) + subWidth)

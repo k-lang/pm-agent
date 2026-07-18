@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  NODE_SIZE,
   defaultGraphPositions,
   isEdgeHighlighted,
   normalizeGraphPayload,
@@ -53,6 +54,24 @@ describe("project graph renderer helpers", () => {
     expect(layout.positions.work_item_main).toBeDefined()
     expect(layout.positions.result_main).toBeDefined()
     expect(layout.containers.work_block_main).toMatchObject({ blockId: "work_block_main" })
+  })
+
+  test("keeps issue rows centered and prevents overlap in both graph views", () => {
+    const issueNodes = [
+      { id: "goal_issue_owner", type: "goal", summary: "问题所属目标", firstStep: 0, communityGoalId: "goal_issue_owner" },
+      { id: "issue_first", type: "issue", summary: "第一个问题", firstStep: 1, communityGoalId: "goal_issue_owner" },
+      { id: "issue_second", type: "issue", summary: "第二个问题", firstStep: 2, communityGoalId: "goal_issue_owner" },
+    ]
+
+    for (const view of ["collapsed", "expanded"]) {
+      const { positions } = defaultGraphPositions(issueNodes, [], view)
+      const firstX = positions.issue_first.x
+      const secondX = positions.issue_second.x
+      const goalX = positions.goal_issue_owner.x
+
+      expect(secondX - firstX).toBeGreaterThan(NODE_SIZE.issue.width)
+      expect((firstX + secondX) / 2).toBe(goalX)
+    }
   })
 
   test("does not use selected-node incident edge highlighting in draft preview mode", () => {
