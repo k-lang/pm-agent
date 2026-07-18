@@ -2,13 +2,15 @@ import fs from "fs/promises"
 import path from "path"
 import z from "zod"
 import { GraphEngine } from "@/graph/engine"
-import { EdgeType, GraphCommand, NODE_DRAFT_FIELD_KEYS, NodeType, type GraphCommand as GraphCommandData } from "@/graph/schema"
+import { EdgeType, GraphCommand, GraphSnapshot, NODE_DRAFT_FIELD_KEYS, NodeType, type GraphCommand as GraphCommandData } from "@/graph/schema"
 import { GraphStorage } from "@/graph/storage"
+import { GraphVersionStore } from "@/graph/version-store"
 import { ProjectWorkflow } from "./state"
 import { loadExpandedGraph } from "../../standalone-graph/transform"
 import type { GraphPayload } from "../../standalone-graph/types"
 
 export namespace ProjectWorkflowExecution {
+  const applyingProjects = new Set<string>()
   export const OperationArtifactSnapshot = z.object({
     workflow: ProjectWorkflow.ActionResult,
     files: z.array(z.object({
@@ -75,6 +77,7 @@ export namespace ProjectWorkflowExecution {
     snapshot: z.string().optional(),
     operationsPath: z.string(),
     archivePath: z.string().optional(),
+    graphVersion: z.string().optional(),
     notePath: z.string().optional(),
     result: z.unknown().optional(),
     errors: z.array(z.string()).default([]),
@@ -167,7 +170,7 @@ export namespace ProjectWorkflowExecution {
         message: `changelog_entry 必须包含 change_id：${draft.change_id}`,
       })
     }
-    const rawNoteFileBase = String(draft.note_filename).replace(/\.md$/iu, "")
+    const rawNoteFileBase = draft.note_filename.replace(/\.md$/iu, "")
     const noteFileBase = safePathSegment(rawNoteFileBase)
     const changeIDBase = safePathSegment(draft.change_id)
     if (!/[A-Za-z0-9]/u.test(rawNoteFileBase)) {
@@ -235,10 +238,6 @@ export namespace ProjectWorkflowExecution {
     return artifactPath(directory, "preview_graph.building")
   }
 
-  function applyBackupDir(directory: string) {
-    return artifactPath(directory, "apply_backup.building")
-  }
-
   function projectStatePath(directory: string) {
     return path.join(directory, "metadata", "project_state.json")
   }
@@ -260,6 +259,30 @@ export namespace ProjectWorkflowExecution {
     return fs.readFile(file, "utf8").catch(() => undefined)
   }
 
+  async function syncDirectory(directory: string) {
+    const handle = await fs.open(directory, "r")
+    try {
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  }
+
+  async function atomicWriteText(file: string, content: string) {
+    const temporary = `${file}.preparing`
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    await fs.rm(temporary, { force: true })
+    const handle = await fs.open(temporary, "w")
+    try {
+      await handle.writeFile(content, "utf8")
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await fs.rename(temporary, file)
+    await syncDirectory(path.dirname(file))
+  }
+
   async function fileExists(file: string) {
     return !!(await fs.stat(file).catch(() => undefined))
   }
@@ -271,6 +294,14 @@ export namespace ProjectWorkflowExecution {
 
   async function readJsonValue(file: string) {
     return JSON.parse(await fs.readFile(file, "utf8"))
+  }
+
+  async function readActiveWorkflowState(directory: string) {
+    return readJsonFile(artifactPath(directory, "state.json"), ProjectWorkflow.State).catch(() => undefined)
+  }
+
+  async function graphOperationBaseDirectory(directory: string) {
+    return GraphVersionStore.resolveActiveBase(directory)
   }
 
   function dropUndefined(input: Record<string, unknown>) {
@@ -287,10 +318,6 @@ export namespace ProjectWorkflowExecution {
 
   function escapeRegExp(value: string) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  }
-
-  function stripHistoryVersionPrefix(description: string, version: string) {
-    return description.replace(new RegExp(`^\\[${escapeRegExp(version)}\\]\\s*`, "u"), "")
   }
 
   function notePathForFilename(filename: string) {
@@ -468,7 +495,7 @@ export namespace ProjectWorkflowExecution {
   }
 
   async function buildHistoryContexts(directory: string, draft: WorkflowOperationDraft) {
-    const storage = new GraphStorage(directory)
+    const storage = new GraphStorage(await graphOperationBaseDirectory(directory))
     const contexts = new Map<string, string[]>()
     const nodeInfos = new Map<string, NodeInfo>()
 
@@ -545,8 +572,192 @@ export namespace ProjectWorkflowExecution {
     return typeof input === "string" ? input : input.value
   }
 
+  function isDeprecationIntent(item: WorkflowOperationDraft["items"][number]) {
+    const source = item as Record<string, unknown>
+    const explicit = source.correction_intent ?? source.intent ?? source.deprecation ?? source.deprecated
+    if (explicit === true) return true
+    return typeof explicit === "string" && /^(?:deprecate|deprecated|logical_delete|delete|废弃|作废|删除)$/iu.test(explicit.trim())
+  }
+
+  const softCorrectionAuditPatterns = [
+    /(?:本次|此次|本轮|这次|追加|经过|经由|经)(?:软)?(?:更正|修正|纠正|修改|补录)/u,
+    /(?:更正|修正|纠正|修改|补录)[^。；，\n]{0,16}(?:之后|以后|后(?!续)|之前|过程|记录)/u,
+    /(?:原图|旧图|原记录|旧记录|历史记录)(?:中|里|的)?(?:遗漏|错误|不准确|缺失)/u,
+    /(?:补充|修复|纠正|更正)(?:了|原图|旧图|原记录|旧记录)?(?:遗漏|错误|缺失)/u,
+    /\bcorrection\b/iu,
+  ]
+
+  function softCorrectionCurrentDescriptions(item: WorkflowOperationDraft["items"][number]) {
+    if (item.kind === "create_node") return [["description", item.description]] as const
+    if (item.kind === "update_node") return [["description", item.description], ["description_delta", item.description_delta]] as const
+    if (item.kind === "create_edge") return [["description", item.description]] as const
+    return [["new_description", item.new_description], ["description_delta", item.description_delta]] as const
+  }
+
+  function softCorrectionDescriptionIssues(draft: WorkflowOperationDraft) {
+    const issues: ReturnType<typeof graphIssue>[] = []
+    draft.items.forEach((item, index) => {
+      for (const [field, value] of softCorrectionCurrentDescriptions(item)) {
+        if (!value) continue
+        const matched = softCorrectionAuditPatterns.map((pattern) => value.match(pattern)?.[0]).find(Boolean)
+        if (!matched) continue
+        issues.push(graphIssue(
+          `operations.draft.json items[${index}].${field} 当前概述包含更正过程或审计措辞“${matched}”。软更正当前概述只能写更正后的当前有效事实；原先哪里错误、遗漏以及本轮如何更正只能写入 item.history。`,
+        ))
+      }
+    })
+    return issues
+  }
+
+  async function buildSoftCorrectionPlan(directory: string, draft: WorkflowOperationDraft) {
+    const storage = new GraphStorage(await graphOperationBaseDirectory(directory))
+    const [allEdges, allNodes] = await Promise.all([storage.getAllEdges(), storage.getAllNodes()])
+    const activeEdges = await storage.getActiveEdges({ nodes: allNodes, edges: allEdges })
+    const updatedNodeIds = new Set<string>()
+    const updatedEdgeIds = new Set<string>()
+    const issues = softCorrectionDescriptionIssues(draft)
+    const structuralNodeUpdates = new Map<string, Record<string, unknown>>()
+
+    for (const item of draft.items) {
+      if (item.kind === "update_node") updatedNodeIds.add(item.node_id)
+      if (item.kind === "update_edge") updatedEdgeIds.add(item.edge_id)
+    }
+
+    const requireNodeUpdate = (source: string, nodeID: string, reason: string) => {
+      if (updatedNodeIds.has(nodeID)) return
+      issues.push(graphIssue(`软更正废弃 ${source} 需要级联覆盖节点 ${nodeID}：${reason}。请在 operations.draft.json.items 中补充 update_node，由模型写清楚该节点当前概述和本轮 correction history。`))
+    }
+    const requireEdgeUpdate = (source: string, edgeID: string, reason: string) => {
+      if (updatedEdgeIds.has(edgeID)) return
+      issues.push(graphIssue(`软更正废弃 ${source} 需要级联覆盖边 ${edgeID}：${reason}。请在 operations.draft.json.items 中补充 update_edge，由模型写清楚该关系当前有效性和本轮 correction history。`))
+    }
+
+    const nodeById = new Map(allNodes.map((node) => [node.id, node]))
+    const edgeById = new Map(allEdges.map((edge) => [edge.id, edge]))
+    const incidentEdges = (nodeID: string) => activeEdges.filter((edge) => edge.from_node_id === nodeID || edge.to_node_id === nodeID)
+
+    const createdNodeIds = new Set(draft.items.flatMap((item) => item.kind === "create_node" ? [item.temp_id] : []))
+    draft.items.forEach((item, index) => {
+      if (item.kind !== "create_edge") return
+      for (const nodeID of new Set([item.from_node, item.to_node])) {
+        if (createdNodeIds.has(nodeID) || updatedNodeIds.has(nodeID) || !nodeById.has(nodeID)) continue
+        issues.push(graphIssue(
+          `operations.draft.json items[${index}] 新增边连接已有端点 ${nodeID}，但缺少该端点的 update_node。请补充 update_node，使节点 description 的可读历史记录体现本轮新增关系；不要手写 incoming_edges/outgoing_edges 或节点顶层结构化 history[]。`,
+        ))
+      }
+    })
+
+    const propertyRelatedNodeIds = (nodeID: string) => {
+      const node = nodeById.get(nodeID)
+      if (!node) return []
+      const ids = new Set<string>()
+      if (node.type === "goal") {
+        for (const blockID of node.linked_work_blocks) ids.add(blockID)
+        for (const candidate of allNodes) {
+          if (candidate.type === "work_block" && candidate.linked_goal_id === node.id) ids.add(candidate.id)
+        }
+      }
+      if (node.type === "work_block") {
+        if (node.linked_goal_id) ids.add(node.linked_goal_id)
+        for (const itemID of node.work_items) ids.add(itemID)
+        for (const candidate of allNodes) {
+          if (candidate.type === "work_item" && candidate.linked_work_block_id === node.id) ids.add(candidate.id)
+        }
+      }
+      if (node.type === "work_item" && node.linked_work_block_id) ids.add(node.linked_work_block_id)
+      ids.delete(nodeID)
+      return [...ids]
+    }
+
+    const patchNode = (nodeID: string, updates: Record<string, unknown>) => {
+      structuralNodeUpdates.set(nodeID, { ...structuralNodeUpdates.get(nodeID), ...updates })
+    }
+    const patchedStringList = (nodeID: string, field: "incoming_edges" | "outgoing_edges" | "linked_work_blocks" | "work_items") => {
+      const patched = structuralNodeUpdates.get(nodeID)?.[field]
+      if (Array.isArray(patched)) return patched.filter((value): value is string => typeof value === "string")
+      const current = (nodeById.get(nodeID) as unknown as Record<string, unknown> | undefined)?.[field]
+      return Array.isArray(current) ? current : []
+    }
+    const removeEdgeReferences = (edge: typeof allEdges[number]) => {
+      patchNode(edge.from_node_id, {
+        outgoing_edges: patchedStringList(edge.from_node_id, "outgoing_edges").filter((id) => id !== edge.id),
+      })
+      patchNode(edge.to_node_id, {
+        incoming_edges: patchedStringList(edge.to_node_id, "incoming_edges").filter((id) => id !== edge.id),
+      })
+    }
+
+    const deprecatedEdgeIDs = new Set<string>()
+    const deprecatedNodeIDs = new Set<string>()
+    for (const item of draft.items) {
+      if (!isDeprecationIntent(item)) continue
+      if (item.kind === "update_edge") deprecatedEdgeIDs.add(item.edge_id)
+      if (item.kind === "update_node") deprecatedNodeIDs.add(item.node_id)
+    }
+    for (const nodeID of deprecatedNodeIDs) {
+      for (const edge of incidentEdges(nodeID)) deprecatedEdgeIDs.add(edge.id)
+    }
+
+    for (const edgeID of deprecatedEdgeIDs) {
+      const edge = edgeById.get(edgeID)
+      if (!edge) continue
+      removeEdgeReferences(edge)
+      requireNodeUpdate(`边 ${edgeID}`, edge.from_node_id, "逻辑废弃关系后，起点节点也需要追加更正历史并更新当前关系认知")
+      requireNodeUpdate(`边 ${edgeID}`, edge.to_node_id, "逻辑废弃关系后，终点节点也需要追加更正历史并更新当前关系认知")
+    }
+
+    for (const nodeID of deprecatedNodeIDs) {
+      const node = nodeById.get(nodeID)
+      if (!node) continue
+      for (const edge of incidentEdges(nodeID)) {
+        requireEdgeUpdate(`节点 ${nodeID}`, edge.id, "逻辑废弃节点会影响与它相连的关系")
+        const otherNodeID = edge.from_node_id === nodeID ? edge.to_node_id : edge.from_node_id
+        requireNodeUpdate(`节点 ${nodeID}`, otherNodeID, `逻辑废弃节点会影响相邻节点 ${otherNodeID} 的当前关系认知`)
+      }
+      for (const relatedNodeID of propertyRelatedNodeIds(nodeID)) {
+        requireNodeUpdate(`节点 ${nodeID}`, relatedNodeID, "逻辑废弃节点会影响 linked_goal_id / linked_work_block_id 等属性关系")
+      }
+
+      if (node.type === "goal") {
+        const blockIDs = propertyRelatedNodeIds(nodeID)
+        patchNode(nodeID, { linked_work_blocks: [] })
+        for (const blockID of blockIDs) patchNode(blockID, { linked_goal_id: null })
+      }
+      if (node.type === "work_block") {
+        const itemIDs = propertyRelatedNodeIds(nodeID).filter((id) => nodeById.get(id)?.type === "work_item")
+        if (node.linked_goal_id) {
+          patchNode(node.linked_goal_id, {
+            linked_work_blocks: patchedStringList(node.linked_goal_id, "linked_work_blocks").filter((id) => id !== nodeID),
+          })
+        }
+        patchNode(nodeID, { linked_goal_id: null, work_items: [] })
+        for (const itemID of itemIDs) patchNode(itemID, { linked_work_block_id: null })
+      }
+      if (node.type === "work_item" && node.linked_work_block_id) {
+        patchNode(node.linked_work_block_id, {
+          work_items: patchedStringList(node.linked_work_block_id, "work_items").filter((id) => id !== nodeID),
+        })
+        patchNode(nodeID, { linked_work_block_id: null })
+      }
+    }
+
+    return { issues, structuralNodeUpdates }
+  }
+
+  function applySoftCorrectionStructure(command: GraphCommandData, structuralNodeUpdates: Map<string, Record<string, unknown>>) {
+    return GraphCommand.parse({
+      ...command,
+      operations: command.operations.map((operation) => {
+        if (operation.type !== "update_node") return operation
+        const structural = structuralNodeUpdates.get(operation.node_id)
+        if (!structural) return operation
+        return { ...operation, updates: { ...operation.updates, ...structural } }
+      }),
+    })
+  }
+
   async function compileCompressedDraft(directory: string, draft: WorkflowOperationDraft): Promise<GraphCommandData> {
-    const storage = new GraphStorage(directory)
+    const storage = new GraphStorage(await graphOperationBaseDirectory(directory))
     const operations: GraphCommandData["operations"] = []
     const historyDescriptions: Record<string, string> = {}
     const historyContexts = await buildHistoryContexts(directory, draft)
@@ -653,31 +864,22 @@ export namespace ProjectWorkflowExecution {
     return candidate
   }
 
-  function notePathFromCommandDetailUrl(command: GraphCommandData) {
-    for (const operation of command.operations) {
-      if (operation.type === "create_node" && operation.data.type === "work_item" && typeof operation.data.detail_url === "string") {
-        return operation.data.detail_url
-      }
-      if (operation.type === "update_node" && typeof operation.updates.detail_url === "string") return operation.updates.detail_url
-    }
-    return undefined
-  }
-
-  async function commandWithWorkflowNoteLink(directory: string, command: GraphCommandData, noteFilename?: string) {
+  async function prepareWorkflowNoteArchive(
+    directory: string,
+    command: GraphCommandData,
+    noteFilename: string,
+    options: { storageDirectory?: string } = {},
+  ) {
     const note = await readOptionalText(artifactPath(directory, "note.md"))
-    if (!note?.trim()) return { command, note, notePath: undefined, changed: false }
+    if (!note?.trim()) throw new Error("缺少 workflows/active/note.md，不能归档本轮工作笔记。")
 
-    const commandNotePath = notePathFromCommandDetailUrl(command)
-    if (!noteFilename && !commandNotePath) {
-      throw new Error("operations.json 缺少由 note_filename 编译得到的 work_item.detail_url，不能用 change_id 机械归档工作笔记。")
-    }
-    const preferredNotePath = noteFilename ? notePathForFilename(noteFilename) : commandNotePath!
-    const notePath = noteFilename ? await uniqueNotePath(directory, preferredNotePath) : preferredNotePath
-    const storage = new GraphStorage(directory)
+    const preferredNotePath = notePathForFilename(noteFilename)
+    const storageDirectory = options.storageDirectory ?? directory
+    const notePath = await uniqueNotePath(storageDirectory, preferredNotePath)
     let changed = false
-    const operations = await Promise.all(command.operations.map(async (operation) => {
-      if (operation.type === "create_node" && operation.data.type === "work_item") {
-        if (operation.data.detail_url === notePath) return operation
+    const operations = command.operations.map((operation) => {
+      if (operation.type === "create_node" && operation.data.detail_url === preferredNotePath) {
+        if (preferredNotePath === notePath) return operation
         changed = true
         return {
           ...operation,
@@ -687,11 +889,8 @@ export namespace ProjectWorkflowExecution {
           },
         }
       }
-      if (operation.type === "update_node") {
-        const node = await storage.getNodeById(operation.node_id)
-        const nextType = typeof operation.updates.type === "string" ? operation.updates.type : node?.type
-        if (nextType !== "work_item") return operation
-        if (operation.updates.detail_url === notePath) return operation
+      if (operation.type === "update_node" && operation.updates.detail_url === preferredNotePath) {
+        if (preferredNotePath === notePath) return operation
         changed = true
         return {
           ...operation,
@@ -702,7 +901,7 @@ export namespace ProjectWorkflowExecution {
         }
       }
       return operation
-    }))
+    })
 
     return {
       command: changed ? GraphCommand.parse({ ...command, operations }) : command,
@@ -710,6 +909,12 @@ export namespace ProjectWorkflowExecution {
       notePath,
       changed,
     }
+  }
+
+  function changelogEntryWithNotePath(entry: string, notePath: string | undefined) {
+    const result = entry.trim()
+    if (!notePath || result.includes(notePath)) return result
+    return `${result.replace(/[。；;\s]+$/u, "")}；工作笔记：${notePath}。`
   }
 
   function graphEdgeRenderId(edge: { from_node_id: string; to_node_id: string; type: string }) {
@@ -762,7 +967,7 @@ export namespace ProjectWorkflowExecution {
   }
 
   async function buildOperationIndex(command: GraphCommandData, directory: string) {
-    const storage = new GraphStorage(directory)
+    const storage = new GraphStorage(await graphOperationBaseDirectory(directory))
     const storageNodes = new Map<string, { summary?: string; type?: string }>()
     const updateEdgeInfo = new Map<string, { sourceNodeId: string; targetNodeId: string; edgeType: string; renderEdgeId: string }>()
     for (const operation of command.operations) {
@@ -969,21 +1174,31 @@ export namespace ProjectWorkflowExecution {
       "operation_index.json",
       "validation.json",
       "preview.json",
+      "apply_result.json",
+      "apply_result.json.preparing",
+      "step.md",
+      "step.md.preparing",
     ]
     await Promise.all([
       ...files.map((file) => fs.rm(artifactPath(input.directory, file), { force: true })),
       fs.rm(previewGraphDir(input.directory), { recursive: true, force: true }),
       fs.rm(previewGraphBuildDir(input.directory), { recursive: true, force: true }),
     ])
+    await GraphVersionStore.cleanup(input.directory)
   }
 
   async function clearValidationAndPreview(directory: string) {
     await Promise.all([
       fs.rm(artifactPath(directory, "validation.json"), { force: true }),
       fs.rm(artifactPath(directory, "preview.json"), { force: true }),
+      fs.rm(artifactPath(directory, "apply_result.json"), { force: true }),
+      fs.rm(artifactPath(directory, "apply_result.json.preparing"), { force: true }),
+      fs.rm(artifactPath(directory, "step.md"), { force: true }),
+      fs.rm(artifactPath(directory, "step.md.preparing"), { force: true }),
       fs.rm(previewGraphDir(directory), { recursive: true, force: true }),
       fs.rm(previewGraphBuildDir(directory), { recursive: true, force: true }),
     ])
+    await GraphVersionStore.cleanup(directory)
   }
 
   async function prepareOperationArtifactManifest(input: {
@@ -1008,9 +1223,14 @@ export namespace ProjectWorkflowExecution {
       fs.rm(artifactPath(input.directory, "changelog_entry.txt"), { force: true }),
       fs.rm(artifactPath(input.directory, "operation_index.json"), { force: true }),
       fs.rm(artifactPath(input.directory, "operations.json"), { force: true }),
+      fs.rm(artifactPath(input.directory, "apply_result.json"), { force: true }),
+      fs.rm(artifactPath(input.directory, "apply_result.json.preparing"), { force: true }),
+      fs.rm(artifactPath(input.directory, "step.md"), { force: true }),
+      fs.rm(artifactPath(input.directory, "step.md.preparing"), { force: true }),
       fs.rm(previewGraphDir(input.directory), { recursive: true, force: true }),
       fs.rm(previewGraphBuildDir(input.directory), { recursive: true, force: true }),
     ])
+    await GraphVersionStore.cleanup(input.directory)
   }
 
   async function operationArtifactStatus(directory: string) {
@@ -1026,6 +1246,16 @@ export namespace ProjectWorkflowExecution {
       hasOperationIndex: operationIndex,
       hasExecutableCommand: operations,
     }
+  }
+
+  async function discardActiveBeforeCorrection(input: { project: string; directory: string }) {
+    await ProjectWorkflow.runAction({
+      project: input.project,
+      directory: input.directory,
+      action: "放弃草案",
+      payload: {},
+    })
+    await GraphVersionStore.cleanup(input.directory)
   }
 
   export async function readOperationArtifacts(input: { project: string; directory?: string }): Promise<OperationArtifactSnapshot> {
@@ -1048,11 +1278,15 @@ export namespace ProjectWorkflowExecution {
     return OperationArtifactSnapshot.parse({ workflow, files })
   }
 
-  export async function validateOperations(input: { directory: string }) {
-    const storage = new GraphStorage(input.directory)
+  export async function validateOperations(input: { directory: string; extraIssues?: ReturnType<typeof graphIssue>[] }) {
+    const storage = new GraphStorage(await graphOperationBaseDirectory(input.directory))
     const engine = new GraphEngine(storage)
-    const validationResult = await engine.validateCommand(await readJsonValue(artifactPath(input.directory, "operations.json")))
-    const errors = validationResult.issues
+    const state = await readActiveWorkflowState(input.directory)
+    const validationResult = await engine.validateCommand(
+      await readJsonValue(artifactPath(input.directory, "operations.json")),
+      { allowDerivedNodeUpdates: ProjectWorkflow.usesCorrectionWorkflowSemantics(state) },
+    )
+    const errors = [...validationResult.issues, ...(input.extraIssues ?? [])]
     return writeValidation({
       directory: input.directory,
       passed: errors.every((issue) => issue.severity !== "error"),
@@ -1076,13 +1310,53 @@ export namespace ProjectWorkflowExecution {
 
     const draft = WorkflowOperationDraft.safeParse(raw)
     if (draft.success) {
-      const command = (await commandWithWorkflowNoteLink(input.directory, normalizeCommand(await compileCompressedDraft(input.directory, draft.data)), draft.data.note_filename)).command
+      const state = await readActiveWorkflowState(input.directory)
+      const correction = state?.correction
+      const hardCorrection = state?.hardCorrection
+      const extraIssues: ReturnType<typeof graphIssue>[] = []
+      let structuralNodeUpdates: Map<string, Record<string, unknown>> | undefined
+      if (hardCorrection) {
+        if (draft.data.change_id !== hardCorrection.expectedChangeId) {
+          const validation = await writeValidation({
+            directory: input.directory,
+            passed: false,
+            change_id: draft.data.change_id,
+            issues: [graphIssue(`本轮恢复草案必须使用后端指定 change_id：${hardCorrection.expectedChangeId}，不能使用 ${draft.data.change_id}。`)],
+          })
+          return { ok: false as const, validation }
+        }
+      } else if (!correction) {
+        const expectedPrefix = await nextRegularStepChangeIdPrefix(input.directory)
+        if (!draft.data.change_id.startsWith(expectedPrefix)) {
+          extraIssues.push(graphIssue(`普通工作推进 change_id 必须使用后端推导的 step 前缀：${expectedPrefix}...，不能使用 ${draft.data.change_id}。首轮提交从 step0_ 开始。`))
+        }
+      } else {
+        if (!draft.data.change_id.startsWith(correction.expectedChangeId)) {
+          extraIssues.push(graphIssue(`软更正 change_id 必须以后端指定前缀 ${correction.expectedChangeId} 开头，不能使用 ${draft.data.change_id}。`))
+        }
+      }
+      if (ProjectWorkflow.usesCorrectionWorkflowSemantics(state)) {
+        const plan = await buildSoftCorrectionPlan(input.directory, draft.data)
+        extraIssues.push(...plan.issues)
+        structuralNodeUpdates = plan.structuralNodeUpdates
+      }
+      const compiled = normalizeCommand(await compileCompressedDraft(input.directory, draft.data))
+      const structured = structuralNodeUpdates ? applySoftCorrectionStructure(compiled, structuralNodeUpdates) : compiled
+      const prepared = await prepareWorkflowNoteArchive(
+        input.directory,
+        structured,
+        draft.data.note_filename,
+        {
+          storageDirectory: await graphOperationBaseDirectory(input.directory),
+        },
+      )
+      const command = prepared.command
       await Promise.all([
-        writeChangelogDraft(input.directory, draft.data.changelog_entry),
+        writeChangelogDraft(input.directory, changelogEntryWithNotePath(draft.data.changelog_entry, prepared.notePath)),
         fs.writeFile(artifactPath(input.directory, "operations.json"), JSON.stringify(command, null, 2) + "\n", "utf8"),
         fs.writeFile(artifactPath(input.directory, "operation_index.json"), JSON.stringify(await buildOperationIndex(command, input.directory), null, 2) + "\n", "utf8"),
       ])
-      return { ok: true as const, command }
+      return { ok: true as const, command, extraIssues }
     }
 
     const validation = await writeValidation({
@@ -1118,13 +1392,8 @@ export namespace ProjectWorkflowExecution {
         fs.rm(artifactPath(input.directory, "preview.json"), { force: true }),
         fs.rm(tempDirectory, { recursive: true, force: true }),
       ])
-      await fs.mkdir(tempDirectory, { recursive: true })
-      for (const entry of ["nodes", "edges", "changes", "snapshots", "metadata"]) {
-        const source = path.join(input.directory, entry)
-        if (await fileExists(source)) {
-          await fs.cp(source, path.join(tempDirectory, entry), { recursive: true })
-        }
-      }
+      const baseDirectory = await graphOperationBaseDirectory(input.directory)
+      await GraphVersionStore.copyTo(baseDirectory, tempDirectory)
       const engine = new GraphEngine(new GraphStorage(tempDirectory))
       const result = await engine.executeCommand(command)
       if (!result.success) throw new Error(`预览 dry-run 执行失败：${result.errors.join("; ")}`)
@@ -1173,38 +1442,39 @@ export namespace ProjectWorkflowExecution {
     return preview
   }
 
-  async function backupGraphData(directory: string) {
-    const backup = applyBackupDir(directory)
-    await fs.rm(backup, { recursive: true, force: true })
-    await fs.mkdir(backup, { recursive: true })
-    const entries = ["nodes", "edges", "changes", "snapshots", "metadata", "descriptions_output", "notes"]
-    const existed: string[] = []
-    for (const entry of entries) {
-      const source = path.join(directory, entry)
-      if (await fileExists(source)) {
-        existed.push(entry)
-        await fs.cp(source, path.join(backup, entry), { recursive: true })
-      }
+  async function rewriteHardCorrectionDraftChangeId(directory: string, oldChangeId: string, expectedChangeId: string) {
+    const draftPath = artifactPath(directory, "operations.draft.json")
+    const raw = await readJsonValue(draftPath).catch(() => undefined)
+    if (!raw || typeof raw !== "object") return
+    const draft = raw as Record<string, unknown>
+    draft.change_id = expectedChangeId
+    if (typeof draft.changelog_entry === "string") {
+      draft.changelog_entry = draft.changelog_entry.split(oldChangeId).join(expectedChangeId)
     }
-    await fs.writeFile(path.join(backup, "manifest.json"), JSON.stringify({ entries, existed }, null, 2) + "\n", "utf8")
-    return { backup, entries, existed }
-  }
-
-  async function restoreGraphData(directory: string, backup: { backup: string; entries: string[]; existed: string[] }) {
-    for (const entry of backup.entries) {
-      await fs.rm(path.join(directory, entry), { recursive: true, force: true })
-      if (backup.existed.includes(entry)) {
-        await fs.cp(path.join(backup.backup, entry), path.join(directory, entry), { recursive: true })
-      }
+    if (Array.isArray(draft.items)) {
+      draft.items = draft.items.map((item) => {
+        if (!item || typeof item !== "object") return item
+        const next = { ...(item as Record<string, unknown>) }
+        if (typeof next.history === "string") {
+          const replaced = next.history.split(oldChangeId).join(expectedChangeId)
+          next.history = replaced.includes(`[${expectedChangeId}]`) ? replaced : `[${expectedChangeId}] ${replaced}`
+        }
+        return next
+      })
     }
+    await fs.writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8")
+    const changelogPath = artifactPath(directory, "changelog_entry.txt")
+    const changelog = await readOptionalText(changelogPath)
+    if (changelog) await fs.writeFile(changelogPath, changelog.split(oldChangeId).join(expectedChangeId), "utf8")
   }
 
-  async function cleanupApplyBackup(directory: string) {
-    await fs.rm(applyBackupDir(directory), { recursive: true, force: true })
-  }
-
-  async function cleanupArchivedApplyBackup(archiveDirectory: string) {
-    await fs.rm(path.join(archiveDirectory, "apply_backup.building"), { recursive: true, force: true })
+  async function rebuildRestoredHardCorrectionArtifacts(directory: string) {
+    let validation: ValidationArtifact
+    let preview: PreviewArtifact | undefined
+    const compiled = await compileOperationDraft({ directory })
+    validation = compiled.ok ? await validateOperations({ directory }) : compiled.validation
+    if (validation.passed) preview = await buildPreview({ directory })
+    return { validation, preview }
   }
 
   function nodeStatusLine(node: Awaited<ReturnType<GraphStorage["getAllNodes"]>>[number]) {
@@ -1230,7 +1500,7 @@ export namespace ProjectWorkflowExecution {
     for (const node of await storage.getAllNodes()) {
       const description = stripEmbeddedHistoryText(node.description || "")
       const summary = `${nodeStatusLine(node)}\n\n${description || node.summary || node.id}`.trimEnd() + "\n"
-      const history = node.history.map((item) => `- [${item.version}] ${stripHistoryVersionPrefix(item.description, item.version)}`).join("\n")
+      const history = renderReadableHistory(normalizeReadableHistoryLines(historySectionText(node.description)))
       await Promise.all([
         fs.writeFile(path.join(summaryDir, `${node.id}.txt`), summary, "utf8"),
         fs.writeFile(path.join(historyDir, `${node.id}.txt`), history ? history + "\n" : "", "utf8"),
@@ -1252,6 +1522,28 @@ export namespace ProjectWorkflowExecution {
     const existing = await readOptionalText(changelog)
     const prefix = existing?.trim() ? `${existing.trimEnd()}\n\n` : ""
     await fs.writeFile(changelog, `${prefix}${line}\n`, "utf8")
+  }
+
+  async function validateCandidateArtifacts(input: {
+    directory: string
+    command: GraphCommandData
+    snapshot?: string
+    notePath?: string
+  }) {
+    const storage = new GraphStorage(input.directory)
+    const nodes = await storage.getAllNodes()
+    if (input.snapshot) {
+      await readJsonFile(path.join(input.directory, "snapshots", `${input.snapshot}.json`), GraphSnapshot)
+    }
+    const changelog = await readOptionalText(path.join(input.directory, "changes", "changelog.txt"))
+    if (!changelog?.includes(input.command.change_id)) throw new Error(`候选图 changelog 缺少 ${input.command.change_id}。`)
+    for (const node of nodes) {
+      await Promise.all([
+        fs.readFile(path.join(input.directory, "descriptions_output", "description_summary", `${node.id}.txt`), "utf8"),
+        fs.readFile(path.join(input.directory, "descriptions_output", "history", `${node.id}.txt`), "utf8"),
+      ])
+    }
+    if (input.notePath) await fs.readFile(path.join(input.directory, input.notePath), "utf8")
   }
 
   async function writeStepArtifact(input: {
@@ -1286,7 +1578,7 @@ export namespace ProjectWorkflowExecution {
       `- 操作数：${input.command.operations.length}`,
       `- apply_result：${applyResultPath}`,
     ].join("\n")
-    await fs.writeFile(path.join(workflowDir, "step.md"), body.trimEnd() + "\n", "utf8")
+    await atomicWriteText(path.join(workflowDir, "step.md"), body.trimEnd() + "\n")
   }
 
   async function nextAppliedWorkflowTarget(directory: string, changeID: string) {
@@ -1309,7 +1601,7 @@ export namespace ProjectWorkflowExecution {
   }
 
   async function writeActiveWorkflowState(directory: string, state: ProjectWorkflow.State) {
-    await fs.writeFile(artifactPath(directory, "state.json"), JSON.stringify(ProjectWorkflow.State.parse(state), null, 2) + "\n", "utf8")
+    await atomicWriteText(artifactPath(directory, "state.json"), JSON.stringify(ProjectWorkflow.State.parse(state), null, 2) + "\n")
   }
 
   function appliedWorkflowState(state: ProjectWorkflow.State) {
@@ -1322,24 +1614,149 @@ export namespace ProjectWorkflowExecution {
     })
   }
 
-  async function writeApplyResult(directory: string, input: Omit<ApplyResultArtifact, "operationsPath"> & { operationsPath?: string }) {
-    const result = ApplyResultArtifact.parse({
+  function createApplyResult(input: Omit<ApplyResultArtifact, "operationsPath"> & { operationsPath?: string }) {
+    return ApplyResultArtifact.parse({
       ...input,
       operationsPath: input.operationsPath ?? "workflows/active/operations.json",
     })
-    await fs.writeFile(artifactPath(directory, "apply_result.json"), JSON.stringify(result, null, 2) + "\n", "utf8")
-    return result
   }
 
-  async function saveWorkflowNoteToNotes(directory: string, notePath: string | undefined, note: string | undefined) {
+  async function writeApplyResult(directory: string, result: ApplyResultArtifact) {
+    await atomicWriteText(artifactPath(directory, "apply_result.json"), JSON.stringify(ApplyResultArtifact.parse(result), null, 2) + "\n")
+  }
+
+  async function saveWorkflowNoteToNotes(directory: string, notePath: string | undefined, note: string | undefined, targetDirectory = directory) {
     if (!notePath || !note?.trim()) return undefined
-    const target = path.join(directory, notePath)
+    const target = path.join(targetDirectory, notePath)
     await fs.mkdir(path.dirname(target), { recursive: true })
     await fs.writeFile(target, note.trimEnd() + "\n", "utf8")
     return notePath
   }
 
-  export async function applyOperations(input: { project: string; directory: string; confirm: boolean }): Promise<ProjectWorkflow.ActionResult> {
+  function appliedArchiveTarget(directory: string, archivePath: string | undefined) {
+    if (!archivePath) throw new Error("已准备的提交缺少 archivePath。")
+    const root = path.resolve(appliedRoot(directory))
+    const target = path.resolve(directory, archivePath)
+    if (target === root || !target.startsWith(root + path.sep)) {
+      throw new Error("已准备的提交 archivePath 未指向 workflows/applied 下的归档目录。")
+    }
+    return target
+  }
+
+  async function ensurePreparedApplyArtifacts(input: {
+    directory: string
+    applyResult: ApplyResultArtifact
+  }) {
+    const { applyResult } = input
+    if (!applyResult.success || !applyResult.graphVersion) {
+      throw new Error("已准备的提交缺少有效 graphVersion。")
+    }
+    appliedArchiveTarget(input.directory, applyResult.archivePath)
+    const [candidate, command, operationNotes] = await Promise.all([
+      GraphVersionStore.resolveManagedVersion(input.directory, applyResult.graphVersion),
+      readJsonFile(artifactPath(input.directory, "operations.json"), GraphCommand),
+      readOptionalText(artifactPath(input.directory, "operation_notes.md")),
+    ])
+    if (command.change_id !== applyResult.change_id) {
+      throw new Error(`已准备的提交 change_id 与 operations.json 不一致：${applyResult.change_id} / ${command.change_id}。`)
+    }
+    await validateCandidateArtifacts({
+      directory: candidate,
+      command,
+      snapshot: applyResult.snapshot,
+      notePath: applyResult.notePath,
+    })
+    await writeStepArtifact({
+      directory: input.directory,
+      command,
+      operationNotes,
+      applyResult,
+      applyResultPath: `${applyResult.archivePath}/apply_result.json`,
+    })
+    return candidate
+  }
+
+  async function finishPublishedActive(input: {
+    project: string
+    directory: string
+    state: ProjectWorkflow.State
+    applyResult: ApplyResultArtifact
+    candidate?: string
+  }): Promise<ProjectWorkflow.ActionResult> {
+    const target = appliedArchiveTarget(input.directory, input.applyResult.archivePath)
+    if (!input.applyResult.archivePath || !input.applyResult.success) throw new Error("已发布 active 缺少有效 apply_result，不能完成归档。")
+    const candidate = input.candidate ?? await ensurePreparedApplyArtifacts({ directory: input.directory, applyResult: input.applyResult })
+    const latest = await GraphVersionStore.resolve(input.directory, "latest")
+    if (candidate !== latest) throw new Error("候选图尚未发布为 latest_graph，不能完成 active 归档。")
+    const snapshot = input.applyResult.snapshot
+    if (snapshot && !await fileExists(path.join(input.directory, "snapshots", `${snapshot}.json`))) {
+      throw new Error(`latest_graph 中缺少已发布快照 ${snapshot}，不能完成归档。`)
+    }
+    await writeActiveWorkflowState(input.directory, appliedWorkflowState(input.state))
+    await GraphVersionStore.removeActiveBase(input.directory)
+    const archivePath = await archiveAppliedWorkflow(input.directory, target)
+    await GraphVersionStore.cleanup(input.directory)
+    await markProjectGraphInitialized(input.directory).catch(() => undefined)
+    const refreshed = await getActive({ project: input.project, directory: input.directory })
+    return {
+      ...refreshed,
+      message: "图操作已应用到正式图数据，active workflow 已归档。",
+      data: { applyResult: input.applyResult, archivePath },
+    }
+  }
+
+  async function finishCommittedActiveIfNeededUnlocked(input: {
+    project: string
+    directory: string
+  }): Promise<ProjectWorkflow.ActionResult | undefined> {
+    const active = await ProjectWorkflow.getActive({ project: input.project, directory: input.directory })
+    if (!active.state) return undefined
+    const applyResultPath = artifactPath(input.directory, "apply_result.json")
+    if (!await fileExists(applyResultPath)) return undefined
+    const applyResult = await readJsonFile(applyResultPath, ApplyResultArtifact)
+    if (!applyResult.success) return undefined
+    if (!applyResult.graphVersion) {
+      throw new Error("active apply_result 缺少 graphVersion，无法判断提交是否已经发布；已阻止覆盖或删除 active。")
+    }
+
+    return resumePreparedApply({
+      project: input.project,
+      directory: input.directory,
+      state: active.state,
+      applyResult,
+    })
+  }
+
+  export async function finishCommittedActiveIfNeeded(input: {
+    project: string
+    directory: string
+  }): Promise<ProjectWorkflow.ActionResult | undefined> {
+    const key = path.resolve(input.directory)
+    if (applyingProjects.has(key)) throw new Error("当前项目正在应用图操作，请等待本次提交完成。")
+    applyingProjects.add(key)
+    try {
+      return await finishCommittedActiveIfNeededUnlocked(input)
+    } finally {
+      applyingProjects.delete(key)
+    }
+  }
+
+  async function resumePreparedApply(input: {
+    project: string
+    directory: string
+    state: ProjectWorkflow.State
+    applyResult: ApplyResultArtifact
+  }) {
+    const candidate = await ensurePreparedApplyArtifacts({ directory: input.directory, applyResult: input.applyResult })
+    const latest = await GraphVersionStore.resolve(input.directory, "latest")
+    if (latest !== candidate) {
+      const base = await GraphVersionStore.resolveActiveBase(input.directory)
+      await GraphVersionStore.publish(input.directory, base, candidate)
+    }
+    return finishPublishedActive({ ...input, candidate })
+  }
+
+  async function applyOperationsUnlocked(input: { project: string; directory: string; confirm: boolean }): Promise<ProjectWorkflow.ActionResult> {
     if (!input.confirm) throw new Error("应用图操作需要 payload.confirm = true，并且必须来自用户明确确认。")
     const active = await ProjectWorkflow.getActive({ project: input.project, directory: input.directory })
     if (active.stage !== "图操作已生成") throw new Error("尚未生成可审核的图操作预览，不能应用图操作。")
@@ -1349,7 +1766,16 @@ export namespace ProjectWorkflowExecution {
     if (!validation.passed) throw new Error("最近一次图操作校验未通过，不能应用图操作。")
     if (!(await fileExists(previewGraphDir(input.directory)))) throw new Error("缺少 preview_graph，不能应用图操作。")
 
-    const prepared = await commandWithWorkflowNoteLink(input.directory, await readJsonFile(artifactPath(input.directory, "operations.json"), GraphCommand))
+    const baseDirectory = await graphOperationBaseDirectory(input.directory)
+    const operationDraft = await readJsonFile(artifactPath(input.directory, "operations.draft.json"), WorkflowOperationDraft)
+    const prepared = await prepareWorkflowNoteArchive(
+      input.directory,
+      await readJsonFile(artifactPath(input.directory, "operations.json"), GraphCommand),
+      operationDraft.note_filename,
+      {
+        storageDirectory: baseDirectory,
+      },
+    )
     const command = prepared.command
     if (prepared.changed) {
       await Promise.all([
@@ -1357,33 +1783,44 @@ export namespace ProjectWorkflowExecution {
         fs.writeFile(artifactPath(input.directory, "operation_index.json"), JSON.stringify(await buildOperationIndex(command, input.directory), null, 2) + "\n", "utf8"),
       ])
     }
-    const postPrepareValidation = await new GraphEngine(new GraphStorage(input.directory)).validateCommand(command)
+    const postPrepareValidation = await new GraphEngine(new GraphStorage(baseDirectory)).validateCommand(command, {
+      allowDerivedNodeUpdates: ProjectWorkflow.usesCorrectionWorkflowSemantics(originalState),
+    })
     const postPrepareErrors = postPrepareValidation.issues.filter((issue) => issue.severity === "error")
     if (postPrepareErrors.length) throw new Error(`图操作补充工作笔记引用后校验失败：${postPrepareErrors.map((issue) => issue.message).join("; ")}`)
-    const changelogEntry = await readChangelogEntry(input.directory, command)
+    const rawChangelogEntry = await readChangelogEntry(input.directory, command)
+    const changelogEntry = changelogEntryWithNotePath(rawChangelogEntry, prepared.notePath)
+    if (changelogEntry !== rawChangelogEntry) await writeChangelogDraft(input.directory, changelogEntry)
     const operationNotes = await readOptionalText(artifactPath(input.directory, "operation_notes.md"))
-    const backup = await backupGraphData(input.directory)
     const archive = await nextAppliedWorkflowTarget(input.directory, command.change_id)
+    const candidate = await GraphVersionStore.createCandidate(input.directory, baseDirectory)
     let applyResult: ApplyResultArtifact | undefined
-    let archivePath: string | undefined
     try {
-      const engine = new GraphEngine(new GraphStorage(input.directory))
-      const notePath = await saveWorkflowNoteToNotes(input.directory, prepared.notePath, prepared.note)
+      const engine = new GraphEngine(new GraphStorage(candidate))
+      const notePath = await saveWorkflowNoteToNotes(input.directory, prepared.notePath, prepared.note, candidate)
       const result = await engine.executeCommand(command)
       if (!result.success) throw new Error(result.errors.join("; ") || "图操作执行失败")
-      applyResult = await writeApplyResult(input.directory, {
+      await refreshDescriptionOutputs(candidate)
+      await appendChangelog(candidate, changelogEntry)
+      await validateCandidateArtifacts({
+        directory: candidate,
+        command,
+        snapshot: result.snapshot_created,
+        notePath,
+      })
+      applyResult = createApplyResult({
         appliedAt: new Date().toISOString(),
         change_id: command.change_id,
         success: true,
         snapshot: result.snapshot_created,
         operationsPath: `${archive.archivePath}/operations.json`,
         archivePath: archive.archivePath,
+        graphVersion: path.relative(input.directory, candidate),
         result,
         notePath,
         errors: [],
       })
-      await refreshDescriptionOutputs(input.directory)
-      await appendChangelog(input.directory, changelogEntry)
+      // The apply result is the durable commit intent, so every referenced artifact must exist first.
       await writeStepArtifact({
         directory: input.directory,
         command,
@@ -1391,41 +1828,270 @@ export namespace ProjectWorkflowExecution {
         applyResult,
         applyResultPath: `${archive.archivePath}/apply_result.json`,
       })
-      await writeActiveWorkflowState(input.directory, appliedWorkflowState(originalState))
-      archivePath = await archiveAppliedWorkflow(input.directory, archive.target)
+      await writeApplyResult(input.directory, applyResult)
+      await GraphVersionStore.publish(input.directory, baseDirectory, candidate)
     } catch (error) {
-      await restoreGraphData(input.directory, backup).catch(() => undefined)
-      await cleanupApplyBackup(input.directory).catch(() => undefined)
-      await writeActiveWorkflowState(input.directory, originalState).catch(() => undefined)
-      const message = error instanceof Error ? error.message : String(error)
-      await writeApplyResult(input.directory, {
-        appliedAt: new Date().toISOString(),
-        change_id: command.change_id,
-        success: false,
-        errors: [message],
-      }).catch(() => undefined)
+      await Promise.all([
+        GraphVersionStore.discardCandidate(candidate).catch(() => undefined),
+        fs.rm(artifactPath(input.directory, "apply_result.json"), { force: true }),
+        fs.rm(artifactPath(input.directory, "apply_result.json.preparing"), { force: true }),
+        fs.rm(artifactPath(input.directory, "step.md"), { force: true }),
+        fs.rm(artifactPath(input.directory, "step.md.preparing"), { force: true }),
+      ])
       throw error
     }
+    return finishPublishedActive({
+      project: input.project,
+      directory: input.directory,
+      state: originalState,
+      applyResult: applyResult!,
+      candidate,
+    })
+  }
 
-    await cleanupArchivedApplyBackup(path.join(input.directory, archivePath)).catch(() => undefined)
-    await markProjectGraphInitialized(input.directory).catch(() => undefined)
-    const refreshed = await ProjectWorkflow.getActive({ project: input.project, directory: input.directory })
-    return {
-      ...refreshed,
-      message: "图操作已应用到正式图数据，active workflow 已归档。",
-      data: {
+  export async function applyOperations(input: { project: string; directory: string; confirm: boolean }): Promise<ProjectWorkflow.ActionResult> {
+    if (!input.confirm) throw new Error("应用图操作需要 payload.confirm = true，并且必须来自用户明确确认。")
+    const key = path.resolve(input.directory)
+    if (applyingProjects.has(key)) throw new Error("当前项目正在应用图操作，请等待本次提交完成。")
+    applyingProjects.add(key)
+    try {
+      const recovered = await finishCommittedActiveIfNeededUnlocked({ project: input.project, directory: input.directory })
+      if (recovered) return recovered
+      return await applyOperationsUnlocked(input)
+    } finally {
+      applyingProjects.delete(key)
+    }
+  }
+
+  async function listAppliedWorkflowArchives(directory: string) {
+    const root = appliedRoot(directory)
+    const names = await fs.readdir(root).catch(() => [])
+    const items = await Promise.all(names.map(async (name) => {
+      const archiveDirectory = path.join(root, name)
+      const stat = await fs.stat(archiveDirectory).catch(() => undefined)
+      if (!stat?.isDirectory()) return undefined
+      const applyResult = await readJsonFile(path.join(archiveDirectory, "apply_result.json"), ApplyResultArtifact).catch(() => undefined)
+      if (!applyResult?.success) return undefined
+      return {
+        name,
+        archiveDirectory,
+        archivePath: path.relative(directory, archiveDirectory),
         applyResult,
-        archivePath,
-      },
+      }
+    }))
+    return items.filter((item): item is NonNullable<typeof item> => !!item)
+      .sort((a, b) => String(b.applyResult.appliedAt).localeCompare(String(a.applyResult.appliedAt)))
+  }
+
+  function hardCorrectionExpectedChangeId(changeID: string, fixIndex: number) {
+    const base = changeID.replace(/_fix\d+$/u, "")
+    return `${base}_fix${fixIndex}`
+  }
+
+  async function nextRegularStepChangeIdPrefix(directory: string) {
+    const archives = await listAppliedWorkflowArchives(directory)
+    let max = -1
+    for (const archive of archives) {
+      const match = archive.applyResult.change_id.match(/^step(\d+)_/u)
+      if (!match) continue
+      max = Math.max(max, Number(match[1]))
+    }
+    const snapshotNames = await fs.readdir(path.join(directory, "snapshots")).catch(() => [])
+    for (const name of snapshotNames) {
+      const match = name.match(/^step(\d+)_.*\.json$/u)
+      if (!match) continue
+      max = Math.max(max, Number(match[1]))
+    }
+    return `step${max + 1}_`
+  }
+
+  async function nextSoftCorrectionChangeId(directory: string) {
+    const root = appliedRoot(directory)
+    const names = await fs.readdir(root).catch(() => [])
+    let max = 0
+    for (const name of names) {
+      const match = name.match(/^correction(\d+)_/u)
+      if (!match) continue
+      max = Math.max(max, Number(match[1]))
+    }
+    return `correction${max + 1}_`
+  }
+
+  async function nextHardCorrectionIndex(directory: string, changeID: string) {
+    const root = appliedRoot(directory)
+    const base = safePathSegment(changeID.replace(/_fix\d+$/u, ""))
+    const names = await fs.readdir(root).catch(() => [])
+    let max = 0
+    for (const name of names) {
+      const match = name.match(new RegExp(`^${escapeRegExp(base)}_fix(\\d+)(?:_\\d+)?$`, "u"))
+      if (!match) continue
+      max = Math.max(max, Number(match[1]))
+    }
+    return max + 1
+  }
+
+  export async function startHardCorrection(input: { project: string; directory: string; confirm: boolean }): Promise<ProjectWorkflow.ActionResult> {
+    if (!input.confirm) throw new Error("重做最近提交需要 payload.confirm = true，并且必须来自用户明确确认。")
+    await finishCommittedActiveIfNeeded(input)
+    const active = await ProjectWorkflow.getActive({ project: input.project, directory: input.directory })
+    const archives = await listAppliedWorkflowArchives(input.directory)
+    const [latest] = archives
+    if (!latest) throw new Error("没有可重做的已提交 workflow。")
+    if (active.state) {
+      await discardActiveBeforeCorrection({ project: input.project, directory: input.directory })
+    }
+    const activeDirectory = activeDir(input.directory)
+    try {
+      await fs.rm(activeDirectory, { recursive: true, force: true })
+      await fs.mkdir(path.dirname(activeDirectory), { recursive: true })
+      await fs.cp(latest.archiveDirectory, activeDirectory, { recursive: true })
+      const archivedState = await readActiveWorkflowState(input.directory)
+      await Promise.all([
+        fs.rm(path.join(activeDirectory, "apply_result.json"), { force: true }),
+        fs.rm(path.join(activeDirectory, "step.md"), { force: true }),
+        fs.rm(path.join(activeDirectory, "preview_graph"), { recursive: true, force: true }),
+        fs.rm(path.join(activeDirectory, "preview_graph.building"), { recursive: true, force: true }),
+      ])
+      await GraphVersionStore.bindActiveBase(input.directory, "previous", true)
+      const fixIndex = await nextHardCorrectionIndex(input.directory, latest.applyResult.change_id)
+      const expectedChangeId = hardCorrectionExpectedChangeId(latest.applyResult.change_id, fixIndex)
+      await ProjectWorkflow.writeHardCorrectionState({
+        project: input.project,
+        directory: input.directory,
+        payload: {
+          ofChangeId: latest.applyResult.change_id,
+          sourceArchivePath: latest.archivePath,
+          fixIndex,
+          expectedChangeId,
+        },
+      })
+      await rewriteHardCorrectionDraftChangeId(input.directory, latest.applyResult.change_id, expectedChangeId)
+      const { validation, preview } = await rebuildRestoredHardCorrectionArtifacts(input.directory)
+      await ProjectWorkflow.runAction({
+        project: input.project,
+        directory: input.directory,
+        action: "校验图操作",
+        payload: {
+          passed: validation.passed,
+          summary: validation.passed ? "硬更正草案已恢复并重新生成预览。" : "硬更正草案已恢复，但需要修订后才能提交。",
+        },
+      })
+      const refreshed = await ProjectWorkflow.getActive({ project: input.project, directory: input.directory })
+      return {
+        ...refreshed,
+        message: validation.passed
+          ? `已恢复最近提交「${latest.applyResult.change_id}」的更正草案现场；正式图数据未改变。新提交将使用 change_id：${expectedChangeId}。`
+          : `已恢复最近提交「${latest.applyResult.change_id}」的更正草案现场；正式图数据未改变，但草案需要修订后才能提交。`,
+        data: {
+          correction: refreshed.state?.correction,
+          hardCorrection: refreshed.state?.hardCorrection,
+          restoredFrom: latest.archivePath,
+          expectedChangeId,
+          validation: {
+            passed: validation.passed,
+            issueCount: validation.issues.length,
+            issues: validation.issues,
+          },
+          preview: preview ? {
+            change_id: preview.change_id,
+            operationCount: preview.operationCount,
+            graphDirectory: preview.graphDirectory,
+          } : undefined,
+          restoredSession: {
+            sessionID: archivedState?.sessionID,
+            sessionStartedAt: archivedState?.sessionStartedAt,
+            warmupSessionID: archivedState?.warmupSessionID,
+            warmupStatus: archivedState?.warmupStatus,
+          },
+        },
+      }
+    } catch (error) {
+      await fs.rm(activeDir(input.directory), { recursive: true, force: true }).catch(() => undefined)
+      await fs.mkdir(activeDir(input.directory), { recursive: true }).catch(() => undefined)
+      throw error
+    }
+  }
+
+  export async function startSoftCorrection(input: { project: string; directory: string; confirm: boolean }): Promise<ProjectWorkflow.ActionResult> {
+    if (!input.confirm) throw new Error("追加更正记录需要 payload.confirm = true，并且必须来自用户明确确认。")
+    await finishCommittedActiveIfNeeded(input)
+    const active = await ProjectWorkflow.getActive({ project: input.project, directory: input.directory })
+    if (active.state) {
+      await discardActiveBeforeCorrection({ project: input.project, directory: input.directory })
+    }
+    await fs.rm(activeDir(input.directory), { recursive: true, force: true })
+    await fs.mkdir(activeDir(input.directory), { recursive: true })
+    const expectedChangeId = await nextSoftCorrectionChangeId(input.directory)
+    const result = await ProjectWorkflow.createSoftCorrectionState({
+      project: input.project,
+      directory: input.directory,
+      payload: { expectedChangeId },
+    })
+    await GraphVersionStore.bindActiveBase(input.directory, "latest", true)
+    return result
+  }
+
+  export async function getActive(input: { project: string; directory: string }) {
+    await GraphVersionStore.ensure(input.directory)
+    const active = await ProjectWorkflow.getActive(input)
+    if (!active.state) {
+      const latest = await GraphVersionStore.resolve(input.directory, "latest")
+      return {
+        ...active,
+        baseIsEmpty: await GraphVersionStore.isEmpty(latest),
+        sessionReady: false,
+      }
+    }
+    const base = await GraphVersionStore.resolveActiveBase(input.directory)
+    const baseIsEmpty = await GraphVersionStore.isEmpty(base)
+    return {
+      ...active,
+      baseIsEmpty,
+      sessionReady: !!active.state.sessionID,
+      warmupStatus: active.state.warmupStatus,
     }
   }
 
   export async function runAction(input: ProjectWorkflow.ActionRequest & { directory?: string }): Promise<ProjectWorkflow.ActionResult> {
     const directory = input.directory ?? ProjectWorkflow.projectDirectory(input.project)
+    await GraphVersionStore.ensure(directory)
+
+    const correctionAction = input.action === "开始软更正" || input.action === "重做最近提交"
+    if (input.action !== "应用图操作" && !correctionAction) {
+      const recovered = await finishCommittedActiveIfNeeded({ project: input.project, directory })
+      if (recovered && input.action === "放弃草案") {
+        return {
+          ...recovered,
+          message: "图操作已经发布，已补完成 active 归档，不能再作为草案放弃。",
+          data: { ...recovered.data, recoveredPublishedApply: true },
+        }
+      }
+      if (recovered) {
+        return {
+          ...recovered,
+          message: "检测到上一轮图操作已经发布，已补完成 active 归档；本次操作未执行。",
+          data: { ...recovered.data, recoveredPublishedApply: true },
+        }
+      }
+    }
+
+    if (input.action === "开始或恢复") {
+      const result = await ProjectWorkflow.runAction({ ...input, directory })
+      if (result.state) {
+        await GraphVersionStore.bindActiveBase(directory, result.state.hardCorrection ? "previous" : "latest")
+      }
+      return result
+    }
+
+    const current = await ProjectWorkflow.getActive({ project: input.project, directory })
+    const actionReplacesOrRemovesActive = input.action === "放弃草案" || correctionAction
+    if (current.state && !actionReplacesOrRemovesActive) {
+      await GraphVersionStore.resolveActiveBase(directory)
+    }
 
     if (input.action === "更新工作笔记") {
       const payload = NoteWritePayload.parse(input.payload)
-      await ProjectWorkflow.runAction({ project: input.project, directory, action: "开始或恢复", payload: {} })
+      await runAction({ project: input.project, directory, action: "开始或恢复", payload: {} })
       await writeNote({ directory, content: payload.content })
       return runAction({
         project: input.project,
@@ -1460,7 +2126,7 @@ export namespace ProjectWorkflowExecution {
       let preview: PreviewArtifact | undefined
       try {
         const compiled = await compileOperationDraft({ directory })
-        validation = compiled.ok ? await validateOperations({ directory }) : compiled.validation
+        validation = compiled.ok ? await validateOperations({ directory, extraIssues: compiled.extraIssues }) : compiled.validation
         if (validation.passed) preview = await buildPreview({ directory })
       } catch (error) {
         validation = await writeValidation({
@@ -1528,6 +2194,44 @@ export namespace ProjectWorkflowExecution {
     if (input.action === "应用图操作") {
       const confirm = input.payload?.confirm === true
       return applyOperations({ project: input.project, directory, confirm })
+    }
+
+    if (input.action === "放弃草案") {
+      const active = await ProjectWorkflow.getActive({ project: input.project, directory })
+      const correctionType = ProjectWorkflow.correctionKind(active.state)
+      const result = await ProjectWorkflow.runAction(input)
+      await GraphVersionStore.cleanup(directory)
+      if (correctionType === "hard") {
+        return {
+          ...result,
+          message: "已放弃硬更正草案；正式图数据未改变。",
+          data: {
+            ...result.data,
+            discardedHardCorrection: true,
+          },
+        }
+      }
+      if (correctionType === "soft") {
+        return {
+          ...result,
+          message: "已放弃软更正草案，并清空本轮更正工作笔记和图操作草案。",
+          data: {
+            ...result.data,
+            discardedSoftCorrection: true,
+          },
+        }
+      }
+      return result
+    }
+
+    if (input.action === "重做最近提交") {
+      const confirm = input.payload?.confirm === true
+      return startHardCorrection({ project: input.project, directory, confirm })
+    }
+
+    if (input.action === "开始软更正") {
+      const confirm = input.payload?.confirm === true
+      return startSoftCorrection({ project: input.project, directory, confirm })
     }
 
     return ProjectWorkflow.runAction(input)

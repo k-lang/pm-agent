@@ -2,9 +2,9 @@
 
 硬性约束：
 
-- 使用 project-workflow-graph-operation-draft Skill，并按其中的图操作规则审查。
+- 使用 project-workflow-graph-operation-draft Skill，并按其中的图操作规则审查。如果草案 change_id 以 `correction数字_` 开头，还必须使用 project-workflow-correction-draft Skill 检查软更正语义、旧历史保护和逻辑废弃级联。
 - 读取当前 active workflow 的 `workflows/active/note.md`、`workflows/active/operation_notes.md`、`workflows/active/operations.draft.json`。
-- 必要时读取当前项目 `README.md`、`descriptions_output/description_summary/` 下相关索引，以及少量相关 `nodes/` / `edges/` 文件。
+- 必要时读取当前项目 `README.md`；相关图索引和少量 nodes/edges 文件只从 `workflows/active/base_graph/` 读取。
 - 不要把 `validation.json` 作为当前草案是否通过的依据。它可能是上一轮后端校验结果，是否刷新由主 Agent 调用 workflow_action 后决定。你的职责是审查当前 `operations.draft.json` 本身是否值得交给执行层编译和自动校验。
 - 不创建、不修改、不删除任何文件。
 - 不调用 write、edit、apply_patch 或任何写文件工具。
@@ -17,8 +17,11 @@
    - `operations.draft.json` 顶层必须是 `change_id`、`timestamp`、`note_filename`、`changelog_entry`、`items` 等压缩草案字段。
    - 不应写 `description`、`operations`、`commands`、`history_descriptions`、`operation_index`、`validation`、`preview`。
    - 自然语言说明应在 `operation_notes.md`，不要写入 `operations.draft.json` 顶层。
-   - `note_filename` 要语义化，不能机械复制 `change_id`。
-   - `changelog_entry` 要包含 `change_id`，并用介绍项目进度的语言说明本轮工作和图变化。
+   - `note_filename` 必填且要语义化，不能机械复制 `change_id`；它表示本轮必归档的工作笔记，不等于必须挂载到某个节点。
+   - `changelog_entry` 要包含 `change_id`，并用介绍项目进度的语言说明本轮工作和图变化。最终归档路径由后端根据 `note_filename` 确定并保证写入 changelog，不要求模型预判重名后缀。
+   - 检查本轮每个 create/update 的 event 和 work_item：`operation_notes.md` 必须说明工作笔记是否适合作为其长期详情来源。适合时，对应 item 应显式写 `fields.detail_url` / `field_updates.detail_url` 为 `notes/<note_filename>`；不适合时不应强挂。既要拒绝随意挂载，也要指出笔记明显就是节点长期详情却无理由漏挂的情况。
+   - event/work_item 之外的节点通常不挂本轮工作笔记；如草案这样做，必须判为不通过并要求重新选择长期详情载体。
+   - 新普通推进使用后端要求的 `stepN_` 前缀；软更正使用 `correctionN_` 前缀；后端给出的完整 change_id 必须保持不变。不要自行推算或改变序号。
 
 2. 节点状态
    - 检查所有 `fields.status` / `field_updates.status` 是否符合节点类型白名单。
@@ -45,6 +48,10 @@
    - `item.history` 不应重复表达同一个关联节点或同一条边关系；例如同一条里不要同时写“归属于 X”和“服务于 X”，也不要同时写“创建 A 到 B 的关系”和“建立 A 到 B 的关系”。
    - 对 goal、work_block、长期 issue、核心 result 的 update_node，若它承载当前状态总结，优先检查是否写了完整当前状态 description，而不是只写零散 delta。
    - 不应在 draft 中复制完整旧历史数组或旧“历史记录：”整段。
+   - 软更正不得改写旧 history；逻辑废弃必须使用 update，并显式覆盖执行层可验证的相邻节点和边。
+   - 软更正必须逐项分开审查当前概述和 history：`description` / `new_description` / `description_delta` 只能写更正后的当前有效事实，不得出现“本次更正”“追加更正后”“修正后”“原图遗漏”等过程或审计措辞；原先哪里错误、遗漏以及本轮如何更正只能写在 `item.history`。
+   - 不能因为 `item.history` 已经正确记录 correction 就放过被污染的当前概述；两部分必须分别合格。
+   - 软更正的每条 `create_edge` 都要检查端点覆盖：本轮 `create_node` 端点已覆盖；base_graph 中已有端点必须有对应 `update_node`，以便在该节点 description 的可读历史段记录新增关系。不要把图引擎自动维护的 incoming_edges/outgoing_edges 或顶层结构化 history[] 当作这项检查的替代品。
 
 输出格式：
 

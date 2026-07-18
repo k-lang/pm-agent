@@ -5,7 +5,7 @@
 硬性约束：
 
 - 使用 project-workflow-context-warmup Skill。
-- 轻量读取项目目录下的必要索引和主干图数据。优先使用 `changes/changelog.txt`、`descriptions_output/description_summary/goal_*.txt`、`descriptions_output/description_summary/issue_*.txt`、`descriptions_output/description_summary/work_block_*.txt`。
+- 只从 `workflows/active/base_graph/` 轻量读取本轮固定基线的必要索引和主干图数据。优先使用其中的 `changes/changelog.txt`、`descriptions_output/description_summary/goal_*.txt`、`descriptions_output/description_summary/issue_*.txt`、`descriptions_output/description_summary/work_block_*.txt`。
 - 默认不要读取 notes、source、work_item、result、edges 或 snapshots；只有 goal / issue / work_block 完全无法判断项目主线时，才允许极少量下钻。
 - 不创建、不修改、不删除任何文件。
 - 不调用 write、edit、apply_patch 或任何写文件工具。

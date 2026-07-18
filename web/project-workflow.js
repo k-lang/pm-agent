@@ -3,6 +3,7 @@ import {
   canShowWorkflowGraphPreview,
   esc,
   markWorkflowPermissionRecord as markWorkflowPermissionRecords,
+  mergeWorkflowReadiness,
   mergeWorkflowPermissionRecords as mergeWorkflowPermissionRecordList,
   permissionListUrl,
   permissionReplyUrl,
@@ -13,6 +14,12 @@ import {
   upsertWorkflowPermissionRecord as upsertWorkflowPermissionRecordList,
   workflowMaximizeBodyClass,
   workflowMaximizeButtonState,
+  workflowChatLockReason,
+  workflowCorrectionKind,
+  workflowLoadBlocksInteraction,
+  workflowMessageErrorText,
+  workflowOperationArtifactsChanged,
+  workflowViewRequestMatches,
   workflowPermissionDiff,
   workflowPermissionFile,
   workflowPermissionStatusText,
@@ -64,6 +71,8 @@ const btnImportNoteFile = document.getElementById('btn-import-note-file')
 const btnPasteNote = document.getElementById('btn-paste-note')
 const noteFile = document.getElementById('note-file')
 const btnApply = document.getElementById('btn-apply')
+const btnHardCorrection = document.getElementById('btn-hard-correction')
+const btnSoftCorrection = document.getElementById('btn-soft-correction')
 const btnDiscardWorkflow = document.getElementById('btn-discard-workflow')
 const tabButtons = Array.from(document.querySelectorAll('.tab-button'))
 const tabPanels = Array.from(document.querySelectorAll('[data-tab-panel]'))
@@ -113,6 +122,12 @@ let workflowMessages = []
 let workflowPermissions = []
 let workflowPermissionRecords = []
 let workflowLoading = false
+let workflowLoadPromise = null
+let workflowLoadGeneration = -1
+let workflowLoadProject = ''
+let workflowRefreshQueued = false
+let workflowViewGeneration = 0
+let terminalActionPending = false
 let chatSending = false
 let warmupStarting = false
 let workflowPollTimer = null
@@ -156,6 +171,13 @@ function resetPreviewRenderKey(element) {
 }
 
 function clearWorkflowView() {
+  workflowViewGeneration += 1
+  workflowRefreshQueued = false
+  if (workflowPollTimer) clearTimeout(workflowPollTimer)
+  workflowPollTimer = null
+  if (refreshWorkflowTimer) clearTimeout(refreshWorkflowTimer)
+  refreshWorkflowTimer = null
+  disconnectWorkflowSSE()
   const reset = resetWorkflowViewState()
   workflow = reset.workflow
   workflowNote = reset.workflowNote
@@ -171,9 +193,27 @@ function clearWorkflowView() {
   shownPermissionModalIds.clear()
   workflowAwaitingReply = reset.workflowAwaitingReply
   workflowStatusById.clear()
+  resources = []
+  archivedNotes = []
+  selectedResourcePath = ''
+  resourceLoading = false
+  noteLoading = false
+  workflowOperationsLoading = false
+  workflowLoading = false
   resetPreviewRenderKey(notePreview)
   resetPreviewRenderKey(graphPreview)
   resetGraphPreview()
+}
+
+function workflowViewRequest(project = selectedProject()) {
+  return {
+    projectName: project?.name || '',
+    generation: workflowViewGeneration,
+  }
+}
+
+function isCurrentWorkflowViewRequest(request) {
+  return workflowViewRequestMatches(request, workflowViewRequest())
 }
 
 function replaceUrl() {
@@ -285,13 +325,52 @@ async function loadProjects() {
   projects = await fetchJson(API + '/project/directories') || []
   if (projectName && !projects.some((project) => project.name === projectName)) projectName = ''
   if (!projectName && projects.length) projectName = projects[0].name
+  clearWorkflowView()
   render()
-  connectWorkflowSSE()
-  await Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote(), loadWorkflowOperations()])
+  await loadSelectedProjectView({ askRestore: true })
 }
 
-async function loadWorkflowNote() {
+async function refreshProjectDirectories({ renderPage = true, request } = {}) {
+  const selectedName = projectName
+  const result = await fetchJson(API + '/project/directories') || []
+  if (request && !isCurrentWorkflowViewRequest(request)) return
+  projects = result
+  if (selectedName && projects.some((project) => project.name === selectedName)) projectName = selectedName
+  else if (projectName && !projects.some((project) => project.name === projectName)) projectName = ''
+  if (!projectName && projects.length) projectName = projects[0].name
+  if (renderPage) render()
+  connectWorkflowSSE()
+}
+
+async function loadSelectedProjectView({ askRestore = false } = {}) {
   const project = selectedProject()
+  if (!project) {
+    renderWorkspace()
+    return
+  }
+
+  disconnectWorkflowSSE()
+  if (askRestore) {
+    const request = workflowViewRequest(project)
+    await refreshWorkflowStateOnly(project, request)
+    if (!isCurrentWorkflowViewRequest(request)) return
+    await maybeAskRestoreWorkflow()
+  }
+
+  const request = workflowViewRequest()
+  if (!request.projectName) return
+  connectWorkflowSSE()
+  await Promise.all([
+    loadWorkflow({ askRestore: false }),
+    loadResources(request),
+    loadWorkflowNote(request),
+    loadWorkflowOperations(request),
+  ])
+}
+
+async function loadWorkflowNote(request = workflowViewRequest()) {
+  const project = selectedProject()
+  if (!isCurrentWorkflowViewRequest(request)) return
   workflowNote = null
   if (!project) {
     renderNotes()
@@ -301,18 +380,22 @@ async function loadWorkflowNote() {
   renderNotes()
   try {
     const result = await fetchJson(API + `/project/workflow/note?project=${encodeURIComponent(project.name)}`)
+    if (!isCurrentWorkflowViewRequest(request)) return
     workflowNote = result || null
-    if (result?.workflow) workflow = result.workflow
+    if (result?.workflow) workflow = mergeWorkflowReadiness(workflow, result.workflow)
   } catch (error) {
+    if (!isCurrentWorkflowViewRequest(request)) return
     workflowNote = { exists: false, content: '', error: error.message || '工作笔记加载失败' }
   } finally {
+    if (!isCurrentWorkflowViewRequest(request)) return
     noteLoading = false
     renderWorkspace()
   }
 }
 
-async function loadWorkflowOperations() {
+async function loadWorkflowOperations(request = workflowViewRequest()) {
   const project = selectedProject()
+  if (!isCurrentWorkflowViewRequest(request)) return
   if (!project) {
     workflowOperations = null
     renderOperationPreview()
@@ -322,21 +405,25 @@ async function loadWorkflowOperations() {
   if (!workflowOperations) renderOperationPreview()
   try {
     const result = await fetchJson(API + `/project/workflow/operations?project=${encodeURIComponent(project.name)}`)
+    if (!isCurrentWorkflowViewRequest(request)) return
     workflowOperations = result || null
-    if (result?.workflow) workflow = result.workflow
+    if (result?.workflow) workflow = mergeWorkflowReadiness(workflow, result.workflow)
     if (activeTab === 'graph' && graphPreviewMode === 'map') {
       await ensureGraphPreviewLoaded().catch(() => {})
     }
   } catch (error) {
+    if (!isCurrentWorkflowViewRequest(request)) return
     workflowOperations = { files: [], error: error.message || '图操作草稿加载失败' }
   } finally {
+    if (!isCurrentWorkflowViewRequest(request)) return
     workflowOperationsLoading = false
     renderWorkspace()
   }
 }
 
-async function loadResources() {
+async function loadResources(request = workflowViewRequest()) {
   const project = selectedProject()
+  if (!isCurrentWorkflowViewRequest(request)) return
   const previousResourcePath = selectedResourcePath
   resources = []
   archivedNotes = []
@@ -352,6 +439,7 @@ async function loadResources() {
       fetchJson(API + `/project/source?project=${encodeURIComponent(project.name)}`),
       fetchJson(API + `/project/notes?project=${encodeURIComponent(project.name)}`),
     ])
+    if (!isCurrentWorkflowViewRequest(request)) return
     resources = sourceResources || []
     archivedNotes = notes || []
     const visibleResources = resourceMode === 'notes' ? archivedNotes : resources
@@ -359,48 +447,104 @@ async function loadResources() {
       selectedResourcePath = previousResourcePath
     }
   } catch (error) {
+    if (!isCurrentWorkflowViewRequest(request)) return
     resourcePreview.innerHTML = `<div class="placeholder">${esc(error.message || '资源加载失败')}</div>`
   } finally {
+    if (!isCurrentWorkflowViewRequest(request)) return
     resourceLoading = false
     renderResources()
   }
 }
 
-async function loadWorkflow(options = {}) {
+async function loadWorkflow() {
   const project = selectedProject()
+  const request = workflowViewRequest(project)
   if (!project) {
     workflow = null
     workflowMessages = []
     renderChat()
     return
   }
-  workflowLoading = true
-  renderChat()
-  try {
-    const [result, statuses] = await Promise.all([
-      fetchJson(API + `/project/workflow/messages?project=${encodeURIComponent(project.name)}`),
-      fetchJson(API + `/session/status?directory=${encodeURIComponent(project.directory)}`).catch(() => ({})),
-    ])
-    workflow = result?.workflow || null
-    workflowMessages = result?.messages || []
-    syncWorkflowStatuses(statuses || {})
-    await loadPendingWorkflowPermissions()
-    if (pendingUserText && workflowMessages.some((message) => visibleUserText(message) === pendingUserText)) {
-      pendingUserText = ''
+  if (
+    workflowLoadPromise &&
+    workflowLoadGeneration === request.generation &&
+    workflowLoadProject === request.projectName
+  ) {
+    workflowRefreshQueued = true
+    return workflowLoadPromise
+  }
+
+  const showLoading = !workflow
+  if (showLoading) {
+    workflowLoading = true
+    renderChat()
+  }
+
+  const load = (async () => {
+    try {
+      const previousState = currentWorkflowState()
+      const previousStage = previousState?.stage || ''
+      const previousGraphInitialized = !!project.graphInitialized
+      const [result, statuses] = await Promise.all([
+        fetchJson(API + `/project/workflow/messages?project=${encodeURIComponent(project.name)}`),
+        fetchJson(API + `/session/status?directory=${encodeURIComponent(project.directory)}`).catch(() => ({})),
+      ])
+      if (!isCurrentWorkflowViewRequest(request)) return
+      workflow = result?.workflow || null
+      workflowMessages = result?.messages || []
+      syncWorkflowStatuses(statuses || {})
+      await loadPendingWorkflowPermissions(request)
+      if (!isCurrentWorkflowViewRequest(request)) return
+      if (pendingUserText && workflowMessages.some((message) => visibleUserText(message) === pendingUserText)) {
+        pendingUserText = ''
+      }
+      if (!workflowHasUnansweredUser()) workflowAwaitingReply = false
+      const nextState = currentWorkflowState()
+      const nextStage = nextState?.stage || ''
+      if (workflowOperationArtifactsChanged(previousState, nextState)) {
+        await loadWorkflowOperations().catch(() => {})
+      }
+      const appliedOrArchived = (nextStage === '已应用' && previousStage !== '已应用') || (!!previousState && !nextState)
+      if (appliedOrArchived) {
+        await refreshProjectDirectories({ renderPage: false, request })
+        if (!isCurrentWorkflowViewRequest(request)) return
+        if (!previousGraphInitialized && selectedProject()?.graphInitialized) resetGraphPreview()
+        await loadResources().catch(() => {})
+        if (activeTab === 'graph') await ensureGraphPreviewLoaded({ force: true }).catch(() => {})
+      }
+    } catch (error) {
+      if (!isCurrentWorkflowViewRequest(request)) return
+      workflow = { ok: false, message: error.message || '工作推进状态加载失败' }
+      workflowMessages = []
+    } finally {
+      if (isCurrentWorkflowViewRequest(request)) {
+        if (showLoading) workflowLoading = false
+        renderWorkspace()
+        maybePollWorkflow()
+      }
     }
-    if (!workflowHasUnansweredUser()) workflowAwaitingReply = false
-  } catch (error) {
-    workflow = { ok: false, message: error.message || '工作推进状态加载失败' }
-    workflowMessages = []
+  })()
+
+  workflowLoadPromise = load
+  workflowLoadGeneration = request.generation
+  workflowLoadProject = request.projectName
+  try {
+    return await load
   } finally {
-    workflowLoading = false
-    renderWorkspace()
-    maybePollWorkflow()
-    if (options.askRestore) await maybeAskRestoreWorkflow()
+    if (workflowLoadPromise === load) {
+      workflowLoadPromise = null
+      workflowLoadGeneration = -1
+      workflowLoadProject = ''
+      if (workflowRefreshQueued && isCurrentWorkflowViewRequest(request)) {
+        workflowRefreshQueued = false
+        scheduleWorkflowRefresh()
+      }
+    }
   }
 }
 
-async function loadPendingWorkflowPermissions() {
+async function loadPendingWorkflowPermissions(request = workflowViewRequest()) {
+  if (!isCurrentWorkflowViewRequest(request)) return
   const ids = workflowSessionIDs()
   if (!ids.size) {
     workflowPermissions = []
@@ -409,6 +553,7 @@ async function loadPendingWorkflowPermissions() {
   }
   const project = selectedProject()
   const permissions = await fetchJson(API + permissionListUrl(project)).catch(() => [])
+  if (!isCurrentWorkflowViewRequest(request)) return
   workflowPermissions = (permissions || []).filter((permission) => ids.has(permission.sessionID))
   mergeWorkflowPermissionRecords(workflowPermissions)
   openFirstPendingPermissionReview()
@@ -441,6 +586,15 @@ function allWorkflowDiffRecords() {
 }
 
 function scheduleWorkflowRefresh() {
+  const request = workflowViewRequest()
+  if (
+    workflowLoadPromise &&
+    workflowLoadGeneration === request.generation &&
+    workflowLoadProject === request.projectName
+  ) {
+    workflowRefreshQueued = true
+    return
+  }
   if (refreshWorkflowTimer) return
   refreshWorkflowTimer = setTimeout(async () => {
     refreshWorkflowTimer = null
@@ -448,24 +602,30 @@ function scheduleWorkflowRefresh() {
   }, 250)
 }
 
-function connectWorkflowSSE() {
+function disconnectWorkflowSSE() {
   if (currentSSE) {
     currentSSE.close()
     currentSSE = null
   }
+}
+
+function connectWorkflowSSE() {
+  disconnectWorkflowSSE()
   const project = selectedProject()
   if (!project) return
+  const request = workflowViewRequest(project)
   const es = new EventSource(API + '/event?directory=' + encodeURIComponent(project.directory))
   es.onmessage = (event) => {
+    if (currentSSE !== es || !isCurrentWorkflowViewRequest(request)) return
     try {
       handleWorkflowBusEvent(JSON.parse(event.data))
     } catch {}
   }
   es.onerror = () => {
     es.close()
-    currentSSE = null
+    if (currentSSE === es) currentSSE = null
     setTimeout(() => {
-      if (selectedProject()?.name === project.name) connectWorkflowSSE()
+      if (!currentSSE && isCurrentWorkflowViewRequest(request)) connectWorkflowSSE()
     }, 3000)
   }
   currentSSE = es
@@ -595,7 +755,7 @@ function resetGraphPreview() {
 }
 
 function graphPreviewApi(project) {
-  return API + `/project/graph?project=${encodeURIComponent(project.name)}&view=expanded`
+  return API + `/project/workflow/graph?project=${encodeURIComponent(project.name)}&view=expanded`
 }
 
 function operationArtifactJson(key) {
@@ -978,7 +1138,8 @@ function workflowActionBlockedReason(action) {
   const project = selectedProject()
   const state = currentWorkflowState()
   if (!project) return '请先选择项目。'
-  if (workflowLoading) return '工作推进状态仍在加载，请稍后再试。'
+  if (terminalActionPending) return '另一个工作推进操作正在处理，请等待完成。'
+  if (workflowLoadBlocksInteraction({ loading: workflowLoading, workflow })) return '工作推进状态仍在加载，请稍后再试。'
   if (!state) return '当前项目还没有 active 工作推进草案。'
   if (TERMINAL_STAGES.has(state.stage)) return `当前草案已处于终态「${state.stage}」，不能执行「${action}」。`
   const entry = workflowActionEntry(action)
@@ -990,25 +1151,56 @@ function workflowActionBlockedReason(action) {
 function updateTerminalActionButtons() {
   const project = selectedProject()
   const state = currentWorkflowState()
-  const hasProject = !!project && !workflowLoading
+  const hasProject = !!project && !workflowLoadBlocksInteraction({ loading: workflowLoading, workflow }) && !terminalActionPending
+  const running = workflowIsRunning()
   if (btnDiscardWorkflow) {
     btnDiscardWorkflow.disabled = !hasProject
     btnDiscardWorkflow.title = state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
   }
   if (btnApply) {
-    btnApply.disabled = !hasProject
+    btnApply.disabled = !hasProject || running
     btnApply.classList.toggle('pending-action', !!workflowActionEntry('应用图操作').available)
-    btnApply.title = state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
+    btnApply.title = running
+      ? '大模型、预热或工具审批仍在处理，暂不能提交。'
+      : state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
+  }
+  const correctionDisabled = !hasProject || running
+  if (btnHardCorrection) {
+    btnHardCorrection.disabled = correctionDisabled
+    btnHardCorrection.title = running
+      ? '大模型、预热或工具审批仍在处理，暂不能重做最近提交。'
+      : state
+      ? '当前已有 active 草案；重做最近提交会先放弃当前草案。'
+      : '恢复最近一次提交的草案，用提交前图数据生成更正预览。'
+  }
+  if (btnSoftCorrection) {
+    btnSoftCorrection.disabled = correctionDisabled
+    btnSoftCorrection.title = running
+      ? '大模型、预热或工具审批仍在处理，暂不能追加更正记录。'
+      : state
+      ? '当前已有 active 草案；追加更正记录会先放弃当前草案。'
+      : '新建一轮只追加更正记录的草案。'
   }
 }
 
-async function refreshWorkflowStateOnly(project) {
+function setTerminalActionPending(pending) {
+  terminalActionPending = pending
+  updateTerminalActionButtons()
+  renderNotes()
+  renderChat()
+}
+
+async function refreshWorkflowStateOnly(project, request = workflowViewRequest(project)) {
   if (!project) return
+  if (!isCurrentWorkflowViewRequest(request)) return
   workflowLoading = true
   updateTerminalActionButtons()
   try {
-    workflow = await fetchJson(API + `/project/workflow/state?project=${encodeURIComponent(project.name)}`)
+    const result = await fetchJson(API + `/project/workflow/state?project=${encodeURIComponent(project.name)}`)
+    if (!isCurrentWorkflowViewRequest(request)) return
+    workflow = result
   } finally {
+    if (!isCurrentWorkflowViewRequest(request)) return
     workflowLoading = false
     renderWorkspace()
   }
@@ -1016,13 +1208,20 @@ async function refreshWorkflowStateOnly(project) {
 
 async function maybeAskRestoreWorkflow() {
   const project = selectedProject()
+  const request = workflowViewRequest(project)
   const state = currentWorkflowState()
   if (!project || !hasUnfinishedActiveWorkflow(state)) return
   if (suppressRestorePrompt) return
   if (restorePromptProject === project.name) return
   restorePromptProject = project.name
 
-  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“确定”会恢复本轮 active workflow。\n选择“取消”会结束并删除本轮 active workflow，包括 state、图操作草案、校验、预览和聊天会话；如果已有工作笔记，会只保留 workflows/active/note.md 供下一轮重新开始使用。已写入的正式图数据不会删除。`)
+  const correctionType = workflowCorrectionKind(state)
+  const discardNote = correctionType === 'hard'
+    ? '这是硬更正草案；选择“取消”只会放弃恢复出来的 active 现场，不保留本轮 note.md，正式图数据不会改变。'
+    : correctionType === 'soft'
+      ? '这是软更正草案；选择“取消”会清空本轮更正 note.md 和图操作草案，不保留为普通推进笔记。'
+      : '选择“取消”会结束并删除本轮 active workflow，包括 state、图操作草案、校验、预览和聊天会话；如果已有工作笔记，会只保留 workflows/active/note.md 供下一轮重新开始使用。已写入的正式图数据不会删除。'
+  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“确定”会恢复本轮 active workflow。\n${discardNote}`)
   if (ok) return
 
   suppressRestorePrompt = true
@@ -1032,10 +1231,9 @@ async function maybeAskRestoreWorkflow() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: '放弃草案', payload: {} }),
     })
+    if (!isCurrentWorkflowViewRequest(request)) return
     clearWorkflowView()
-    await loadWorkflow({ askRestore: false })
-    await loadWorkflowNote()
-    await loadWorkflowOperations()
+    renderWorkspace()
   } catch (error) {
     chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '放弃草案失败')}</div>`
   } finally {
@@ -1092,12 +1290,16 @@ function renderWorkflowMessage(message) {
   if (role !== 'user' && role !== 'assistant') return ''
   const parts = (message.parts || []).map((part) => renderMessagePart(part, message)).filter(Boolean).join('')
   const fallback = visibleMessageText(message)
-  if (!parts && !fallback) return ''
+  const error = role === 'assistant' ? workflowMessageErrorText(message.info?.error || message.error) : ''
+  if (!parts && !fallback && !error) return ''
   const label = role === 'user' ? '你' : '大模型'
+  const body = parts || (fallback
+    ? `<div class="message-text">${esc(fallback)}</div>`
+    : `<div class="message-text message-error">模型请求失败：${esc(error)}</div>`)
   return `
-    <div class="workflow-message ${role === 'user' ? 'user' : 'assistant'}">
+    <div class="workflow-message ${role === 'user' ? 'user' : 'assistant'}${error && !parts && !fallback ? ' error' : ''}">
       <div class="message-role">${label}</div>
-      <div class="message-body">${parts || `<div class="message-text">${esc(fallback)}</div>`}</div>
+      <div class="message-body">${body}</div>
     </div>
   `
 }
@@ -1202,14 +1404,8 @@ function workflowIsRunning() {
 }
 
 function chatLockReason(project, state) {
-  if (!project) return '选择或新建项目后可以开始工作推进。'
-  if (!project.graphInitialized) return ''
-  if (workflowLoading) return '正在加载工作推进状态。'
-  if (!state) return '已有图数据的项目需要先完成项目上下文预热。'
-  if (state.warmupStatus === 'running') return '项目上下文预热中，完成后会自动开放推进对话。'
-  if (state.warmupStatus === 'failed') return '项目上下文预热失败，请重新预热后再继续。'
-  if (state.warmupStatus !== 'completed') return '请先预热项目上下文，让大模型掌握当前项目主线。'
-  return ''
+  if (terminalActionPending) return '工作推进操作正在处理，请等待完成。'
+  return workflowChatLockReason({ project, workflow, state, loading: workflowLoading })
 }
 
 function renderChat() {
@@ -1217,12 +1413,13 @@ function renderChat() {
   const state = currentWorkflowState()
   const lockReason = chatLockReason(project, state)
   const running = workflowIsRunning()
+  updateTerminalActionButtons()
   const canChat = !!project && !running && !lockReason
-  const canWarmup = !!project?.graphInitialized && !warmupStarting && state?.warmupStatus !== 'running'
+  const canWarmup = !!project && !terminalActionPending && !warmupStarting && state?.warmupStatus !== 'running'
   const hasNote = !!workflowNote?.exists
   const readyHint = !project
     ? '选择或新建项目后可以开始工作推进。'
-    : project.graphInitialized
+    : !workflow?.baseIsEmpty
       ? hasNote
         ? '基于当前工作笔记继续补充、修改，或要求生成图操作草案。'
         : '描述本次推进、补充材料，或在工作笔记页签导入/人工修改笔记。'
@@ -1237,16 +1434,24 @@ function renderChat() {
       ? '大模型正在处理，本轮回复完成后可以继续输入。'
       : ''
 
-  btnWarmup.classList.toggle('hidden', !project?.graphInitialized)
+  const showWarmupControl = !!project && (!workflow?.baseIsEmpty || (!!state && !workflow?.sessionReady))
+  btnWarmup.classList.toggle('hidden', !showWarmupControl)
   btnWarmup.disabled = !canWarmup
-  btnWarmup.textContent = state?.warmupStatus === 'completed' ? '重新预热项目上下文' : '开始项目上下文预热'
-  const showWarmupStatus = !!project?.graphInitialized
+  btnWarmup.textContent = workflow?.baseIsEmpty
+    ? '恢复推进会话'
+    : state?.warmupStatus === 'completed' ? '重新预热项目上下文' : '开始项目上下文预热'
+  const showWarmupStatus = showWarmupControl
   const warmupDisplayStatus = warmupStarting ? 'running' : (state?.warmupStatus || '')
   warmupStatus.classList.toggle('hidden', !showWarmupStatus)
-  warmupStatus.textContent = showWarmupStatus ? warmupStatusText(warmupDisplayStatus) : ''
+  const warmupPrefix = state?.correction ? '软更正：' : ''
+  warmupStatus.textContent = showWarmupStatus
+    ? workflow?.baseIsEmpty
+      ? warmupStarting ? '正在恢复推进会话' : '空图无需预热，推进会话待恢复'
+      : warmupPrefix + warmupStatusText(warmupDisplayStatus)
+    : ''
   warmupStatus.dataset.status = warmupDisplayStatus || 'none'
 
-  if (workflowLoading && !workflowMessages.length) {
+  if (workflowLoadBlocksInteraction({ loading: workflowLoading, workflow }) && !workflowMessages.length) {
     chatLog.innerHTML = ''
     chatHint.textContent = '正在加载工作推进会话...'
     return
@@ -1342,8 +1547,9 @@ function renderResources() {
 
 function renderNotes() {
   const project = selectedProject()
-  if (btnImportNoteFile) btnImportNoteFile.disabled = !project || noteLoading || noteImporting
-  if (btnPasteNote) btnPasteNote.disabled = !project || noteLoading || noteImporting
+  const noteMutationBlocked = terminalActionPending || workflowIsRunning()
+  if (btnImportNoteFile) btnImportNoteFile.disabled = !project || noteMutationBlocked || noteLoading || noteImporting
+  if (btnPasteNote) btnPasteNote.disabled = !project || noteMutationBlocked || noteLoading || noteImporting
   if (!project) {
     setPreviewHtml(notePreview, 'note:no-project', '<div class="placeholder">选择项目后可以导入、粘贴或生成工作笔记。</div>')
     noteList.innerHTML = '<div class="placeholder">还没有项目。</div>'
@@ -1456,6 +1662,10 @@ function hideError() {
 }
 
 function openNoteImportModal() {
+  if (terminalActionPending || workflowIsRunning()) {
+    alert('大模型、预热或工具审批仍在处理，请等待完成后再修改工作笔记。')
+    return
+  }
   noteImportContent.value = workflowNote?.content || ''
   hideNoteImportError()
   noteImportModal.classList.remove('hidden')
@@ -1519,6 +1729,11 @@ function confirmNoteReplacement() {
 async function importNoteFile(file) {
   const project = selectedProject()
   if (!project || !file) return
+  if (terminalActionPending || workflowIsRunning()) {
+    if (noteFile) noteFile.value = ''
+    alert('大模型、预热或工具审批仍在处理，请等待完成后再修改工作笔记。')
+    return
+  }
   if (!confirmNoteReplacement()) return
   const form = new FormData()
   form.append('file', file)
@@ -1530,7 +1745,7 @@ async function importNoteFile(file) {
       body: form,
     })
     workflowNote = result
-    if (result?.workflow) workflow = result.workflow
+    if (result?.workflow) workflow = mergeWorkflowReadiness(workflow, result.workflow)
     await refreshAfterNoteImport()
   } catch (error) {
     notePreview.innerHTML = `<div class="placeholder">${esc(error.message || '导入失败')}</div>`
@@ -1549,6 +1764,10 @@ async function importPastedNote() {
     showNoteImportError('请先选择项目')
     return
   }
+  if (terminalActionPending || workflowIsRunning()) {
+    showNoteImportError('大模型、预热或工具审批仍在处理，请等待完成后再修改工作笔记。')
+    return
+  }
   if (!content) {
     showNoteImportError('请输入工作笔记内容')
     return
@@ -1564,7 +1783,7 @@ async function importPastedNote() {
       body: JSON.stringify({ content }),
     })
     workflowNote = result
-    if (result?.workflow) workflow = result.workflow
+    if (result?.workflow) workflow = mergeWorkflowReadiness(workflow, result.workflow)
     closeNoteImportModal()
     await refreshAfterNoteImport()
   } catch (error) {
@@ -1580,10 +1799,8 @@ projectSelect.onchange = () => {
   projectName = projectSelect.value
   restorePromptProject = ''
   clearWorkflowView()
-  resetGraphPreview()
   render()
-  connectWorkflowSSE()
-  Promise.all([loadWorkflow({ askRestore: true }), loadResources(), loadWorkflowNote(), loadWorkflowOperations()]).catch((error) => {
+  loadSelectedProjectView({ askRestore: true }).catch((error) => {
     chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '加载失败')}</div>`
   })
 }
@@ -1626,7 +1843,7 @@ btnCreateProject.onclick = createProject
 btnPasteNote.onclick = openNoteImportModal
 btnImportNoteFile.onclick = () => {
   const project = selectedProject()
-  if (!project) return
+  if (!project || terminalActionPending || workflowIsRunning()) return
   noteFile.click()
 }
 btnCancelNoteImport.onclick = closeNoteImportModal
@@ -1658,6 +1875,7 @@ btnUploadResource.onclick = () => {
 }
 
 async function discardWorkflowFromButton() {
+  if (terminalActionPending) return
   const project = selectedProject()
   await refreshWorkflowStateOnly(project)
   const reason = workflowActionBlockedReason('放弃草案')
@@ -1666,9 +1884,15 @@ async function discardWorkflowFromButton() {
     return
   }
   const state = currentWorkflowState()
-  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n这会结束并删除本轮 active workflow，包括 state、图操作草案、校验、预览和聊天会话；如果已有工作笔记，会只保留 workflows/active/note.md 供下一轮重新开始使用。已写入的正式图数据不会删除。`)
+  const correctionType = workflowCorrectionKind(state)
+  const notePolicy = correctionType === 'hard'
+    ? '这是硬更正草案；放弃后只会删除恢复出来的 active 现场，不保留本轮 note.md，正式图数据不会改变。'
+    : correctionType === 'soft'
+      ? '这是软更正草案；放弃后会删除本轮更正 note.md、图操作草案、校验、预览和聊天会话，不保留为普通推进笔记。'
+      : '这会结束并删除本轮 active workflow，包括 state、图操作草案、校验、预览和聊天会话；如果已有工作笔记，会只保留 workflows/active/note.md 供下一轮重新开始使用。已写入的正式图数据不会删除。'
+  const ok = confirm(`确认放弃项目「${project.name}」的本轮工作推进草案吗？\n\n当前阶段：${state.stage}\n\n${notePolicy}`)
   if (!ok) return
-  btnDiscardWorkflow.disabled = true
+  setTerminalActionPending(true)
   try {
     await fetchJson(API + `/project/workflow/action?project=${encodeURIComponent(project.name)}`, {
       method: 'POST',
@@ -1677,17 +1901,16 @@ async function discardWorkflowFromButton() {
     })
     clearWorkflowView()
     restorePromptProject = project.name
-    await loadWorkflow({ askRestore: false })
-    await loadWorkflowNote()
-    await loadWorkflowOperations()
+    await loadSelectedProjectView({ askRestore: false })
   } catch (error) {
     alert(error.message || '放弃草案失败')
   } finally {
-    updateTerminalActionButtons()
+    setTerminalActionPending(false)
   }
 }
 
 async function applyWorkflowFromButton() {
+  if (terminalActionPending) return
   const project = selectedProject()
   try {
     await refreshWorkflowStateOnly(project)
@@ -1703,7 +1926,7 @@ async function applyWorkflowFromButton() {
   const state = currentWorkflowState()
   const ok = confirm(`确认提交项目「${project.name}」的本轮图操作吗？\n\n当前阶段：${state.stage}\n\n提交后将进入正式图数据写入流程。`)
   if (!ok) return
-  btnApply.disabled = true
+  setTerminalActionPending(true)
   try {
     const result = await fetchJson(API + `/project/workflow/action?project=${encodeURIComponent(project.name)}`, {
       method: 'POST',
@@ -1712,20 +1935,75 @@ async function applyWorkflowFromButton() {
     })
     alert(result.message || '图操作已应用。')
     clearWorkflowView()
+    await refreshProjectDirectories({ renderPage: false })
     await loadWorkflow({ askRestore: false })
-    await loadWorkflowNote()
-    await loadWorkflowOperations()
+    await Promise.all([
+      loadResources(),
+      loadWorkflowNote(),
+      loadWorkflowOperations(),
+    ])
+    if (activeTab === 'graph') await ensureGraphPreviewLoaded({ force: true }).catch(() => {})
+    render()
   } catch (error) {
     alert(error.message || '应用图操作失败')
     await loadWorkflow({ askRestore: false }).catch(() => {})
     await loadWorkflowOperations().catch(() => {})
   } finally {
-    updateTerminalActionButtons()
+    setTerminalActionPending(false)
+  }
+}
+
+async function startCorrectionFromButton(kind) {
+  if (terminalActionPending) return
+  const project = selectedProject()
+  if (!project) {
+    alert('请先选择项目。')
+    return
+  }
+  try {
+    await refreshWorkflowStateOnly(project)
+  } catch (error) {
+    alert(error.message || '读取工作推进状态失败')
+    return
+  }
+  if (terminalActionPending) return
+  if (workflowIsRunning()) {
+    alert('大模型、预热或工具审批仍在处理，请等待完成后再切换更正模式。')
+    return
+  }
+  const state = currentWorkflowState()
+  const isHard = kind === 'hard'
+  const hasUnsubmittedWorkspace = !!state || !!workflowNote?.exists
+  const replacementWarning = hasUnsubmittedWorkspace
+    ? '当前存在未提交的工作现场；确认后会放弃它，未提交的工作笔记和 active 资源登记不会带入更正。\n\n'
+    : ''
+  const ok = confirm(isHard
+    ? `确认重做项目「${project.name}」最近一次提交吗？\n\n${replacementWarning}这会恢复那次提交的草案现场，并使用提交前图数据生成更正预览；正式图数据现在不会改变，只有最终确认提交时才会替换。`
+    : `确认为项目「${project.name}」追加更正记录吗？\n\n${replacementWarning}这会新建一轮 correction 草案，不回滚旧图数据，不修改旧历史；可以新增、更正或逻辑废弃节点和关系，最终会作为新的更正提交追加到图数据。`)
+  if (!ok) return
+  setTerminalActionPending(true)
+  try {
+    const result = await fetchJson(API + `/project/workflow/action?project=${encodeURIComponent(project.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: isHard ? '重做最近提交' : '开始软更正', payload: { confirm: true } }),
+    })
+    alert(result.message || (isHard ? '已恢复最近提交草案。' : '已开始追加更正记录。'))
+    clearWorkflowView()
+    await loadSelectedProjectView({ askRestore: false })
+  } catch (error) {
+    alert(error.message || (isHard ? '重做最近提交失败' : '开始软更正失败'))
+    await loadWorkflow({ askRestore: false }).catch(() => {})
+    await loadWorkflowOperations().catch(() => {})
+  } finally {
+    setTerminalActionPending(false)
   }
 }
 
 btnDiscardWorkflow.onclick = () => discardWorkflowFromButton()
 btnApply.onclick = () => applyWorkflowFromButton()
+btnHardCorrection.onclick = () => startCorrectionFromButton('hard')
+btnSoftCorrection.onclick = () => startCorrectionFromButton('soft')
 btnResourceModeSource.onclick = () => {
   if (resourceMode === 'source') return
   resourceMode = 'source'
@@ -1838,7 +2116,7 @@ async function previewResource(resourcePath) {
 async function sendChat() {
   const project = selectedProject()
   const text = chatInput.value.trim()
-  if (!project || !text || chatSending) return
+  if (!project || !text || terminalActionPending || chatSending) return
   chatSending = true
   workflowAwaitingReply = true
   pendingUserText = text
@@ -1856,6 +2134,8 @@ async function sendChat() {
   } catch (error) {
     workflowAwaitingReply = false
     pendingUserText = ''
+    await loadWorkflow({ askRestore: false }).catch(() => {})
+    await loadWorkflowOperations().catch(() => {})
     throw error
   } finally {
     chatSending = false
@@ -1865,11 +2145,16 @@ async function sendChat() {
 
 async function startWarmup() {
   const project = selectedProject()
-  if (!project?.graphInitialized || warmupStarting) return
+  if (!project || terminalActionPending || warmupStarting) return
   const state = currentWorkflowState()
   const force = !!state
   if (force) {
-    const ok = confirm('重新预热会创建新的 active workflow 和新的聊天会话；会保留当前工作笔记和资源登记，但清空图操作草案、校验和预览。是否继续？')
+    const message = workflow?.baseIsEmpty
+      ? '将重新建立当前工作推进聊天会话；不会改变正式图数据或当前草案。是否继续？'
+      : state.correction
+        ? '重新预热会基于当前草案的固定图基线建立软更正上下文，并替换当前更正聊天会话；不会改变正式图数据或当前草案。是否继续？'
+        : '重新预热会基于当前草案的固定图基线替换聊天会话；不会改变正式图数据，也不会清空工作笔记、资源或图操作草案。是否继续？'
+    const ok = confirm(message)
     if (!ok) return
   }
   warmupStarting = true

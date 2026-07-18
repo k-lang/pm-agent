@@ -6,6 +6,7 @@ import {
   isEditTool,
   isWriteTool,
   markWorkflowPermissionRecord,
+  mergeWorkflowReadiness,
   mergeWorkflowPermissionRecords,
   permissionListUrl,
   permissionReplyUrl,
@@ -21,7 +22,118 @@ import {
   writeToolRecords,
   workflowMaximizeBodyClass,
   workflowMaximizeButtonState,
+  workflowChatLockReason,
+  workflowCorrectionKind,
+  workflowLoadBlocksInteraction,
+  workflowMessageErrorText,
+  workflowOperationArtifactsChanged,
+  workflowViewRequestMatches,
 } from "./project-workflow-view.js"
+
+describe("project workflow chat readiness", () => {
+  const project = { name: "demo" }
+
+  test("allows first chat on an empty graph without an active workflow", () => {
+    expect(workflowChatLockReason({ project, workflow: { baseIsEmpty: true, sessionReady: false }, state: undefined })).toBe("")
+  })
+
+  test("requires explicit session recovery for an existing empty-base active", () => {
+    expect(workflowChatLockReason({
+      project,
+      workflow: { baseIsEmpty: true, sessionReady: false },
+      state: { stage: "笔记已生成" },
+    })).toContain("恢复推进会话")
+  })
+
+  test("locks a nonempty graph before warmup and while warmup is running", () => {
+    expect(workflowChatLockReason({ project, workflow: { baseIsEmpty: false }, state: undefined })).toContain("先预热")
+    expect(workflowChatLockReason({
+      project,
+      workflow: { baseIsEmpty: false, sessionReady: false },
+      state: { warmupStatus: "running" },
+    })).toContain("预热中")
+  })
+
+  test("unlocks a nonempty graph only when warmup and session are ready", () => {
+    expect(workflowChatLockReason({
+      project,
+      workflow: { baseIsEmpty: false, sessionReady: true },
+      state: { warmupStatus: "completed" },
+    })).toBe("")
+  })
+
+  test("keeps computed readiness when note or operation payload refreshes workflow state", () => {
+    const merged = mergeWorkflowReadiness(
+      { baseIsEmpty: false, sessionReady: true, warmupStatus: "completed", state: { stage: "收集材料" } },
+      { state: { stage: "图操作已生成", warmupStatus: "completed" } },
+    )
+    expect(merged).toMatchObject({
+      baseIsEmpty: false,
+      sessionReady: true,
+      warmupStatus: "completed",
+      state: { stage: "图操作已生成" },
+    })
+    expect(workflowChatLockReason({ project, workflow: merged, state: merged.state })).toBe("")
+  })
+
+  test("does not lock an already rendered workflow during a background refresh", () => {
+    const workflow = { baseIsEmpty: true, sessionReady: true, state: { stage: "图操作已生成" } }
+    expect(workflowLoadBlocksInteraction({ loading: true, workflow })).toBe(false)
+    expect(workflowChatLockReason({ project, workflow, state: workflow.state, loading: true })).toBe("")
+    expect(workflowLoadBlocksInteraction({ loading: true, workflow: null })).toBe(true)
+  })
+
+  test("extracts provider errors from assistant message metadata", () => {
+    expect(workflowMessageErrorText({
+      name: "APIError",
+      data: { message: "Unauthorized: Invalid API key", statusCode: 401 },
+    })).toBe("Unauthorized: Invalid API key")
+    expect(workflowMessageErrorText({ name: "AbortedError" })).toBe("AbortedError")
+    expect(workflowMessageErrorText(undefined)).toBe("")
+  })
+
+  test("refreshes operation artifacts when a generated workflow changes", () => {
+    expect(workflowOperationArtifactsChanged(
+      { stage: "笔记已生成", updatedAt: 1 },
+      { stage: "图操作已生成", updatedAt: 2 },
+    )).toBe(true)
+    expect(workflowOperationArtifactsChanged(
+      { stage: "图操作已生成", updatedAt: 2 },
+      { stage: "图操作已生成", updatedAt: 3 },
+    )).toBe(true)
+    expect(workflowOperationArtifactsChanged(
+      { stage: "图操作已生成", updatedAt: 3 },
+      { stage: "图操作已生成", updatedAt: 3 },
+    )).toBe(false)
+    expect(workflowOperationArtifactsChanged(
+      { stage: "图操作已生成", updatedAt: 3 },
+      { stage: "笔记已生成", updatedAt: 4 },
+    )).toBe(true)
+    expect(workflowOperationArtifactsChanged(
+      { stage: "收集材料", updatedAt: 3 },
+      { stage: "笔记已生成", updatedAt: 4 },
+    )).toBe(false)
+  })
+
+  test("rejects responses from an invalidated view or another project", () => {
+    const current = { projectName: "demo", generation: 4 }
+    expect(workflowViewRequestMatches({ projectName: "demo", generation: 4 }, current)).toBe(true)
+    expect(workflowViewRequestMatches({ projectName: "demo", generation: 3 }, current)).toBe(false)
+    expect(workflowViewRequestMatches({ projectName: "other", generation: 4 }, current)).toBe(false)
+  })
+})
+
+describe("project workflow correction semantics", () => {
+  test("distinguishes lifecycle correction kind for all unified active combinations", () => {
+    expect(workflowCorrectionKind({})).toBe("")
+    expect(workflowCorrectionKind({ correction: { expectedChangeId: "correction1_" } })).toBe("soft")
+    expect(workflowCorrectionKind({ hardCorrection: { expectedChangeId: "step0_demo_fix1" } })).toBe("hard")
+    expect(workflowCorrectionKind({
+      correction: { expectedChangeId: "correction1_" },
+      hardCorrection: { expectedChangeId: "correction1_demo_fix1" },
+    })).toBe("hard")
+  })
+})
 
 function permission(overrides = {}) {
   return {

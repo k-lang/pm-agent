@@ -14,10 +14,13 @@ import { ProjectDetail } from "@/project/detail"
 import { SessionID } from "@/session/schema"
 import { Session } from "@/session"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionStatus } from "@/session/status"
+import { Permission } from "@/permission"
 import { Instance } from "@/project/instance"
 import { MessageV2 } from "@/session/message-v2"
 import { ProjectWorkflow } from "@/workflow/state"
 import { ProjectWorkflowExecution } from "@/workflow/execution"
+import { GraphVersionStore } from "@/graph/version-store"
 import { loadExpandedGraph, loadGraph, saveLayout } from "../../../standalone-graph/transform"
 
 const ProjectDirectory = z.object({
@@ -93,6 +96,10 @@ const GraphView = z.enum(["collapsed", "expanded"]).default("collapsed")
 const GraphQuery = z.object({
   directory: z.string().optional(),
   project: z.string().optional(),
+  view: GraphView.optional(),
+})
+
+const WorkflowGraphQuery = ProjectOnlyQuery.extend({
   view: GraphView.optional(),
 })
 
@@ -214,6 +221,7 @@ async function ensureProjectStructure(directory: string) {
     const template = await fs.readFile(projectReadmeTemplatePath(), "utf8")
     await fs.writeFile(readmePath, template.endsWith("\n") ? template : `${template}\n`, "utf8")
   }
+  await GraphVersionStore.ensure(directory)
 }
 
 async function createInitialWorkflow(directory: string, background: string | undefined, now: number) {
@@ -665,6 +673,19 @@ async function readWorkflowOperationArtifacts(project: string) {
   return ProjectWorkflowExecution.readOperationArtifacts({ project, directory })
 }
 
+async function readWorkflowGraph(project: string, view: z.infer<typeof GraphView>) {
+  const directory = projectDirectoryForName(project)
+  await ensureExistingProject(directory)
+  await GraphVersionStore.ensure(directory)
+  const active = await ProjectWorkflow.getActive({ project, directory })
+  const graphDirectory = active.state
+    ? await GraphVersionStore.resolveActiveBase(directory)
+    : await GraphVersionStore.resolve(directory, "latest")
+  return view === "expanded"
+    ? loadExpandedGraph(graphDirectory)
+    : loadGraph(graphDirectory)
+}
+
 async function importWorkflowNote(input: {
   project: string
   content: string
@@ -673,17 +694,19 @@ async function importWorkflowNote(input: {
 }) {
   const directory = projectDirectoryForName(input.project)
   await ensureExistingProject(directory)
-  await ProjectWorkflow.runAction({ project: input.project, directory, action: "开始或恢复", payload: {} })
-  await ProjectWorkflowExecution.writeNote({ directory, content: input.content })
   const workflow = await ProjectWorkflowExecution.runAction({
     project: input.project,
     directory,
-    action: "同步工作笔记变更",
+    action: "更新工作笔记",
     payload: {
+      content: input.content,
       summary: input.summary ?? "人工修改工作笔记。",
       source: input.source ?? "manual_edit",
     },
   })
+  if (workflow.data?.recoveredPublishedApply) {
+    throw new HTTPException(409, { message: "上一轮图操作已经发布并完成归档，本次工作笔记修改未执行。" })
+  }
   return WorkflowNote.parse({
     exists: true,
     content: input.content.trimEnd() + "\n",
@@ -720,6 +743,12 @@ async function latestAssistantText(sessionID: SessionID) {
   return assistant ? visibleMessageText(assistant) : ""
 }
 
+export function requireWarmupContext(context: string) {
+  const result = context.trim()
+  if (!result) throw new Error("项目上下文预热未生成有效内容，请重新预热。")
+  return result
+}
+
 function warmupPrompt(project: string) {
   return [
     "请执行工作推进项目上下文预热。",
@@ -728,12 +757,30 @@ function warmupPrompt(project: string) {
     "",
     "要求：",
     "- 使用 project-workflow-context-warmup Skill。",
+    "- 图数据基线固定在 workflows/active/base_graph/；从这里读取 nodes、edges、changes、descriptions_output 和 snapshots。",
     "- 只建立项目主干上下文，供后续 workflow chat session fork 使用。",
     "- 只读取项目资料，不要创建、修改或删除任何文件。",
     "- 不要调用 workflow_action。",
     "- 不要生成正式项目总结报告，不要写 report_output。",
     "- 输出紧凑 Markdown，覆盖项目主线、当前目标状态、主要问题、主要工作块、最近变化的粗略线索、后续查找入口和需要确认的上下文缺口。",
   ].join("\n")
+}
+
+function correctionWarmupPrompt(project: string, expectedChangeId?: string) {
+  return [
+    "请执行项目图谱更正上下文预热。",
+    "",
+    `项目名：${project}`,
+    expectedChangeId ? `后端指定本轮 change_id 约束：${expectedChangeId}` : "",
+    "",
+    "要求：",
+    "- 只建立更正上下文，供后续 correction chat session fork 使用。",
+    "- 不读取 workflows/active/state.json；更正语义和 change_id 约束由后端在本请求中提供。",
+    "- 轻量读取 workflows/active/base_graph 中的图谱、最近 changelog 和相关 description_summary / nodes / edges 索引。",
+    "- 不创建、修改或删除任何文件。",
+    "- 不调用 workflow_action。",
+    "- 输出紧凑 Markdown，覆盖当前图谱主线、最近提交线索、可能需要更正的入口、软更正规则和后续需要核实的证据。",
+  ].filter(Boolean).join("\n")
 }
 
 async function createWorkflowChatSession(directory: string, warmupSessionID?: SessionID) {
@@ -750,18 +797,278 @@ async function createWorkflowChatSession(directory: string, warmupSessionID?: Se
   })
 }
 
-async function ensureWorkflowChatSession(project: string, directory: string, graphInitialized: boolean) {
-  let active = await ProjectWorkflow.getActive({ project, directory })
+export function workflowAgentProfile(state: ProjectWorkflow.State | undefined) {
+  return ProjectWorkflow.usesCorrectionWorkflowSemantics(state)
+    ? {
+        primary: "project_workflow_correction" as const,
+        warmup: "project_workflow_correction_warmup" as const,
+      }
+    : {
+        primary: "project_workflow" as const,
+        warmup: "project_workflow_warmup" as const,
+      }
+}
+
+export function workflowChatAgent(state: ProjectWorkflow.State | undefined) {
+  return workflowAgentProfile(state).primary
+}
+
+async function sessionExists(directory: string, sessionID: string | undefined) {
+  if (!sessionID) return false
+  return Instance.provide({
+    directory,
+    fn: () => Session.get(sessionID as SessionID).then(() => true).catch(() => false),
+  })
+}
+
+async function forkExistingSession(directory: string, sessionID: string) {
+  return Instance.provide({
+    directory,
+    fn: async () => {
+      const forked = await Session.fork({ sessionID: sessionID as SessionID })
+      await Session.setTitle({ sessionID: forked.id, title: "工作推进" })
+      return forked
+    },
+  })
+}
+
+async function cleanupWorkflowChatSession(directory: string, sessionID: string | undefined) {
+  if (!sessionID) return
+  await Instance.provide({
+    directory,
+    fn: async () => {
+      await SessionPrompt.cancel(sessionID as SessionID).catch(() => undefined)
+      await Session.remove(sessionID as SessionID).catch(() => undefined)
+    },
+  }).catch(() => undefined)
+}
+
+async function assertWorkflowIdle(project: string, directory: string, actionLabel: string) {
+  const active = await ProjectWorkflowExecution.getActive({ project, directory })
+  const state = active.state
+  if (!state) return
+  if (state.warmupStatus === "running") {
+    throw new HTTPException(409, { message: `项目上下文仍在预热，完成前不能${actionLabel}。` })
+  }
+  const sessionIDs = new Set([state.sessionID, state.warmupSessionID].filter((id): id is string => !!id))
+  if (!sessionIDs.size) return
+  const [statuses, permissions] = await Instance.provide({
+    directory,
+    fn: () => Promise.all([
+      Promise.all([...sessionIDs].map(async (id) => [id, await SessionStatus.get(id as SessionID)] as const)),
+      Permission.list(),
+    ]),
+  })
+  if (statuses.some(([, status]) => status.type === "busy" || status.type === "retry")) {
+    throw new HTTPException(409, { message: `大模型仍在处理当前工作推进，回复完成前不能${actionLabel}。` })
+  }
+  if (permissions.some((permission) => sessionIDs.has(permission.sessionID))) {
+    throw new HTTPException(409, { message: `当前还有待处理的工具修改审批，批准或拒绝前不能${actionLabel}。` })
+  }
+}
+
+const activeWarmupRuns = new Map<string, { token: string; sessionID?: SessionID }>()
+
+async function invalidateActiveWarmup(directory: string) {
+  const key = path.resolve(directory)
+  const run = activeWarmupRuns.get(key)
+  activeWarmupRuns.delete(key)
+  if (!run?.sessionID) return
+  await Instance.provide({
+    directory,
+    fn: () => SessionPrompt.cancel(run.sessionID!),
+  }).catch(() => undefined)
+}
+
+async function runWorkflowWarmupSession(input: {
+  project: string
+  directory: string
+  active: ProjectWorkflow.ActionResult
+  title: string
+  agent: "project_workflow_warmup" | "project_workflow_correction_warmup"
+  prompt: string
+  contextPath: string
+}) {
+  const workflowID = input.active.state?.id
+  if (!workflowID) throw new Error("当前没有可预热的 active 工作推进草案。")
+  const key = path.resolve(input.directory)
+  const runToken = ulid()
+  activeWarmupRuns.set(key, { token: runToken })
+  const previousSessionID = input.active.state?.sessionID
+  let warmupSessionID: SessionID | undefined
+  let chatSessionID: SessionID | undefined
+  try {
+    const warmupSession = await Instance.provide({
+      directory: input.directory,
+      fn: () => Session.create({ title: input.title }),
+    })
+    warmupSessionID = warmupSession.id
+    const currentRun = activeWarmupRuns.get(key)
+    if (currentRun?.token !== runToken) return undefined
+    currentRun.sessionID = warmupSession.id
+    const running = await ProjectWorkflow.bindSessionsIfCurrent({
+      project: input.project,
+      directory: input.directory,
+      expectedWorkflowID: workflowID,
+      warmupSessionID: warmupSession.id,
+      warmupStatus: "running",
+    })
+    if (!running) return undefined
+    if (activeWarmupRuns.get(key)?.token !== runToken) return undefined
+
+    await Instance.provide({
+      directory: input.directory,
+      fn: () => SessionPrompt.prompt({
+        sessionID: warmupSession.id,
+        agent: input.agent,
+        noReply: true,
+        parts: [{ type: "text", text: input.prompt }],
+      }),
+    })
+    await Instance.provide({
+      directory: input.directory,
+      fn: () => SessionPrompt.loop({ sessionID: warmupSession.id }),
+    })
+    if (activeWarmupRuns.get(key)?.token !== runToken) return undefined
+
+    const context = requireWarmupContext(await Instance.provide({
+      directory: input.directory,
+      fn: () => latestAssistantText(warmupSession.id),
+    }))
+    const chatSession = await createWorkflowChatSession(input.directory, warmupSession.id)
+    chatSessionID = chatSession.id
+    const bound = await ProjectWorkflow.bindSessionsIfCurrent({
+      project: input.project,
+      directory: input.directory,
+      expectedWorkflowID: workflowID,
+      expectedWarmupSessionID: warmupSession.id,
+      sessionID: chatSession.id,
+      warmupSessionID: warmupSession.id,
+      warmupStatus: "completed",
+      reset: true,
+    })
+    if (!bound) {
+      await cleanupWorkflowChatSession(input.directory, chatSession.id)
+      return undefined
+    }
+    const current = await ProjectWorkflow.getActive({ project: input.project, directory: input.directory })
+    if (current.state?.id === workflowID && current.state.sessionID === chatSession.id) {
+      await fs.writeFile(
+        path.join(input.directory, "workflows", "active", input.contextPath),
+        context + "\n",
+        "utf8",
+      )
+    }
+    if (previousSessionID && previousSessionID !== chatSession.id) {
+      await cleanupWorkflowChatSession(input.directory, previousSessionID)
+    }
+    return bound
+  } catch (error) {
+    if (activeWarmupRuns.get(key)?.token === runToken) {
+      await ProjectWorkflow.bindSessionsIfCurrent({
+        project: input.project,
+        directory: input.directory,
+        expectedWorkflowID: workflowID,
+        ...(chatSessionID ? {
+          sessionID: undefined,
+          warmupSessionID,
+          reset: true,
+        } : {}),
+        warmupStatus: "failed",
+      }).catch(() => undefined)
+    }
+    if (chatSessionID) await cleanupWorkflowChatSession(input.directory, chatSessionID)
+    throw error
+  } finally {
+    if (activeWarmupRuns.get(key)?.token === runToken) activeWarmupRuns.delete(key)
+  }
+}
+
+const RestoredWorkflowSession = z.object({
+  sessionID: z.string().optional(),
+  sessionStartedAt: z.number().optional(),
+  warmupSessionID: z.string().optional(),
+  warmupStatus: ProjectWorkflow.BaselineStatus.optional(),
+})
+type RestoredWorkflowSession = z.infer<typeof RestoredWorkflowSession>
+
+async function prepareHardCorrectionWorkflowChat(project: string, directory: string, state: ProjectWorkflow.State, restored?: RestoredWorkflowSession) {
+  if (!state.hardCorrection) throw new Error("当前 active 不是硬更正现场。")
+  if (state.sessionID && await sessionExists(directory, state.sessionID)) return state.sessionID as SessionID
+  const restoredSessionID = restored?.sessionID
+  const restoredWarmupSessionID = restored?.warmupSessionID
+  if (restoredSessionID && await sessionExists(directory, restoredSessionID)) {
+    const chatSession = await forkExistingSession(directory, restoredSessionID)
+    const bound = await ProjectWorkflow.bindRestoredWorkflowChat({
+      project,
+      directory,
+      sessionID: chatSession.id,
+      sessionStartedAt: restored?.sessionStartedAt,
+      warmupSessionID: restoredWarmupSessionID,
+      warmupStatus: restored?.warmupStatus,
+    })
+    if (!bound.state?.sessionID) throw new Error("硬更正工作推进会话绑定失败。")
+    return bound.state.sessionID as SessionID
+  }
+  if (restoredWarmupSessionID && await sessionExists(directory, restoredWarmupSessionID)) {
+    const chatSession = await createWorkflowChatSession(directory, restoredWarmupSessionID as SessionID)
+    const bound = await ProjectWorkflow.bindRestoredWorkflowChat({
+      project,
+      directory,
+      sessionID: chatSession.id,
+      warmupSessionID: restoredWarmupSessionID,
+      warmupStatus: "completed",
+    })
+    if (!bound.state?.sessionID) throw new Error("硬更正工作推进会话绑定失败。")
+    return bound.state.sessionID as SessionID
+  }
+
+  const base = await GraphVersionStore.resolveActiveBase(directory)
+  if (await GraphVersionStore.isEmpty(base)) {
+    const chatSession = await createWorkflowChatSession(directory)
+    const bound = await ProjectWorkflow.bindSessions({
+      project,
+      directory,
+      sessionID: chatSession.id,
+      warmupStatus: "completed",
+      reset: true,
+    })
+    if (!bound.state?.sessionID) throw new Error("硬更正工作推进会话绑定失败。")
+    return bound.state.sessionID as SessionID
+  }
+
+  const active = await ProjectWorkflowExecution.getActive({ project, directory })
+  const warmed = await runWorkflowWarmupForActive(project, directory, active)
+  if (!warmed?.state?.sessionID) throw new Error("硬更正工作推进会话绑定失败。")
+  return warmed.state.sessionID as SessionID
+}
+
+async function ensureWorkflowChatSession(project: string, directory: string) {
+  let active: ProjectWorkflow.ActionResult = await ProjectWorkflowExecution.getActive({ project, directory })
   let state = active.state
+  let createdActive = false
   if (!state) {
-    active = await ProjectWorkflow.runAction({ project, directory, action: "开始或恢复", payload: {} })
+    active = await ProjectWorkflowExecution.runAction({ project, directory, action: "开始或恢复", payload: {} })
     state = active.state
+    createdActive = true
   }
   if (!state) throw new Error("无法创建工作推进草案。")
-  if (graphInitialized && state.warmupStatus !== "completed") {
+  const base = await GraphVersionStore.resolveActiveBase(directory)
+  const baseIsEmpty = await GraphVersionStore.isEmpty(base)
+  if (!baseIsEmpty && state.warmupStatus !== "completed") {
     throw new HTTPException(409, { message: "项目上下文预热尚未完成，暂不能开始工作推进对话。" })
   }
-  if (state.sessionID) return state.sessionID as SessionID
+  if (state.sessionID) {
+    const sessionID = state.sessionID as SessionID
+    if (await sessionExists(directory, sessionID)) return sessionID
+  }
+  if (!createdActive) {
+    throw new HTTPException(409, {
+      message: baseIsEmpty
+        ? "推进会话尚未就位，请使用恢复推进会话入口后再继续。"
+        : "推进会话尚未就位，请重新预热并恢复会话后再继续。",
+    })
+  }
   const session = await createWorkflowChatSession(directory, state.warmupSessionID as SessionID | undefined)
   const bound = await ProjectWorkflow.bindSessions({
     project,
@@ -774,63 +1081,35 @@ async function ensureWorkflowChatSession(project: string, directory: string, gra
   return bound.state.sessionID as SessionID
 }
 
-async function runWorkflowWarmup(project: string, directory: string, carry: ProjectWorkflow.ActiveArtifactSnapshot) {
-  let warmupSessionID: SessionID | undefined
-  try {
-    const warmupSession = await Instance.provide({
-      directory,
-      fn: () => Session.create({ title: "工作推进上下文预热" }),
-    })
-    warmupSessionID = warmupSession.id
-    await ProjectWorkflow.bindSessions({
-      project,
-      directory,
-      warmupSessionID,
-      warmupStatus: "running",
-    })
-    await Instance.provide({
-      directory,
-      fn: () => SessionPrompt.prompt({
-        sessionID: warmupSession.id,
-        agent: "project_workflow_warmup",
-        noReply: true,
-        parts: [{ type: "text", text: warmupPrompt(project) }],
-      }),
-    })
-    await Instance.provide({
-      directory,
-      fn: () => SessionPrompt.loop({ sessionID: warmupSession.id }),
-    })
-    const context = await Instance.provide({
-      directory,
-      fn: () => latestAssistantText(warmupSession.id),
-    })
-    const chatSession = await createWorkflowChatSession(directory, warmupSession.id)
-    const replaced = await ProjectWorkflow.replaceActiveForWarmup({
-      project,
-      directory,
-      sessionID: chatSession.id,
-      warmupSessionID: warmupSession.id,
-      warmupStatus: "completed",
-      carry,
-    })
-    if (context.trim()) {
-      await fs.writeFile(
-        path.join(directory, "workflows", "active", "context_warmup.md"),
-        context.trimEnd() + "\n",
-        "utf8",
-      )
-    }
-    return replaced
-  } catch (error) {
-    await ProjectWorkflow.bindSessions({
-      project,
-      directory,
-      ...(warmupSessionID ? { warmupSessionID } : {}),
-      warmupStatus: "failed",
-    }).catch(() => undefined)
-    throw error
-  }
+async function runCorrectionWarmup(project: string, directory: string, active: ProjectWorkflow.ActionResult) {
+  const expectedChangeId = ProjectWorkflow.expectedChangeId(active.state)
+  return runWorkflowWarmupSession({
+    project,
+    directory,
+    active,
+    title: "图谱软更正上下文预热",
+    agent: "project_workflow_correction_warmup",
+    prompt: correctionWarmupPrompt(project, expectedChangeId),
+    contextPath: "correction_warmup.md",
+  })
+}
+
+async function runWorkflowWarmup(project: string, directory: string, active: ProjectWorkflow.ActionResult) {
+  return runWorkflowWarmupSession({
+    project,
+    directory,
+    active,
+    title: "工作推进上下文预热",
+    agent: "project_workflow_warmup",
+    prompt: warmupPrompt(project),
+    contextPath: "context_warmup.md",
+  })
+}
+
+async function runWorkflowWarmupForActive(project: string, directory: string, active: ProjectWorkflow.ActionResult) {
+  return workflowAgentProfile(active.state).warmup === "project_workflow_correction_warmup"
+    ? runCorrectionWarmup(project, directory, active)
+    : runWorkflowWarmup(project, directory, active)
 }
 
 export const ProjectRoutes = lazy(() =>
@@ -905,7 +1184,10 @@ export const ProjectRoutes = lazy(() =>
         },
       }),
       validator("query", ProjectOnlyQuery),
-      async (c) => c.json(await ProjectWorkflow.getActive(c.req.valid("query"))),
+      async (c) => {
+        const { project } = c.req.valid("query")
+        return c.json(await ProjectWorkflowExecution.getActive({ project, directory: projectDirectoryForName(project) }))
+      },
     )
     .post(
       "/workflow/action",
@@ -921,7 +1203,47 @@ export const ProjectRoutes = lazy(() =>
       validator("json", ProjectWorkflow.ActionRequest.omit({ project: true })),
       async (c) => {
         const query = c.req.valid("query")
-        return c.json(await ProjectWorkflowExecution.runAction({ project: query.project, ...c.req.valid("json") }))
+        const input = c.req.valid("json")
+        const directory = projectDirectoryForName(query.project)
+        const correctionConfirmed = input.payload?.confirm === true
+        const correctionAction = input.action === "开始软更正" || input.action === "重做最近提交"
+        if (input.action === "应用图操作") await assertWorkflowIdle(query.project, directory, "提交图操作")
+        if (correctionConfirmed && correctionAction) await assertWorkflowIdle(query.project, directory, "切换更正模式")
+        const result = await ProjectWorkflowExecution.runAction({ project: query.project, ...input })
+        if (input.action === "放弃草案" || (correctionConfirmed && (input.action === "开始软更正" || input.action === "重做最近提交"))) {
+          await invalidateActiveWarmup(directory)
+        }
+        if (input.action === "开始软更正" && result.state?.correction && !result.state.hardCorrection) {
+          const base = await GraphVersionStore.resolveActiveBase(directory)
+          if (await GraphVersionStore.isEmpty(base)) {
+            const chat = await createWorkflowChatSession(directory)
+            await ProjectWorkflow.bindSessions({
+              project: query.project,
+              directory,
+              sessionID: chat.id,
+              warmupStatus: "completed",
+              reset: true,
+            })
+            return c.json(await ProjectWorkflowExecution.getActive({ project: query.project, directory }))
+          }
+          await ProjectWorkflow.bindSessions({ project: query.project, directory, warmupStatus: "running" })
+          void runCorrectionWarmup(query.project, directory, result).catch(() => undefined)
+          return c.json(await ProjectWorkflowExecution.getActive({ project: query.project, directory }))
+        }
+        if (input.action === "重做最近提交" && result.state?.hardCorrection) {
+          const restored = result.data?.restoredSession && typeof result.data.restoredSession === "object"
+            ? RestoredWorkflowSession.parse(result.data.restoredSession)
+            : undefined
+          await prepareHardCorrectionWorkflowChat(query.project, directory, result.state, restored)
+          const refreshed = await ProjectWorkflowExecution.getActive({ project: query.project, directory })
+          const { restoredSession: _restoredSession, ...data } = result.data ?? {}
+          return c.json({
+            ...refreshed,
+            message: result.message,
+            data,
+          })
+        }
+        return c.json(result)
       },
     )
     .post(
@@ -941,19 +1263,39 @@ export const ProjectRoutes = lazy(() =>
         const input = c.req.valid("json")
         const directory = projectDirectoryForName(project)
         await ensureExistingProject(directory)
-        const projectState = await readProjectState(directory)
-        if (!projectState.graphInitialized) badRequest("未初始化项目不需要项目上下文预热。")
-        const current = await ProjectWorkflow.getActive({ project, directory })
-        if (current.state?.warmupStatus === "running") return c.json(current)
+        const recovered = await ProjectWorkflowExecution.finishCommittedActiveIfNeeded({ project, directory })
+        if (recovered) {
+          return c.json({
+            ...recovered,
+            message: "上一轮图操作已经发布并完成归档，本次预热未执行。",
+            data: { ...recovered.data, recoveredPublishedApply: true },
+          })
+        }
+        const current = await ProjectWorkflowExecution.getActive({ project, directory })
+        if (current.state?.warmupStatus === "running" && !input.force) return c.json(current)
         if (current.state && !input.force) {
           throw new HTTPException(409, { message: "当前已有 active 工作推进草案；重新预热需要 force=true。" })
         }
-        const carry = await ProjectWorkflow.readActiveArtifacts({ project, directory })
-        let active = current
-        if (!active.state) active = await ProjectWorkflow.runAction({ project, directory, action: "开始或恢复", payload: {} })
+        let active: ProjectWorkflow.ActionResult = current
+        if (!active.state) active = await ProjectWorkflowExecution.runAction({ project, directory, action: "开始或恢复", payload: {} })
+        await invalidateActiveWarmup(directory)
+        const base = await GraphVersionStore.resolveActiveBase(directory)
+        if (await GraphVersionStore.isEmpty(base)) {
+          const previousSessionID = active.state?.sessionID
+          const chat = await createWorkflowChatSession(directory)
+          await ProjectWorkflow.bindSessions({
+            project,
+            directory,
+            sessionID: chat.id,
+            warmupStatus: "completed",
+            reset: true,
+          })
+          if (previousSessionID && previousSessionID !== chat.id) await cleanupWorkflowChatSession(directory, previousSessionID)
+          return c.json(await ProjectWorkflowExecution.getActive({ project, directory }))
+        }
         await ProjectWorkflow.bindSessions({ project, directory, warmupStatus: "running" })
-        void runWorkflowWarmup(project, directory, carry).catch(() => undefined)
-        return c.json(await ProjectWorkflow.getActive({ project, directory }))
+        void runWorkflowWarmupForActive(project, directory, active).catch(() => undefined)
+        return c.json(await ProjectWorkflowExecution.getActive({ project, directory }))
       },
     )
     .post(
@@ -973,13 +1315,17 @@ export const ProjectRoutes = lazy(() =>
         const input = c.req.valid("json")
         const directory = projectDirectoryForName(project)
         await ensureExistingProject(directory)
-        const projectState = await readProjectState(directory)
-        const sessionID = await ensureWorkflowChatSession(project, directory, !!projectState.graphInitialized)
+        const recovered = await ProjectWorkflowExecution.finishCommittedActiveIfNeeded({ project, directory })
+        if (recovered) {
+          throw new HTTPException(409, { message: "上一轮图操作已经发布并完成归档，本次消息未发送。" })
+        }
+        const sessionID = await ensureWorkflowChatSession(project, directory)
+        const active = await ProjectWorkflow.getActive({ project, directory })
         const userMessage = await Instance.provide({
           directory,
           fn: () => SessionPrompt.prompt({
             sessionID,
-            agent: "project_workflow",
+            agent: workflowChatAgent(active.state),
             noReply: true,
             parts: [{ type: "text", text: input.text }],
           }),
@@ -1010,13 +1356,16 @@ export const ProjectRoutes = lazy(() =>
         const { project } = c.req.valid("query")
         const directory = projectDirectoryForName(project)
         await ensureExistingProject(directory)
-        const active = await ProjectWorkflow.getActive({ project, directory })
+        const active = await ProjectWorkflowExecution.getActive({ project, directory })
         const sessionID = active.state?.sessionID
-        if (!sessionID) return c.json({ sessionID: undefined, messages: [], workflow: active })
+        if (!sessionID) return c.json({ sessionID: undefined, messages: [], workflow: { ...active, sessionReady: false } })
+        if (!await sessionExists(directory, sessionID)) {
+          return c.json({ sessionID, messages: [], workflow: { ...active, sessionReady: false } })
+        }
         const messages = await Instance.provide({
           directory,
           fn: () => Session.messages({ sessionID: sessionID as SessionID }),
-        })
+        }).catch(() => [])
         const startedAt = active.state?.sessionStartedAt
         let visibleMessages = messages
         if (typeof startedAt === "number") {
@@ -1029,7 +1378,7 @@ export const ProjectRoutes = lazy(() =>
           const warmupCutoff = Math.max(0, ...warmupMessages.map((message) => message.info.time.created ?? 0))
           if (warmupCutoff > 0) visibleMessages = messages.filter((message) => (message.info.time.created ?? 0) > warmupCutoff)
         }
-        return c.json({ sessionID, messages: visibleMessages, workflow: active })
+        return c.json({ sessionID, messages: visibleMessages, workflow: { ...active, sessionReady: true } })
       },
     )
     .get(
@@ -1058,6 +1407,22 @@ export const ProjectRoutes = lazy(() =>
       validator("query", ProjectOnlyQuery),
       async (c) => c.json(await readWorkflowOperationArtifacts(c.req.valid("query").project)),
     )
+    .get(
+      "/workflow/graph",
+      describeRoute({
+        summary: "Get the active workflow base graph payload",
+        operationId: "project.workflowGraph",
+        responses: {
+          200: { description: "Active workflow base graph payload", content: { "application/json": { schema: resolver(z.any()) } } },
+          ...errors(400),
+        },
+      }),
+      validator("query", WorkflowGraphQuery),
+      async (c) => {
+        const query = c.req.valid("query")
+        return c.json(await readWorkflowGraph(query.project, query.view || "collapsed"))
+      },
+    )
     .post(
       "/workflow/note/import",
       describeRoute({
@@ -1071,6 +1436,9 @@ export const ProjectRoutes = lazy(() =>
       validator("query", ProjectOnlyQuery),
       async (c) => {
         const { project } = c.req.valid("query")
+        const directory = projectDirectoryForName(project)
+        await ensureExistingProject(directory)
+        await assertWorkflowIdle(project, directory, "修改工作笔记")
         const contentType = c.req.header("content-type") || ""
         if (contentType.includes("multipart/form-data")) {
           const body = await c.req.parseBody({ all: true })
@@ -1141,8 +1509,9 @@ export const ProjectRoutes = lazy(() =>
         ]
         await writeSourceRegistry(target.directory, { resources })
 
-        await ProjectWorkflow.runAction({
+        await ProjectWorkflowExecution.runAction({
           project,
+          directory: target.directory,
           action: "登记资源",
           payload: {
             path: resource.path,

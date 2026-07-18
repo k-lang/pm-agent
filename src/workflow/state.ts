@@ -5,6 +5,7 @@ import z from "zod"
 import { projectGraphRoot } from "@/project/root"
 
 export namespace ProjectWorkflow {
+  const mutationTails = new Map<string, Promise<void>>()
   export const Stage = z.enum([
     "收集材料",
     "笔记已生成",
@@ -29,6 +30,8 @@ export namespace ProjectWorkflow {
     "校验图操作",
     "提出修订意见",
     "应用图操作",
+    "重做最近提交",
+    "开始软更正",
   ])
   export type Action = z.infer<typeof Action>
 
@@ -60,10 +63,17 @@ export namespace ProjectWorkflow {
     warmupStatus: BaselineStatus.optional(),
     createdAt: z.number(),
     updatedAt: z.number(),
-    base: z.object({
-      snapshotId: z.string().optional(),
-      graphHash: z.string().optional(),
-    }).default({}),
+    correction: z.object({
+      expectedChangeId: z.string(),
+      restoredAt: z.string(),
+    }).optional(),
+    hardCorrection: z.object({
+      ofChangeId: z.string(),
+      sourceArchivePath: z.string(),
+      fixIndex: z.number().int().positive(),
+      expectedChangeId: z.string(),
+      restoredAt: z.string(),
+    }).optional(),
     artifacts: ArtifactPaths.default({
       messages: "messages.jsonl",
       resources: "resources.json",
@@ -85,6 +95,20 @@ export namespace ProjectWorkflow {
     }).optional(),
   }).strict()
   export type State = z.infer<typeof State>
+
+  export function usesCorrectionWorkflowSemantics(state: State | undefined) {
+    return !!state?.correction
+  }
+
+  export function correctionKind(state: State | undefined) {
+    if (state?.hardCorrection) return "hard" as const
+    if (state?.correction) return "soft" as const
+    return undefined
+  }
+
+  export function expectedChangeId(state: State | undefined) {
+    return state?.hardCorrection?.expectedChangeId ?? state?.correction?.expectedChangeId
+  }
 
   export const ActionRequest = z.object({
     project: z.string(),
@@ -111,6 +135,9 @@ export namespace ProjectWorkflow {
     recommendations: z.array(z.string()),
     allowedActions: z.array(Action).optional(),
     state: State.optional(),
+    baseIsEmpty: z.boolean().optional(),
+    sessionReady: z.boolean().optional(),
+    warmupStatus: BaselineStatus.optional(),
     data: z.record(z.string(), z.unknown()).optional(),
   })
   export type ActionResult = z.infer<typeof ActionResult>
@@ -157,6 +184,19 @@ export namespace ProjectWorkflow {
     applyResultPath: z.string().optional(),
     archivePath: z.string().optional(),
   })
+
+  export const HardCorrectionPayload = z.object({
+    ofChangeId: z.string(),
+    sourceArchivePath: z.string(),
+    fixIndex: z.number().int().positive(),
+    expectedChangeId: z.string(),
+  })
+  export type HardCorrectionPayload = z.infer<typeof HardCorrectionPayload>
+
+  export const SoftCorrectionPayload = z.object({
+    expectedChangeId: z.string(),
+  })
+  export type SoftCorrectionPayload = z.infer<typeof SoftCorrectionPayload>
 
   const NoteReviewPayload = z.object({
     sufficient: z.boolean(),
@@ -213,6 +253,24 @@ export namespace ProjectWorkflow {
     return path.join(activeDir(directory), ArtifactPaths.parse({})[key])
   }
 
+  async function withStateMutation<T>(directory: string, operation: () => Promise<T>): Promise<T> {
+    const key = path.resolve(directory)
+    const previous = mutationTails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = previous.catch(() => undefined).then(() => gate)
+    mutationTails.set(key, tail)
+    await previous.catch(() => undefined)
+    try {
+      return await operation()
+    } finally {
+      release()
+      if (mutationTails.get(key) === tail) mutationTails.delete(key)
+    }
+  }
+
   async function ensureProject(directory: string) {
     const stat = await fs.stat(directory).catch(() => undefined)
     if (!stat?.isDirectory()) throw new Error(`项目目录不存在：${directory}`)
@@ -231,7 +289,10 @@ export namespace ProjectWorkflow {
 
   async function writeState(directory: string, state: State) {
     await fs.mkdir(activeDir(directory), { recursive: true })
-    await fs.writeFile(activeStatePath(directory), JSON.stringify(State.parse(state), null, 2) + "\n", "utf8")
+    const target = activeStatePath(directory)
+    const temporary = `${target}.writing`
+    await fs.writeFile(temporary, JSON.stringify(State.parse(state), null, 2) + "\n", "utf8")
+    await fs.rename(temporary, target)
   }
 
   async function appendJsonLine(file: string, value: unknown) {
@@ -254,25 +315,40 @@ export namespace ProjectWorkflow {
     })
   }
 
-  function withSessionBinding(state: State, input: { sessionID?: string; warmupSessionID?: string; warmupStatus?: BaselineStatus }) {
+  function withSessionBinding(state: State, input: { sessionID?: string; warmupSessionID?: string; warmupStatus?: BaselineStatus; reset?: boolean }) {
     const now = Date.now()
     const sessionChanged = !!input.sessionID && input.sessionID !== state.sessionID
     return State.parse({
       ...state,
-      sessionID: input.sessionID ?? state.sessionID,
-      sessionStartedAt: sessionChanged ? now : state.sessionStartedAt,
-      warmupSessionID: input.warmupSessionID ?? state.warmupSessionID,
-      warmupStatus: input.warmupStatus ?? state.warmupStatus,
+      sessionID: input.reset ? input.sessionID : input.sessionID ?? state.sessionID,
+      sessionStartedAt: input.reset ? (input.sessionID ? now : undefined) : sessionChanged ? now : state.sessionStartedAt,
+      warmupSessionID: input.reset ? input.warmupSessionID : input.warmupSessionID ?? state.warmupSessionID,
+      warmupStatus: input.reset ? input.warmupStatus : input.warmupStatus ?? state.warmupStatus,
       updatedAt: now,
     })
   }
 
+  function withRestoredWorkflowChat(state: State, input: { sessionID: string; sessionStartedAt?: number; warmupSessionID?: string; warmupStatus?: BaselineStatus }) {
+    return State.parse({
+      ...state,
+      sessionID: input.sessionID,
+      sessionStartedAt: input.sessionStartedAt,
+      warmupSessionID: input.warmupSessionID ?? state.warmupSessionID,
+      warmupStatus: input.warmupStatus ?? state.warmupStatus,
+      updatedAt: Date.now(),
+    })
+  }
+
   async function cleanupWorkflowChatSession(state?: State) {
-    if (!state?.sessionID) return
+    if (!state?.sessionID && !state?.warmupSessionID) return
     const [{ Session }, { SessionPrompt }] = await Promise.all([
       import("@/session"),
       import("@/session/prompt"),
     ])
+    if (state.warmupSessionID) {
+      await SessionPrompt.cancel(state.warmupSessionID as any).catch(() => undefined)
+    }
+    if (!state.sessionID) return
     await SessionPrompt.cancel(state.sessionID as any).catch(() => undefined)
     await Session.remove(state.sessionID as any).catch(() => undefined)
   }
@@ -316,21 +392,6 @@ export namespace ProjectWorkflow {
     return validation?.passed === true
   }
 
-  async function clearGraphDraftArtifacts(directory: string, state: State, options: { includeNoteReview?: boolean } = {}) {
-    const keys: (keyof z.infer<typeof ArtifactPaths>)[] = [
-      ...(options.includeNoteReview ? ["noteReview" as const] : []),
-      "operationNotes",
-      "changelogEntry",
-      "operationsDraft",
-      "operations",
-      "operationIndex",
-      "validation",
-      "preview",
-      "previewGraph",
-    ]
-    await Promise.all(keys.map((key) => fs.rm(artifactPath(directory, state, key), { recursive: key === "previewGraph", force: true })))
-  }
-
   async function assertOperationArtifactManifest(
     directory: string,
     state: State,
@@ -370,7 +431,12 @@ export namespace ProjectWorkflow {
       { action: "追加消息", reason: "继续记录用户输入、模型回应或审核意见。" },
       { action: "登记资源", reason: "登记上传附件或项目资源，供工作笔记引用。" },
       { action: "提出修订意见", reason: "记录用户对工作笔记、图操作或两者的审核意见。" },
-      { action: "放弃草案", reason: "结束并删除当前 active workflow；如已有工作笔记则只保留 note.md 供下一轮重新开始。", requiresUserConfirmation: true },
+      { action: "放弃草案", reason: state.hardCorrection
+        ? "放弃硬更正草案；只删除恢复出来的 active 现场，正式图数据不改变。"
+        : state.correction
+          ? "放弃软更正草案；删除本轮更正 note.md、图操作草案、校验、预览和聊天会话。"
+          : "结束并删除当前 active workflow；如已有普通工作笔记则只保留 note.md 供下一轮重新开始。",
+      requiresUserConfirmation: true },
     ]
     const blockedActions: { action: Action; reason: string }[] = []
 
@@ -473,19 +539,76 @@ export namespace ProjectWorkflow {
     sessionID?: string
     warmupSessionID?: string
     warmupStatus?: BaselineStatus
+    reset?: boolean
   }) {
     const project = validateProjectName(input.project)
     const directory = input.directory ?? projectDirectory(project)
-    await ensureProject(directory)
-    const existing = await readState(directory)
-    if (!existing) throw new Error("当前项目没有 active 工作推进草案，请先执行「开始或恢复」。")
-    const next = withSessionBinding(existing, {
-      sessionID: input.sessionID,
-      warmupSessionID: input.warmupSessionID,
-      warmupStatus: input.warmupStatus,
+    return withStateMutation(directory, async () => {
+      await ensureProject(directory)
+      const existing = await readState(directory)
+      if (!existing) throw new Error("当前项目没有 active 工作推进草案，请先执行「开始或恢复」。")
+      const next = withSessionBinding(existing, {
+        sessionID: input.sessionID,
+        warmupSessionID: input.warmupSessionID,
+        warmupStatus: input.warmupStatus,
+        reset: input.reset,
+      })
+      await writeState(directory, next)
+      return ok(project, directory, next, "已绑定工作推进会话。")
     })
-    await writeState(directory, next)
-    return ok(project, directory, next, "已绑定工作推进会话。")
+  }
+
+  export async function bindSessionsIfCurrent(input: {
+    project: string
+    directory?: string
+    expectedWorkflowID: string
+    expectedWarmupSessionID?: string
+    sessionID?: string
+    warmupSessionID?: string
+    warmupStatus?: BaselineStatus
+    reset?: boolean
+  }) {
+    const project = validateProjectName(input.project)
+    const directory = input.directory ?? projectDirectory(project)
+    return withStateMutation(directory, async () => {
+      await ensureProject(directory)
+      const existing = await readState(directory)
+      if (!existing || existing.id !== input.expectedWorkflowID) return undefined
+      if (input.expectedWarmupSessionID && existing.warmupSessionID !== input.expectedWarmupSessionID) return undefined
+      const next = withSessionBinding(existing, {
+        sessionID: input.sessionID,
+        warmupSessionID: input.warmupSessionID,
+        warmupStatus: input.warmupStatus,
+        reset: input.reset,
+      })
+      await writeState(directory, next)
+      return ok(project, directory, next, "已绑定工作推进会话。")
+    })
+  }
+
+  export async function bindRestoredWorkflowChat(input: {
+    project: string
+    directory?: string
+    sessionID: string
+    sessionStartedAt?: number
+    warmupSessionID?: string
+    warmupStatus?: BaselineStatus
+  }) {
+    const project = validateProjectName(input.project)
+    const directory = input.directory ?? projectDirectory(project)
+    return withStateMutation(directory, async () => {
+      await ensureProject(directory)
+      const existing = await readState(directory)
+      if (!existing) throw new Error("当前项目没有 active 工作推进草案，请先执行「开始或恢复」。")
+      const next = withRestoredWorkflowChat(existing, {
+        sessionID: input.sessionID,
+        sessionStartedAt: input.sessionStartedAt,
+        warmupSessionID: input.warmupSessionID,
+        warmupStatus: input.warmupStatus,
+      })
+      await writeState(directory, next)
+      return ok(project, directory, next, "已绑定恢复后的工作推进会话。")
+    })
   }
 
   export async function readActiveArtifacts(input: { project: string; directory?: string }): Promise<ActiveArtifactSnapshot> {
@@ -500,53 +623,19 @@ export namespace ProjectWorkflow {
     return ActiveArtifactSnapshot.parse({ note, resources })
   }
 
-  export async function replaceActiveForWarmup(input: {
-    project: string
-    directory?: string
-    sessionID: string
-    warmupSessionID: string
-    warmupStatus?: BaselineStatus
-    carry?: ActiveArtifactSnapshot
-  }) {
-    const project = validateProjectName(input.project)
-    const directory = input.directory ?? projectDirectory(project)
-    await ensureProject(directory)
-    const existing = await readState(directory)
-    const carry = input.carry ?? await readActiveArtifacts({ project, directory })
-    await fs.rm(activeDir(directory), { recursive: true, force: true })
-    await fs.mkdir(activeDir(directory), { recursive: true })
-    let state = createState(project)
-    state = State.parse({
-      ...state,
-      sessionID: input.sessionID,
-      sessionStartedAt: Date.now(),
-      warmupSessionID: input.warmupSessionID,
-      warmupStatus: input.warmupStatus ?? "completed",
-    })
-
-    if (carry.resources) {
-      await fs.writeFile(artifactPath(directory, state, "resources"), carry.resources, "utf8")
-    }
-    if (carry.note?.trim()) {
-      await fs.writeFile(artifactPath(directory, state, "note"), carry.note.trimEnd() + "\n", "utf8")
-      state = transition(
-        state,
-        "同步工作笔记变更",
-        "笔记已生成",
-      )
-    }
-    await writeState(directory, state)
-    return ok(project, directory, state, "已创建重新预热后的 active 工作推进草案。", {
-      carriedNote: !!carry.note?.trim(),
-      carriedResources: !!carry.resources?.trim(),
-    })
-      .finally(() => cleanupWorkflowChatSession(existing))
-  }
-
   async function discard(project: string, directory: string, state: State) {
     const note = await readOptionalText(artifactPath(directory, state, "note"))
     const resources = await readOptionalText(artifactPath(directory, state, "resources"))
     await cleanupWorkflowChatSession(state)
+    const correctionKind = ProjectWorkflow.correctionKind(state)
+    if (correctionKind) {
+      await fs.rm(activeDir(directory), { recursive: true, force: true })
+      return inactive(project, directory, correctionKind === "hard"
+        ? "已清空硬更正 active 草案。"
+        : "已清空软更正 active 草案。", {
+        discardedCorrection: correctionKind,
+      })
+    }
     if (!note?.trim()) {
       await fs.rm(activeDir(directory), { recursive: true, force: true })
       return inactive(project, directory, "已清空当前 active 草案。")
@@ -567,138 +656,140 @@ export namespace ProjectWorkflow {
     const request = ActionRequest.parse(input)
     const project = validateProjectName(request.project)
     const directory = input.directory ?? projectDirectory(project)
-    await ensureProject(directory)
+    return withStateMutation(directory, async () => {
+      await ensureProject(directory)
 
-    if (request.action === "开始或恢复") return startOrResume(project, directory)
+      if (request.action === "开始或恢复") return startOrResume(project, directory)
 
-    const state = await readState(directory)
-    if (!state) throw new Error("当前项目没有 active 工作推进草案，请先执行「开始或恢复」。")
-    await ensureRunnable(directory, state, request.action, request.payload)
+      const state = await readState(directory)
+      if (!state) throw new Error("当前项目没有 active 工作推进草案，请先执行「开始或恢复」。")
+      await ensureRunnable(directory, state, request.action, request.payload)
 
-    if (request.action === "放弃草案") return discard(project, directory, state)
+      if (request.action === "放弃草案") return discard(project, directory, state)
 
-    if (request.action === "追加消息") {
-      const payload = MessagePayload.parse(request.payload)
-      await appendJsonLine(artifactPath(directory, state, "messages"), {
-        time: new Date().toISOString(),
-        role: payload.role,
-        text: payload.text,
-      })
-      const next = touch(state, "追加消息")
-      await writeState(directory, next)
-      return ok(project, directory, next, "已记录消息。")
-    }
-
-    if (request.action === "登记资源") {
-      const payload = ResourcePayload.parse(request.payload)
-      await appendJsonLine(artifactPath(directory, state, "resources"), {
-        time: new Date().toISOString(),
-        path: payload.path,
-        title: payload.title,
-        note: payload.note,
-      })
-      const next = touch(state, "登记资源")
-      await writeState(directory, next)
-      return ok(project, directory, next, "已登记资源。")
-    }
-
-    if (request.action === "更新工作笔记") {
-      throw new Error("「更新工作笔记」不再由状态机接收整篇 note 内容。请先由 note service 写入 note.md，再调用「同步工作笔记变更」。")
-    }
-
-    if (request.action === "同步工作笔记变更") {
-      const payload = NoteSyncPayload.parse(request.payload)
-      const next = transition(state, "同步工作笔记变更", "笔记已生成")
-      await writeState(directory, next)
-      return ok(project, directory, next, "已同步工作笔记变更。", {
-        notePath: next.artifacts.note,
-        source: payload.source,
-        sourcePath: payload.sourcePath,
-      })
-    }
-
-    if (request.action === "检查笔记充分性") {
-      const payload = NoteReviewPayload.parse(request.payload)
-      const review = {
-        checkedAt: new Date().toISOString(),
-        sufficient: payload.sufficient,
-        canDraftOperations: payload.canDraftOperations ?? payload.sufficient,
-        blockingQuestions: payload.blockingQuestions,
-        missingFields: payload.missingFields,
-        summary: payload.summary,
+      if (request.action === "追加消息") {
+        const payload = MessagePayload.parse(request.payload)
+        await appendJsonLine(artifactPath(directory, state, "messages"), {
+          time: new Date().toISOString(),
+          role: payload.role,
+          text: payload.text,
+        })
+        const next = touch(state, "追加消息")
+        await writeState(directory, next)
+        return ok(project, directory, next, "已记录消息。")
       }
-      await fs.writeFile(artifactPath(directory, state, "noteReview"), JSON.stringify(review, null, 2) + "\n", "utf8")
-      const next = transition(
-        state,
-        "检查笔记充分性",
-        review.sufficient && review.canDraftOperations ? "笔记已生成" : "笔记需补充",
-      )
-      await writeState(directory, next)
-      return ok(project, directory, next, review.sufficient ? "笔记充分性检查通过。" : "笔记仍需补充。", { review })
-    }
 
-    if (request.action === "生成图操作草案") {
-      const payload = OperationsPayload.parse(request.payload)
-      await assertOperationArtifactManifest(directory, state, payload.artifacts)
-      const artifacts = await artifactStatus(directory, state)
-      const next = transition(state, "生成图操作草案", "图操作已生成")
-      await writeState(directory, next)
-      return ok(project, directory, next, "已登记图操作草案产物。", {
-        change_id: payload.change_id,
-        hasOperationNotes: artifacts.operationNotes,
-        hasDraft: artifacts.operationsDraft,
-        hasOperationIndex: artifacts.operationIndex,
-        hasExecutableCommand: artifacts.operations,
-      })
-    }
+      if (request.action === "登记资源") {
+        const payload = ResourcePayload.parse(request.payload)
+        await appendJsonLine(artifactPath(directory, state, "resources"), {
+          time: new Date().toISOString(),
+          path: payload.path,
+          title: payload.title,
+          note: payload.note,
+        })
+        const next = touch(state, "登记资源")
+        await writeState(directory, next)
+        return ok(project, directory, next, "已登记资源。")
+      }
 
-    if (request.action === "校验图操作") {
-      const payload = ValidationRegisterPayload.parse(request.payload)
-      const validation = await readJsonFile(artifactPath(directory, state, "validation"), ValidationArtifact)
-      const passed = payload.passed ?? validation.passed
-      const next = transition(
-        state,
-        "校验图操作",
-        passed ? "图操作已生成" : "图操作需修订",
-      )
-      await writeState(directory, next)
-      return ok(project, directory, next, passed ? "图操作和预览已生成。" : "图操作需修订。", {
-        validation: {
-          passed: validation.passed,
-          issueCount: validation.issues.length,
-          issues: validation.issues,
-        },
-      })
-    }
+      if (request.action === "更新工作笔记") {
+        throw new Error("「更新工作笔记」不再由状态机接收整篇 note 内容。请先由 note service 写入 note.md，再调用「同步工作笔记变更」。")
+      }
 
-    if (request.action === "提出修订意见") {
-      const payload = RevisionPayload.parse(request.payload)
-      await appendJsonLine(artifactPath(directory, state, "messages"), {
-        time: new Date().toISOString(),
-        role: "用户",
-        type: "修订意见",
-        target: payload.target,
-        text: payload.comment,
-      })
-      const nextStage: Stage = payload.target === "图操作" ? "图操作需修订" : payload.target === "工作笔记" ? "笔记需补充" : "笔记需补充"
-      const next = transition(state, "提出修订意见", nextStage)
-      await writeState(directory, next)
-      return ok(project, directory, next, `已记录${payload.target}修订意见。`)
-    }
+      if (request.action === "同步工作笔记变更") {
+        const payload = NoteSyncPayload.parse(request.payload)
+        const next = transition(state, "同步工作笔记变更", "笔记已生成")
+        await writeState(directory, next)
+        return ok(project, directory, next, "已同步工作笔记变更。", {
+          notePath: next.artifacts.note,
+          source: payload.source,
+          sourcePath: payload.sourcePath,
+        })
+      }
 
-    if (request.action === "应用图操作") {
-      const payload = ApplyPayload.parse(request.payload)
-      if (!payload.confirm) throw new Error("应用图操作需要 payload.confirm = true，并且必须来自用户明确确认。")
-      if (!payload.applied) throw new Error("应用图操作必须由执行层完成正式写图后登记，不能直接由状态机推进。")
-      const next = transition(state, "应用图操作", "已应用")
-      await writeState(directory, next)
-      return ok(project, directory, next, "图操作已应用到正式图数据。", {
-        applyResultPath: payload.applyResultPath,
-        archivePath: payload.archivePath,
-      })
-    }
+      if (request.action === "检查笔记充分性") {
+        const payload = NoteReviewPayload.parse(request.payload)
+        const review = {
+          checkedAt: new Date().toISOString(),
+          sufficient: payload.sufficient,
+          canDraftOperations: payload.canDraftOperations ?? payload.sufficient,
+          blockingQuestions: payload.blockingQuestions,
+          missingFields: payload.missingFields,
+          summary: payload.summary,
+        }
+        await fs.writeFile(artifactPath(directory, state, "noteReview"), JSON.stringify(review, null, 2) + "\n", "utf8")
+        const next = transition(
+          state,
+          "检查笔记充分性",
+          review.sufficient && review.canDraftOperations ? "笔记已生成" : "笔记需补充",
+        )
+        await writeState(directory, next)
+        return ok(project, directory, next, review.sufficient ? "笔记充分性检查通过。" : "笔记仍需补充。", { review })
+      }
 
-    throw new Error(`未支持的动作：${request.action}`)
+      if (request.action === "生成图操作草案") {
+        const payload = OperationsPayload.parse(request.payload)
+        await assertOperationArtifactManifest(directory, state, payload.artifacts)
+        const artifacts = await artifactStatus(directory, state)
+        const next = transition(state, "生成图操作草案", "图操作已生成")
+        await writeState(directory, next)
+        return ok(project, directory, next, "已登记图操作草案产物。", {
+          change_id: payload.change_id,
+          hasOperationNotes: artifacts.operationNotes,
+          hasDraft: artifacts.operationsDraft,
+          hasOperationIndex: artifacts.operationIndex,
+          hasExecutableCommand: artifacts.operations,
+        })
+      }
+
+      if (request.action === "校验图操作") {
+        const payload = ValidationRegisterPayload.parse(request.payload)
+        const validation = await readJsonFile(artifactPath(directory, state, "validation"), ValidationArtifact)
+        const passed = payload.passed ?? validation.passed
+        const next = transition(
+          state,
+          "校验图操作",
+          passed ? "图操作已生成" : "图操作需修订",
+        )
+        await writeState(directory, next)
+        return ok(project, directory, next, passed ? "图操作和预览已生成。" : "图操作需修订。", {
+          validation: {
+            passed: validation.passed,
+            issueCount: validation.issues.length,
+            issues: validation.issues,
+          },
+        })
+      }
+
+      if (request.action === "提出修订意见") {
+        const payload = RevisionPayload.parse(request.payload)
+        await appendJsonLine(artifactPath(directory, state, "messages"), {
+          time: new Date().toISOString(),
+          role: "用户",
+          type: "修订意见",
+          target: payload.target,
+          text: payload.comment,
+        })
+        const nextStage: Stage = payload.target === "图操作" ? "图操作需修订" : payload.target === "工作笔记" ? "笔记需补充" : "笔记需补充"
+        const next = transition(state, "提出修订意见", nextStage)
+        await writeState(directory, next)
+        return ok(project, directory, next, `已记录${payload.target}修订意见。`)
+      }
+
+      if (request.action === "应用图操作") {
+        const payload = ApplyPayload.parse(request.payload)
+        if (!payload.confirm) throw new Error("应用图操作需要 payload.confirm = true，并且必须来自用户明确确认。")
+        if (!payload.applied) throw new Error("应用图操作必须由执行层完成正式写图后登记，不能直接由状态机推进。")
+        const next = transition(state, "应用图操作", "已应用")
+        await writeState(directory, next)
+        return ok(project, directory, next, "图操作已应用到正式图数据。", {
+          applyResultPath: payload.applyResultPath,
+          archivePath: payload.archivePath,
+        })
+      }
+
+      throw new Error(`未支持的动作：${request.action}`)
+    })
   }
 
   export async function getActive(input: { project: string; directory?: string }): Promise<ActionResult> {
@@ -708,5 +799,71 @@ export namespace ProjectWorkflow {
     const state = await readState(directory)
     if (!state) return inactive(project, directory, "当前没有 active 工作推进草案。")
     return ok(project, directory, state, `当前阶段：${state.stage}。`)
+  }
+
+  export async function writeHardCorrectionState(input: {
+    project: string
+    directory?: string
+    payload: HardCorrectionPayload
+  }) {
+    const project = validateProjectName(input.project)
+    const directory = input.directory ?? projectDirectory(project)
+    return withStateMutation(directory, async () => {
+      await ensureProject(directory)
+      const existing = await readState(directory)
+      if (!existing) throw new Error("当前项目没有 active 工作推进草案，请先恢复更正现场。")
+      const payload = HardCorrectionPayload.parse(input.payload)
+      const next = State.parse({
+        ...existing,
+        stage: (await fileExists(artifactPath(directory, existing, "note"))) ? "笔记已生成" : "收集材料",
+        lastAction: "开始或恢复",
+        sessionID: undefined,
+        sessionStartedAt: undefined,
+        warmupSessionID: undefined,
+        warmupStatus: undefined,
+        hardCorrection: {
+          ofChangeId: payload.ofChangeId,
+          sourceArchivePath: payload.sourceArchivePath,
+          fixIndex: payload.fixIndex,
+          expectedChangeId: payload.expectedChangeId,
+          restoredAt: new Date().toISOString(),
+        },
+        updatedAt: Date.now(),
+        pendingConfirmation: undefined,
+      })
+      await writeState(directory, next)
+      return ok(project, directory, next, `已恢复最近提交「${payload.ofChangeId}」的更正现场。`, {
+        correction: next.correction,
+        hardCorrection: next.hardCorrection,
+      })
+    })
+  }
+
+  export async function createSoftCorrectionState(input: {
+    project: string
+    directory?: string
+    payload: SoftCorrectionPayload
+  }) {
+    const project = validateProjectName(input.project)
+    const directory = input.directory ?? projectDirectory(project)
+    return withStateMutation(directory, async () => {
+      await ensureProject(directory)
+      const existing = await readState(directory)
+      if (existing) throw new Error("当前已有 active 工作推进草案；追加更正记录前请先处理或放弃当前草案。")
+      const payload = SoftCorrectionPayload.parse(input.payload)
+      const state = State.parse({
+        ...createState(project),
+        stage: "收集材料",
+        correction: {
+          expectedChangeId: payload.expectedChangeId,
+          restoredAt: new Date().toISOString(),
+        },
+        lastAction: "开始软更正",
+      })
+      await writeState(directory, state)
+      return ok(project, directory, state, `已开始追加更正记录，建议使用 change_id：${payload.expectedChangeId}。`, {
+        correction: state.correction,
+      })
+    })
   }
 }

@@ -5,6 +5,8 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 # 项目工作推进图操作草案 Skill
 
+本轮所有现有图数据都以 `workflows/active/base_graph/` 为固定基线。读取 nodes、edges、changes、snapshots、descriptions_output 和已归档 notes 时必须从该目录读取；不要改读项目根目录中可能已经变化的兼容入口。active 草案文件仍写在 `workflows/active/`。
+
 ## 目标
 
 把当前 active workflow 的工作笔记转成可审核、可校验的图操作草案。
@@ -112,6 +114,8 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 - `create_edge` 写：`kind`、`temp_id`、`from_node`、`to_node`、`edge_type`、`description`、`history`。
 - `update_edge` 写：`kind`、`edge_id`、`new_description` 或 `description_delta`、可选 `reason`、`history`。
 - `history` 只写本轮变化的历史说明。不要写完整旧历史数组。
+- 软更正也使用这四类 `kind`。软更正可以用 `create_node` / `create_edge` 补充历史遗漏事实，也可以用 `update_node` / `update_edge` 修正或逻辑废弃已有节点/边；不要发明 `delete_node`、`delete_edge`、`deprecate_node`、`deprecate_edge`。
+- 如果软更正要逻辑废弃已有节点或边，在对应 `update_node` / `update_edge` item 上明确写 `deprecation: true` 或 `correction_intent: "deprecate"`。同时显式补齐受影响的相邻节点/边 update；执行层会根据图结构检查是否漏掉级联对象，但不会替你写这些对象的业务描述。
 
 ### ID 引用格式
 
@@ -500,7 +504,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 常见图更新：
 
-- 更新 `work_item.status`、`description`；不要手写 `detail_url`，执行层会根据 `operations.draft.json.note_filename` 统一补到相关 work_item 上
+- 更新 `work_item.status`、`description`；根据本轮工作笔记是否适合作为长期详情来源，决定是否显式更新 `detail_url`
 - 新建或更新 `result`、`issue`
 - 更新 `goal`、`work_block`
 - 创建 `creates`、`modifies_work`、`discovers`、`adjusts_result` 等边
@@ -525,7 +529,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 ```json
 {
   "summary": "本轮图操作草案摘要",
-  "change_id": "workflow_...",
+  "change_id": "stepN_...",
   "artifacts": {
     "operationNotes": true,
     "operationsDraft": true
@@ -547,6 +551,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 - 哪些节点/边映射不确定，需要用户确认。
 - 本次准备追加哪些 history 语义。
 - 本次工作笔记归档文件名草稿。这个内容必须写入 `operations.draft.json.note_filename`，用语义化英文/拼音 snake_case 文件名，不能机械使用 change_id。
+- 本次工作笔记与 event/work_item 的挂载判断：逐个说明哪些节点适合把该笔记作为长期详情来源、哪些不适合，以及理由。没有合适节点时明确说明“不挂节点，通过 changelog 查找”。
 - 本次 changelog 增量草稿。这个内容必须同时写入 `operations.draft.json.changelog_entry`，提交时后端会使用该字段追加 `changes/changelog.txt`。
 
 不要在 `operation_notes` 里贴大段 JSON。JSON 放到 `operations.draft.json`。
@@ -555,7 +560,8 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 `operations.draft.json` 是模型写出的压缩结构化图操作草案。它不是最终执行文件，必须使用后端能机械编译的语义 delta 结构。顶层必须包含 `note_filename` 和 `changelog_entry`：
 
-- `note_filename`：当前 `workflows/active/note.md` 在确认提交后归档到 `notes/` 下的语义化文件名。必须根据工作笔记主题命名，例如 `knowledge_entry_point.md`、`distinction_sort.md`、`improvement_plan.md`。不要用 change_id 机械命名。后端会做安全转义、补 `.md` 后缀和冲突处理，并把最终路径补到相关 `work_item.detail_url`。
+- `change_id`：新建普通工作推进草案必须使用 `step数字_语义短名`。首轮提交从 `step0_` 开始，后续按已提交普通推进递增，例如 `step1_...`、`step2_...`。软更正按 `project-workflow-correction-draft` Skill 使用后端指定的 `correction数字_` 前缀；如果后端给出完整 ID 或既有草案已经带有完整 ID，必须原样保留。任何模式都不要写 `workflow_...`，也不要自行跳号；如果后端校验返回期望前缀或完整 ID，必须按返回值修订。
+- `note_filename`：当前 `workflows/active/note.md` 在确认提交后归档到 `notes/` 下的语义化文件名。它必填，工作笔记也必须存在并归档。必须根据工作笔记主题命名，例如 `knowledge_entry_point.md`、`distinction_sort.md`、`improvement_plan.md`，不要用 change_id 机械命名。后端会做安全转义、补 `.md` 后缀和冲突处理，并保证最终路径出现在 changelog 中；后端不会因此强制修改任何节点的 `detail_url`。
 - `changelog_entry`：本次要追加到 `changes/changelog.txt` 的完整记录。写法要像旧记录一样，用介绍项目进度的语言串起本轮工作、产生的结果或问题、对目标/工作块的影响，同时点明关键节点 ID。通常形如 `[YYYY-MM-DD HH:mm] change_id: ...`。
 
 - `create_node`：模型写 `node_type`、`summary`、`description`、必要 `fields` 和 `history`；执行层补齐默认字段并生成最终 `create_node.data`。
@@ -566,6 +572,17 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 - 不使用顶层 `description` 字段；自然语言说明只写入 `operation_notes.md`。
 
 `temp_id` 本来就是最终图引擎支持的字段，不要另造 `proposed_id` 或让后端猜测 ID。
+
+### 工作笔记归档与 detail_url
+
+工作笔记归档和节点详情挂载是两件事：
+
+- 每轮必须有 `note.md` 和 `note_filename`。提交时后端一定把笔记归档到 `notes/`，并把最终路径追加到本轮 changelog；即使没有节点引用它，用户也能从项目时间线找到笔记。
+- 如果本轮 create/update 了 `event` 或 `work_item`，逐个判断该笔记是否是该节点长期有效、主题匹配的详情来源。适合时在 `create_node.fields.detail_url` 或 `update_node.field_updates.detail_url` 中显式写 `notes/<note_filename>`。
+- 笔记只是跨节点过程记录、主题不专属于某个节点，或不适合取代节点原有详情时，不写 `detail_url`。不能为了让笔记“有地方挂”而强行关联。
+- `goal`、`work_block`、`issue`、`result` 通常不直接挂本轮工作笔记。不要把 `detail_url` 写成执行层自动派生字段，也不要依赖后端替模型选择节点。
+- `operation_notes.md` 必须记录上述判断，独立 reviewer 会同时检查不当挂载和明显漏挂。
+- 若最终归档因重名产生后缀，后端只会把草案中明确写成 `notes/<note_filename>` 的引用改成实际路径；模型无需猜测后缀。
 
 新建节点的 `description` 写当前节点说明。更新已有节点时要区分两类情况：
 
@@ -580,10 +597,10 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 ```json
 {
-  "change_id": "workflow_x",
+  "change_id": "step0_pilot_validation",
   "timestamp": "2026-07-06T10:00:00+08:00",
   "note_filename": "pilot_validation_result.md",
-  "changelog_entry": "[2026-07-06 10:00] workflow_x: 完成某项阶段工作(work_item_x)，产生某项结果(result_z)，并推动某个目标(goal_y)进展；图数据新增工作项、结果节点及工作项到结果的 creates 关系",
+  "changelog_entry": "[2026-07-06 10:00] step0_pilot_validation: 完成某项阶段工作(work_item_x)，产生某项结果(result_z)，并推动某个目标(goal_y)进展；图数据新增工作项、结果节点及工作项到结果的 creates 关系",
   "items": [
     {
       "kind": "update_node",
@@ -593,7 +610,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
         "completion_score": 40
       },
       "description": "目标当前状态总结：已完成试探性验证，验证结果支持继续推进；当前目标处于进行中状态，后续需要扩大样本范围并确认方案稳定性。",
-      "history": "[workflow_x] 目标进度更新，因本轮试探性验证完成，completion_score从20提升到40，status保持\"in_progress\"；此目标被阶段验证结果影响，支持继续扩大样本范围（结果节点id: result_z）"
+      "history": "[step0_pilot_validation] 目标进度更新，因本轮试探性验证完成，completion_score从20提升到40，status保持\"in_progress\"；此目标被阶段验证结果影响，支持继续扩大样本范围（结果节点id: result_z）"
     }
   ]
 }
@@ -603,10 +620,10 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 ```json
 {
-  "change_id": "workflow_x",
+  "change_id": "step1_next_step_plan",
   "timestamp": "2026-07-06T10:00:00+08:00",
   "note_filename": "next_step_plan.md",
-  "changelog_entry": "[2026-07-06 10:00] workflow_x: 创建工作项(work_item_x)以推进工作块(work_block_y)，记录本轮计划或进展；图数据新增工作项节点并关联工作块属性",
+  "changelog_entry": "[2026-07-06 10:00] step1_next_step_plan: 创建工作项(work_item_x)以推进工作块(work_block_y)，记录本轮计划或进展；图数据新增工作项节点并关联工作块属性",
   "items": [
     {
       "kind": "create_node",
@@ -618,7 +635,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
         "status": "planned",
         "linked_work_block_id": "work_block_y"
       },
-      "history": "[workflow_x] 创建工作项短标题，用于推进下一步计划；状态设置为planned，关联到work_block_y；工作项被对应工作块归属（工作块节点id: work_block_y）"
+      "history": "[step1_next_step_plan] 创建工作项短标题，用于推进下一步计划；状态设置为planned，关联到work_block_y；工作项被对应工作块归属（工作块节点id: work_block_y）"
     }
   ]
 }
@@ -628,10 +645,10 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 ```json
 {
-  "change_id": "workflow_x",
+  "change_id": "step2_stage_result_review",
   "timestamp": "2026-07-06T10:00:00+08:00",
   "note_filename": "stage_result_review.md",
-  "changelog_entry": "[2026-07-06 10:00] workflow_x: 工作项(work_item_x)产生结果(result_z)，形成新的阶段产物；图数据新增工作项到结果的 creates 关系",
+  "changelog_entry": "[2026-07-06 10:00] step2_stage_result_review: 工作项(work_item_x)产生结果(result_z)，形成新的阶段产物；图数据新增工作项到结果的 creates 关系",
   "items": [
     {
       "kind": "create_edge",
@@ -640,7 +657,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
       "to_node": "result_z",
       "edge_type": "creates",
       "description": "工作项产生结果",
-      "history": "[workflow_x] 建立工作项到结果的creates关系，表示工作项短标题产出某项结果（工作项节点id: work_item_x；结果节点id: result_z）"
+      "history": "[step2_stage_result_review] 建立工作项到结果的creates关系，表示工作项短标题产出某项结果（工作项节点id: work_item_x；结果节点id: result_z）"
     }
   ]
 }
@@ -666,7 +683,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
   "action": "生成图操作草案",
   "payload": {
     "summary": "已生成图操作说明和结构化 draft。",
-    "change_id": "workflow_...",
+    "change_id": "stepN_...",
     "artifacts": {
       "operationNotes": true,
       "operationsDraft": true

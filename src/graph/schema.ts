@@ -28,6 +28,15 @@ export const NODE_MUTABLE_FIELD_KEYS = {
   work_block: ["summary", "description", "detail_url", "status", "linked_goal_id"],
 } satisfies Record<NodeType, readonly string[]>
 
+export const NODE_COMMAND_UPDATE_FIELD_KEYS = {
+  event: [...NODE_MUTABLE_FIELD_KEYS.event, "outgoing_edges", "incoming_edges"],
+  issue: [...NODE_MUTABLE_FIELD_KEYS.issue, "outgoing_edges", "incoming_edges"],
+  goal: [...NODE_MUTABLE_FIELD_KEYS.goal, "outgoing_edges", "incoming_edges", "linked_work_blocks"],
+  work_item: [...NODE_MUTABLE_FIELD_KEYS.work_item, "outgoing_edges", "incoming_edges"],
+  result: [...NODE_MUTABLE_FIELD_KEYS.result, "outgoing_edges", "incoming_edges"],
+  work_block: [...NODE_MUTABLE_FIELD_KEYS.work_block, "outgoing_edges", "incoming_edges", "work_items"],
+} satisfies Record<NodeType, readonly string[]>
+
 export const NODE_CREATE_DATA_KEYS = {
   event: ["type", ...NODE_MUTABLE_FIELD_KEYS.event],
   issue: ["type", ...NODE_MUTABLE_FIELD_KEYS.issue],

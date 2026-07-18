@@ -1,7 +1,7 @@
 import fs from "fs/promises"
 import { GraphStorage } from "./storage"
 import { GraphCommand, GraphEdge, GraphNode, type GraphOperation, type HistoryRecord, type NodeType } from "./schema"
-import { GraphSemanticValidator, type GraphSemanticIssue } from "./semantic-validation"
+import { GraphSemanticValidator, type GraphSemanticIssue, type GraphSemanticValidationOptions } from "./semantic-validation"
 
 export type GraphValidationIssue = GraphSemanticIssue
 
@@ -149,7 +149,7 @@ export class GraphEngine {
     return errors
   }
 
-  async validateCommand(command: unknown): Promise<{ command?: GraphCommand; issues: GraphValidationIssue[] }> {
+  async validateCommand(command: unknown, options: GraphSemanticValidationOptions = {}): Promise<{ command?: GraphCommand; issues: GraphValidationIssue[] }> {
     const parsed = GraphCommand.safeParse(command)
     if (!parsed.success) {
       return {
@@ -160,7 +160,7 @@ export class GraphEngine {
       }
     }
     const basicErrors = await this.validateOperations(parsed.data.operations)
-    const semanticIssues = await new GraphSemanticValidator(this.storage).validateCommand(parsed.data)
+    const semanticIssues = await new GraphSemanticValidator(this.storage).validateCommand(parsed.data, options)
     return {
       command: parsed.data,
       issues: [
@@ -308,7 +308,7 @@ export class GraphEngine {
 
   private async createSnapshot(id: string, timestamp: string) {
     const nodes = Object.fromEntries((await this.storage.getAllNodes()).filter((node) => node.history.length).map((node) => [node.id, node.history.at(-1)?.version || "v1.0"]))
-    const edges = Object.fromEntries((await this.storage.getAllEdges()).filter((edge) => edge.history.length).map((edge) => [edge.id, edge.history.at(-1)?.version || "v1.0"]))
+    const edges = Object.fromEntries((await this.storage.getActiveEdges()).filter((edge) => edge.history.length).map((edge) => [edge.id, edge.history.at(-1)?.version || "v1.0"]))
     await this.storage.saveSnapshot({ id, timestamp, nodes, edges })
   }
 

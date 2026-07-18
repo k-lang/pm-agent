@@ -19,6 +19,58 @@ export function resetWorkflowViewState() {
   }
 }
 
+export function workflowViewRequestMatches(request, current) {
+  return request?.generation === current?.generation && request?.projectName === current?.projectName
+}
+
+export function workflowChatLockReason({ project, workflow, state, loading = false }) {
+  if (!project) return '选择或新建项目后可以开始工作推进。'
+  if (workflowLoadBlocksInteraction({ loading, workflow })) return '正在加载工作推进状态。'
+  if (workflow?.baseIsEmpty) {
+    if (state && !workflow?.sessionReady) return '推进会话尚未就位，请点击恢复推进会话。'
+    return ''
+  }
+  if (!state) return '请先预热项目上下文，让大模型掌握当前项目主线。'
+  if (state.warmupStatus === 'running') return '项目上下文预热中，完成后会自动开放推进对话。'
+  if (state.warmupStatus === 'failed') return '项目上下文预热失败，请重新预热后再继续。'
+  if (!workflow?.sessionReady) return '推进会话尚未就位，请重新预热并恢复会话。'
+  if (state.warmupStatus !== 'completed') return '请先预热项目上下文，让大模型掌握当前项目主线。'
+  return ''
+}
+
+export function workflowLoadBlocksInteraction({ loading = false, workflow }) {
+  return !!loading && !workflow
+}
+
+export function workflowOperationArtifactsChanged(previousState, nextState) {
+  const artifactStages = new Set(['图操作已生成', '图操作需修订'])
+  if (!artifactStages.has(previousState?.stage) && !artifactStages.has(nextState?.stage)) return false
+  return previousState?.updatedAt !== nextState.updatedAt || previousState?.stage !== nextState.stage
+}
+
+export function workflowCorrectionKind(state) {
+  if (state?.hardCorrection) return 'hard'
+  if (state?.correction) return 'soft'
+  return ''
+}
+
+export function workflowMessageErrorText(error) {
+  if (!error) return ''
+  if (typeof error === 'string') return error
+  if (typeof error !== 'object') return String(error)
+  const data = error.data && typeof error.data === 'object' ? error.data : null
+  return data?.message || error.message || error.code || error.name || '未知错误'
+}
+
+export function mergeWorkflowReadiness(current, next) {
+  if (!next) return current || null
+  const merged = { ...next }
+  for (const key of ['baseIsEmpty', 'sessionReady', 'warmupStatus']) {
+    if (merged[key] === undefined && current?.[key] !== undefined) merged[key] = current[key]
+  }
+  return merged
+}
+
 export function workflowPermissionTitle(req) {
   if (req.permission === 'edit' && isWorkflowNotePath(workflowPermissionFile(req))) return '修改工作笔记'
   return req.permission === 'edit' ? '修改文件' : '权限请求'

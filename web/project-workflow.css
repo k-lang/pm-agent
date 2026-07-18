@@ -202,6 +202,10 @@ body.workflow-maximized-chat #chat-panel {
 .workspace-top-actions {
   min-width: 0;
 }
+.workspace-top-actions .btn-secondary {
+  padding: 7px 10px;
+  white-space: nowrap;
+}
 #project-status { color: #9ca3af; font-size: 12px; white-space: nowrap; }
 .chat-actions {
   display: flex;
@@ -547,6 +551,12 @@ body.workflow-maximized-chat #chat-panel {
 }
 .workflow-message.assistant {
   align-self: flex-start;
+}
+
+.workflow-message.error .message-body {
+  border-color: #d7a3a3;
+  background: #fff5f5;
+  color: #8c2525;
 }
 .message-role {
   color: #9ca3af;

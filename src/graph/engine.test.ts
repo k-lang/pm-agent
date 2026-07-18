@@ -422,6 +422,34 @@ describe("graph engine", () => {
     expect(messages).toContain("linked_work_block_id")
   })
 
+  test("derived reverse fields are accepted only for internal correction compilation", async () => {
+    const root = path.join(OUTPUT_ROOT, "semantic-derived-update-fields")
+    await fs.rm(root, { recursive: true, force: true })
+    const storage = new GraphStorage(root)
+    await storage.saveNode(GraphNode.parse({
+      id: "goal_existing",
+      type: "goal",
+      summary: "已有目标",
+      description: "",
+      status: "established",
+    }))
+    const command = GraphCommand.parse({
+      change_id: "internal_structural_correction",
+      timestamp: "2026-07-09T10:00:00+08:00",
+      operations: [{
+        type: "update_node",
+        node_id: "goal_existing",
+        updates: { outgoing_edges: [] },
+      }],
+      history_descriptions: {},
+    })
+    const validator = new GraphSemanticValidator(storage)
+
+    const defaultMessages = (await validator.validateCommand(command)).map((issue) => issue.message).join("\n")
+    expect(defaultMessages).toContain("goal.outgoing_edges 不是合法字段")
+    expect(await validator.validateCommand(command, { allowDerivedNodeUpdates: true })).toEqual([])
+  })
+
   test("semantic validator rejects new nodes that cannot be placed by graph layout rules", async () => {
     const storage = new GraphStorage(path.join(OUTPUT_ROOT, "semantic-invalid"))
     await fs.rm(storage.root, { recursive: true, force: true })

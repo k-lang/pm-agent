@@ -1,4 +1,4 @@
-import { GraphCommand, NODE_CREATE_DATA_KEYS, NODE_MUTABLE_FIELD_KEYS, NODE_STATUS_VALUES, type EdgeType, type NodeType } from "./schema"
+import { GraphCommand, NODE_COMMAND_UPDATE_FIELD_KEYS, NODE_CREATE_DATA_KEYS, NODE_MUTABLE_FIELD_KEYS, NODE_STATUS_VALUES, type EdgeType, type NodeType } from "./schema"
 import { GraphStorage } from "./storage"
 
 export type GraphSemanticIssue = {
@@ -6,6 +6,10 @@ export type GraphSemanticIssue = {
   operationIndex?: number
   nodeId?: string
   message: string
+}
+
+export type GraphSemanticValidationOptions = {
+  allowDerivedNodeUpdates?: boolean
 }
 
 type NodeRef = {
@@ -103,11 +107,11 @@ function unknownFieldIssues(nodeType: NodeType, data: Record<string, unknown>, a
 export class GraphSemanticValidator {
   constructor(readonly storage: GraphStorage) {}
 
-  async validateCommand(command: GraphCommand): Promise<GraphSemanticIssue[]> {
+  async validateCommand(command: GraphCommand, options: GraphSemanticValidationOptions = {}): Promise<GraphSemanticIssue[]> {
     const parsed = GraphCommand.parse(command)
     const existingNodes = await this.loadExistingNodes()
     const nodes = new Map(existingNodes)
-    const edges: EdgeRef[] = (await this.storage.getAllEdges()).map((edge) => ({
+    const edges: EdgeRef[] = (await this.storage.getActiveEdges()).map((edge) => ({
       from: edge.from_node_id,
       to: edge.to_node_id,
       type: edge.type,
@@ -155,7 +159,10 @@ export class GraphSemanticValidator {
               message: statusIssue,
             })
           }
-          for (const message of unknownFieldIssues(node.type, operation.updates, NODE_MUTABLE_FIELD_KEYS[node.type])) {
+          const allowedFields = options.allowDerivedNodeUpdates
+            ? NODE_COMMAND_UPDATE_FIELD_KEYS[node.type]
+            : NODE_MUTABLE_FIELD_KEYS[node.type]
+          for (const message of unknownFieldIssues(node.type, operation.updates, allowedFields)) {
             issues.push({
               severity: "error",
               operationIndex: index,

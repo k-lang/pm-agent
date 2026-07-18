@@ -7,12 +7,15 @@ import { tmpdir } from "./fixture/fixture"
 import { Log } from "../util/log"
 import { Session } from "../session"
 import { SessionPrompt } from "../session/prompt"
+import { SessionStatus } from "../session/status"
 import { ProjectDetail } from "../project/detail"
 import { Database } from "../storage/db"
 import { ProjectSummaryRecordTable } from "../project/project.sql"
 import { SessionID } from "../session/schema"
 import { ProjectWorkflow } from "../workflow/state"
 import { ProjectWorkflowExecution } from "../workflow/execution"
+import { GraphVersionStore } from "../graph/version-store"
+import { requireWarmupContext, workflowAgentProfile } from "../server/routes/project"
 
 Log.init({ print: false })
 
@@ -57,6 +60,65 @@ function insertBaselineSummary(directory: string, sessionID: SessionID, options:
 describe("server routes", () => {
   afterEach(async () => {
     await Instance.disposeAll()
+  })
+
+  test("workflow agent profile follows restored active semantics, not hard-correction lifecycle", () => {
+    const normal = ProjectWorkflow.State.parse({
+      id: "wf_normal",
+      project: "demo",
+      stage: "收集材料",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const soft = ProjectWorkflow.State.parse({
+      ...normal,
+      id: "wf_soft",
+      correction: { expectedChangeId: "correction1_", restoredAt: "2026-07-16T00:00:00.000Z" },
+    })
+    const hardNormal = ProjectWorkflow.State.parse({
+      ...normal,
+      id: "wf_hard_normal",
+      hardCorrection: {
+        ofChangeId: "step0_demo",
+        sourceArchivePath: "workflows/applied/step0_demo",
+        fixIndex: 1,
+        expectedChangeId: "step0_demo_fix1",
+        restoredAt: "2026-07-16T00:00:00.000Z",
+      },
+    })
+    const hardSoft = ProjectWorkflow.State.parse({
+      ...soft,
+      id: "wf_hard_soft",
+      hardCorrection: {
+        ofChangeId: "correction1_demo",
+        sourceArchivePath: "workflows/applied/correction1_demo",
+        fixIndex: 1,
+        expectedChangeId: "correction1_demo_fix1",
+        restoredAt: "2026-07-16T00:00:00.000Z",
+      },
+    })
+
+    expect(workflowAgentProfile(normal)).toEqual({
+      primary: "project_workflow",
+      warmup: "project_workflow_warmup",
+    })
+    expect(workflowAgentProfile(soft)).toEqual({
+      primary: "project_workflow_correction",
+      warmup: "project_workflow_correction_warmup",
+    })
+    expect(workflowAgentProfile(hardNormal)).toEqual({
+      primary: "project_workflow",
+      warmup: "project_workflow_warmup",
+    })
+    expect(workflowAgentProfile(hardSoft)).toEqual({
+      primary: "project_workflow_correction",
+      warmup: "project_workflow_correction_warmup",
+    })
+  })
+
+  test("warmup must produce visible assistant context before a chat can be forked", () => {
+    expect(requireWarmupContext("\n  项目主线上下文。  \n")).toBe("项目主线上下文。")
+    expect(() => requireWarmupContext(" \n\t ")).toThrow("预热未生成有效内容")
   })
 
   test("GET /global/health returns healthy", async () => {
@@ -275,6 +337,65 @@ describe("server routes", () => {
     expect(body.currentSummary?.status).toBe("expired")
   })
 
+  test("GET /project/detail expires an empty-graph summary after the first graph submission", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const app = Server.createApp({})
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const baseline = await Session.create({ title: "项目总结" })
+        insertBaselineSummary(tmp.path, baseline.id)
+      },
+    })
+    await fs.mkdir(path.join(tmp.path, "workflows", "applied", "step0_first_submit"), { recursive: true })
+    await fs.writeFile(path.join(tmp.path, "workflows", "applied", "step0_first_submit", "apply_result.json"), JSON.stringify({
+      appliedAt: new Date().toISOString(),
+      change_id: "step0_first_submit",
+      success: true,
+      snapshot: "step0_first_submit",
+    }, null, 2) + "\n", "utf8")
+
+    const res = await app.fetch(
+      new Request(`http://localhost/project/detail?directory=${encodeURIComponent(tmp.path)}`),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.currentSummary?.graphVersion).toBeUndefined()
+    expect(body.currentSummary?.status).toBe("expired")
+  })
+
+  test("GET /project/detail sees a published graph before its active workflow is archived", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const app = Server.createApp({})
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const baseline = await Session.create({ title: "项目总结" })
+        insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "old_graph_version" })
+      },
+    })
+    const { latest } = await GraphVersionStore.ensure(tmp.path)
+    const candidate = await GraphVersionStore.createCandidate(tmp.path, latest)
+    await GraphVersionStore.publish(tmp.path, latest, candidate)
+    await fs.mkdir(path.join(tmp.path, "workflows", "active"), { recursive: true })
+    await fs.writeFile(path.join(tmp.path, "workflows", "active", "apply_result.json"), JSON.stringify({
+      appliedAt: new Date().toISOString(),
+      change_id: "published_before_archive",
+      snapshot: "published_before_archive",
+      success: true,
+      graphVersion: path.relative(tmp.path, candidate),
+    }, null, 2) + "\n", "utf8")
+
+    const res = await app.fetch(
+      new Request(`http://localhost/project/detail?directory=${encodeURIComponent(tmp.path)}`),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.currentSummary?.status).toBe("expired")
+  })
+
   test("GET /project/detail keeps summary completed when graph version matches", async () => {
     await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
     const app = Server.createApp({})
@@ -396,6 +517,59 @@ describe("server routes", () => {
     }
   })
 
+  test("POST /project/workflow/note/import preserves note and draft while workflow session is busy", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      const activeDir = path.join(projectDir, "workflows", "active")
+      await fs.mkdir(activeDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+
+      const first = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "note before busy session" }),
+      }))
+      expect(first.status).toBe(200)
+      await fs.writeFile(path.join(activeDir, "operations.draft.json"), "draft sentinel\n", "utf8")
+
+      const session = await Instance.provide({
+        directory: projectDir,
+        fn: () => Session.create({ title: "工作推进" }),
+      })
+      await ProjectWorkflow.bindSessions({
+        project: "demo",
+        directory: projectDir,
+        sessionID: session.id,
+        warmupStatus: "completed",
+      })
+      await Instance.provide({
+        directory: projectDir,
+        fn: () => SessionStatus.set(session.id, { type: "busy" }),
+      })
+
+      const response = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "replacement that must be rejected" }),
+      }))
+
+      expect(response.status).toBe(409)
+      expect(await response.text()).toContain("不能修改工作笔记")
+      await expect(fs.readFile(path.join(activeDir, "note.md"), "utf8")).resolves.toBe("note before busy session\n")
+      await expect(fs.readFile(path.join(activeDir, "operations.draft.json"), "utf8")).resolves.toBe("draft sentinel\n")
+      await Instance.provide({
+        directory: projectDir,
+        fn: () => SessionStatus.set(session.id, { type: "idle" }),
+      })
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
   test("GET /project/workflow/operations returns active graph operation draft artifacts", async () => {
     await using tmp = await tmpdir()
     const originalCwd = process.cwd()
@@ -406,7 +580,7 @@ describe("server routes", () => {
       await fs.mkdir(projectDir, { recursive: true })
       await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
 
-      await ProjectWorkflow.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
+      await ProjectWorkflowExecution.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
       await ProjectWorkflowExecution.writeNote({
         directory: projectDir,
         content: "本轮准备把工作笔记转成图操作草案。",
@@ -420,10 +594,10 @@ describe("server routes", () => {
       const activeDir = path.join(projectDir, "workflows", "active")
       await fs.writeFile(path.join(activeDir, "operation_notes.md"), "## 图操作说明\n\n准备更新已有目标。\n", "utf8")
       await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
-        change_id: "demo_operations",
+        change_id: "step0_demo_operations",
         timestamp: "2026-07-06T10:00:00+08:00",
         note_filename: "demo_operations_note.md",
-        changelog_entry: "[2026-07-06 10:00] demo_operations: 测试把工作笔记转成图操作草案(demo_operations)，用于验证工作推进页图操作产物接口。",
+        changelog_entry: "[2026-07-06 10:00] step0_demo_operations: 测试把工作笔记转成图操作草案(step0_demo_operations)，用于验证工作推进页图操作产物接口。",
         items: [],
       }, null, 2) + "\n", "utf8")
       await ProjectWorkflowExecution.runAction({
@@ -432,7 +606,7 @@ describe("server routes", () => {
         action: "生成图操作草案",
         payload: {
           summary: "登记图操作产物。",
-          change_id: "demo_operations",
+          change_id: "step0_demo_operations",
           artifacts: {
             operationNotes: true,
             operationsDraft: true,
@@ -445,10 +619,52 @@ describe("server routes", () => {
       const body = await res.json()
       expect(body.workflow.stage).toBe("图操作已生成")
       expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationNotes")?.content).toContain("图操作说明")
-      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationsDraft")?.content).toContain("demo_operations")
-      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationIndex")?.content).toContain("demo_operations")
-      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operations")?.content).toContain("demo_operations")
-      expect(body.files.find((file: { key: string; content?: string }) => file.key === "preview")?.content).toContain("demo_operations")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationsDraft")?.content).toContain("step0_demo_operations")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operationIndex")?.content).toContain("step0_demo_operations")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "operations")?.content).toContain("step0_demo_operations")
+      expect(body.files.find((file: { key: string; content?: string }) => file.key === "preview")?.content).toContain("step0_demo_operations")
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("GET /project/workflow/graph reads the active base instead of the latest formal graph", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(projectDir, { recursive: true })
+      const { latest: empty } = await GraphVersionStore.ensure(projectDir)
+      const submitted = await GraphVersionStore.createCandidate(projectDir, empty)
+      await fs.writeFile(path.join(submitted, "nodes", "goal", "goal_submitted.json"), JSON.stringify({
+        id: "goal_submitted",
+        type: "goal",
+        summary: "已提交目标",
+        description: "只存在于最新正式图。",
+        status: "active",
+      }, null, 2) + "\n", "utf8")
+      await GraphVersionStore.publish(projectDir, empty, submitted)
+
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "开始或恢复",
+        payload: {},
+      })
+      await GraphVersionStore.bindActiveBase(projectDir, "previous", true)
+
+      const formalRes = await app.fetch(new Request("http://localhost/project/graph?project=demo&view=expanded"))
+      expect(formalRes.status).toBe(200)
+      const formal = await formalRes.json()
+      expect(formal.nodes.map((node: { id: string }) => node.id)).toEqual(["goal_submitted"])
+
+      const workflowRes = await app.fetch(new Request("http://localhost/project/workflow/graph?project=demo&view=expanded"))
+      expect(workflowRes.status).toBe(200)
+      const workflowGraph = await workflowRes.json()
+      expect(workflowGraph.nodes).toEqual([])
+      expect(workflowGraph.edges).toEqual([])
     } finally {
       process.chdir(originalCwd)
     }
@@ -480,7 +696,7 @@ describe("server routes", () => {
           })
           const chat = await Session.fork({ sessionID: warmup.id })
 
-          await ProjectWorkflow.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
+          await ProjectWorkflowExecution.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
           await ProjectWorkflow.bindSessions({
             project: "demo",
             directory: projectDir,
@@ -515,6 +731,538 @@ describe("server routes", () => {
       const legacyText = JSON.stringify(legacyBody.messages)
       expect(legacyText).toContain("visible workflow message")
       expect(legacyText).not.toContain("warmup baseline should be hidden")
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("workflow readiness is derived from active base graph content", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const emptyProject = path.join(tmp.path, "project_graph_data", "empty")
+      await fs.mkdir(path.join(emptyProject, "metadata"), { recursive: true })
+
+      const emptyRes = await app.fetch(new Request("http://localhost/project/workflow/state?project=empty"))
+      expect(emptyRes.status).toBe(200)
+      const empty = await emptyRes.json()
+      expect(empty.baseIsEmpty).toBe(true)
+      expect(empty.sessionReady).toBe(false)
+
+      await ProjectWorkflowExecution.runAction({
+        project: "empty",
+        directory: emptyProject,
+        action: "开始或恢复",
+        payload: {},
+      })
+      await fs.writeFile(path.join(emptyProject, "workflows", "active", "note.md"), "保留的工作笔记。\n")
+      await fs.writeFile(path.join(emptyProject, "workflows", "active", "operations.draft.json"), "{\"change_id\":\"step0_keep\"}\n")
+      const restoreRes = await app.fetch(new Request("http://localhost/project/workflow/warmup?project=empty", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: true }),
+      }))
+      expect(restoreRes.status).toBe(200)
+      const restored = await restoreRes.json()
+      expect(restored.baseIsEmpty).toBe(true)
+      expect(restored.sessionReady).toBe(true)
+      expect(restored.state?.warmupSessionID).toBeUndefined()
+      await expect(fs.readFile(path.join(emptyProject, "workflows", "active", "note.md"), "utf8")).resolves.toContain("保留的工作笔记")
+      await expect(fs.readFile(path.join(emptyProject, "workflows", "active", "operations.draft.json"), "utf8")).resolves.toContain("step0_keep")
+
+      const graphProject = path.join(tmp.path, "project_graph_data", "with-graph")
+      await fs.mkdir(path.join(graphProject, "nodes", "goal"), { recursive: true })
+      await fs.writeFile(path.join(graphProject, "nodes", "goal", "goal_demo.json"), "{}\n")
+      const graphRes = await app.fetch(new Request("http://localhost/project/workflow/state?project=with-graph"))
+      expect(graphRes.status).toBe(200)
+      const graph = await graphRes.json()
+      expect(graph.baseIsEmpty).toBe(false)
+      expect(graph.sessionReady).toBe(false)
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("GET /project/workflow/messages keeps restored hard-correction chat history", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "metadata"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await fs.writeFile(
+        path.join(projectDir, "metadata", "project_state.json"),
+        JSON.stringify({ graphInitialized: true }, null, 2) + "\n",
+        "utf8",
+      )
+
+      await Instance.provide({
+        directory: projectDir,
+        fn: async () => {
+          const warmup = await Session.create({ title: "工作推进上下文预热" })
+          await SessionPrompt.prompt({
+            sessionID: warmup.id,
+            noReply: true,
+            parts: [{ type: "text", text: "restored warmup baseline should be hidden" }],
+          })
+          const originalChat = await Session.fork({ sessionID: warmup.id })
+          await SessionPrompt.prompt({
+            sessionID: originalChat.id,
+            noReply: true,
+            parts: [{ type: "text", text: "original workflow discussion should stay visible" }],
+          })
+
+          await ProjectWorkflowExecution.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
+          await ProjectWorkflow.bindSessions({
+            project: "demo",
+            directory: projectDir,
+            sessionID: originalChat.id,
+            warmupSessionID: warmup.id,
+            warmupStatus: "completed",
+          })
+          await ProjectWorkflow.writeHardCorrectionState({
+            project: "demo",
+            directory: projectDir,
+            payload: {
+              ofChangeId: "step01_demo",
+              sourceArchivePath: "workflows/applied/step01_demo",
+              fixIndex: 1,
+              expectedChangeId: "step01_demo_fix1",
+            },
+          })
+
+          const restoredChat = await Session.fork({ sessionID: originalChat.id })
+          await ProjectWorkflow.bindRestoredWorkflowChat({
+            project: "demo",
+            directory: projectDir,
+            sessionID: restoredChat.id,
+            warmupSessionID: warmup.id,
+            warmupStatus: "completed",
+          })
+          await SessionPrompt.prompt({
+            sessionID: restoredChat.id,
+            noReply: true,
+            parts: [{ type: "text", text: "restored workflow follow-up" }],
+          })
+        },
+      })
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/messages?project=demo"))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      const text = JSON.stringify(body.messages)
+      expect(text).toContain("original workflow discussion should stay visible")
+      expect(text).toContain("restored workflow follow-up")
+      expect(text).not.toContain("restored warmup baseline should be hidden")
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("GET /project/workflow/messages does not restore hard-correction active without session id", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "metadata"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await fs.writeFile(
+        path.join(projectDir, "metadata", "project_state.json"),
+        JSON.stringify({ graphInitialized: true }, null, 2) + "\n",
+        "utf8",
+      )
+
+      await Instance.provide({
+        directory: projectDir,
+        fn: async () => {
+          const originalChat = await Session.create({ title: "工作推进" })
+          await SessionPrompt.prompt({
+            sessionID: originalChat.id,
+            noReply: true,
+            parts: [{ type: "text", text: "legacy active source chat should be restored" }],
+          })
+
+          await ProjectWorkflowExecution.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
+          const active = await ProjectWorkflow.getActive({ project: "demo", directory: projectDir })
+          await fs.writeFile(
+            path.join(projectDir, "workflows", "active", "state.json"),
+            JSON.stringify({
+              ...active.state,
+              hardCorrection: {
+                ofChangeId: "step0_demo",
+                sourceArchivePath: "workflows/applied/step0_demo",
+                fixIndex: 1,
+                expectedChangeId: "step0_demo_fix1",
+                restoredAt: new Date().toISOString(),
+              },
+            },
+            null,
+            2,
+          ) + "\n", "utf8")
+        },
+      })
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/messages?project=demo"))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.sessionID).toBeUndefined()
+      expect(body.messages).toEqual([])
+      expect(body.workflow.state?.sessionID).toBeUndefined()
+      expect(JSON.stringify(body)).not.toContain("legacy active source chat should be restored")
+
+      const chatRes = await app.fetch(new Request("http://localhost/project/workflow/chat?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "继续硬更正" }),
+      }))
+      expect(chatRes.status).toBe(409)
+      const afterChat = await ProjectWorkflow.getActive({ project: "demo", directory: projectDir })
+      expect(afterChat.state?.sessionID).toBeUndefined()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("POST /project/workflow/action rejects apply while the workflow session is busy", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "metadata"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "开始或恢复",
+        payload: {},
+      })
+      const session = await Instance.provide({
+        directory: projectDir,
+        fn: () => Session.create({ title: "工作推进" }),
+      })
+      await ProjectWorkflow.bindSessions({
+        project: "demo",
+        directory: projectDir,
+        sessionID: session.id,
+        warmupStatus: "completed",
+      })
+      await Instance.provide({
+        directory: projectDir,
+        fn: () => SessionStatus.set(session.id, { type: "busy" }),
+      })
+
+      const response = await app.fetch(new Request("http://localhost/project/workflow/action?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "应用图操作", payload: { confirm: true } }),
+      }))
+
+      expect(response.status).toBe(409)
+      expect(await response.text()).toContain("大模型仍在处理当前工作推进")
+      await Instance.provide({
+        directory: projectDir,
+        fn: () => SessionStatus.set(session.id, { type: "idle" }),
+      })
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("POST /project/workflow/action rejects correction mode switches while warmup is running", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "metadata"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      const started = await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "开始或恢复",
+        payload: {},
+      })
+      await ProjectWorkflow.bindSessions({
+        project: "demo",
+        directory: projectDir,
+        warmupStatus: "running",
+      })
+
+      for (const action of ["开始软更正", "重做最近提交"]) {
+        const response = await app.fetch(new Request("http://localhost/project/workflow/action?project=demo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, payload: { confirm: true } }),
+        }))
+        expect(response.status).toBe(409)
+        expect(await response.text()).toContain("项目上下文仍在预热")
+      }
+
+      const current = await ProjectWorkflow.getActive({ project: "demo", directory: projectDir })
+      expect(current.state?.id).toBe(started.state?.id)
+      expect(current.state?.warmupStatus).toBe("running")
+      expect(current.state?.correction).toBeUndefined()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("POST /project/workflow/action restores chat history even when the archived warmup is missing", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    let archivedWarmupSessionID: SessionID | undefined
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "metadata"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "开始或恢复",
+        payload: {},
+      })
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "更新工作笔记",
+        payload: {
+          content: "首轮工作推进笔记。",
+          summary: "首轮工作推进。",
+        },
+      })
+
+      await Instance.provide({
+        directory: projectDir,
+        fn: async () => {
+          const warmup = await Session.create({ title: "工作推进上下文预热" })
+          archivedWarmupSessionID = warmup.id
+          await SessionPrompt.prompt({
+            sessionID: warmup.id,
+            noReply: true,
+            parts: [{ type: "text", text: "warmup baseline before apply should stay hidden" }],
+          })
+          const chat = await Session.fork({ sessionID: warmup.id })
+          await Bun.sleep(2)
+          await ProjectWorkflow.bindSessions({
+            project: "demo",
+            directory: projectDir,
+            sessionID: chat.id,
+            warmupSessionID: warmup.id,
+            warmupStatus: "completed",
+          })
+          await SessionPrompt.prompt({
+            sessionID: chat.id,
+            noReply: true,
+            parts: [{ type: "text", text: "original chat before apply should be restored" }],
+          })
+        },
+      })
+
+      const activeDir = path.join(projectDir, "workflows", "active")
+      await fs.writeFile(path.join(activeDir, "operation_notes.md"), "## 图操作说明\n\n首轮最小建图提交。\n", "utf8")
+      await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+        change_id: "step0_initial_workflow",
+        timestamp: "2026-07-06T10:00:00+08:00",
+        note_filename: "initial_workflow.md",
+        changelog_entry: "[2026-07-06 10:00] step0_initial_workflow: 首轮创建目标、工作块和计划工作项，用于验证硬更正会话恢复。",
+        items: [
+          {
+            kind: "create_node",
+            temp_id: "goal_initial_workflow",
+            node_type: "goal",
+            summary: "首轮目标",
+            description: "首轮目标当前状态。",
+            fields: { status: "established", completion_score: 0 },
+            history: "[step0_initial_workflow] 创建首轮目标。",
+          },
+          {
+            kind: "create_node",
+            temp_id: "work_block_initial_workflow",
+            node_type: "work_block",
+            summary: "首轮工作块",
+            description: "首轮工作块当前状态。",
+            fields: { status: "active", linked_goal_id: "goal_initial_workflow" },
+            history: "[step0_initial_workflow] 创建首轮工作块。",
+          },
+          {
+            kind: "create_node",
+            temp_id: "work_item_initial_workflow",
+            node_type: "work_item",
+            summary: "首轮工作项",
+            description: "首轮工作项当前状态。",
+            fields: { status: "planned", linked_work_block_id: "work_block_initial_workflow" },
+            history: "[step0_initial_workflow] 创建首轮计划工作项。",
+          },
+        ],
+      }, null, 2) + "\n", "utf8")
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "生成图操作草案",
+        payload: {
+          summary: "登记首轮建图草案。",
+          change_id: "step0_initial_workflow",
+          artifacts: { operationNotes: true, operationsDraft: true },
+        },
+      })
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "应用图操作",
+        payload: { confirm: true },
+      })
+      if (!archivedWarmupSessionID) throw new Error("test warmup session was not created")
+      await Instance.provide({
+        directory: projectDir,
+        fn: () => Session.remove(archivedWarmupSessionID!),
+      })
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/action?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "重做最近提交", payload: { confirm: true } }),
+      }))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.state?.correction).toBeUndefined()
+      expect(body.state?.hardCorrection?.expectedChangeId).toBe("step0_initial_workflow_fix1")
+      expect(body.state?.sessionID).toMatch(/^ses_/)
+      expect(body.state?.warmupSessionID).toMatch(/^ses_/)
+      expect(body.data?.restoredSession).toBeUndefined()
+
+      const messagesRes = await app.fetch(new Request("http://localhost/project/workflow/messages?project=demo"))
+      expect(messagesRes.status).toBe(200)
+      const messagesBody = await messagesRes.json()
+      const messagesText = JSON.stringify(messagesBody.messages)
+      expect(messagesText).toContain("original chat before apply should be restored")
+      expect(messagesText).not.toContain("warmup baseline before apply should stay hidden")
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("hard correction forks the archived warmup when the archived chat no longer exists", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(path.join(projectDir, "metadata"), { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await ProjectWorkflowExecution.runAction({ project: "demo", directory: projectDir, action: "开始或恢复", payload: {} })
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "更新工作笔记",
+        payload: { content: "首轮事件记录。", summary: "首轮事件。" },
+      })
+
+      let warmupSessionID = ""
+      let chatSessionID = ""
+      await Instance.provide({
+        directory: projectDir,
+        fn: async () => {
+          const warmup = await Session.create({ title: "工作推进上下文预热" })
+          warmupSessionID = warmup.id
+          await SessionPrompt.prompt({
+            sessionID: warmup.id,
+            noReply: true,
+            parts: [{ type: "text", text: "archived warmup should remain hidden" }],
+          })
+          const chat = await Session.fork({ sessionID: warmup.id })
+          chatSessionID = chat.id
+          await ProjectWorkflow.bindSessions({
+            project: "demo",
+            directory: projectDir,
+            sessionID: chat.id,
+            warmupSessionID: warmup.id,
+            warmupStatus: "completed",
+          })
+        },
+      })
+
+      const activeDir = path.join(projectDir, "workflows", "active")
+      await fs.writeFile(path.join(activeDir, "operation_notes.md"), "# 图操作说明\n\n创建首轮事件。\n", "utf8")
+      await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+        change_id: "step0_initial_event",
+        timestamp: "2026-07-06T10:00:00+08:00",
+        note_filename: "initial_event.md",
+        changelog_entry: "[2026-07-06 10:00] step0_initial_event: 记录首轮项目事件并建立初始图数据。",
+        items: [
+          {
+            kind: "create_node",
+            temp_id: "goal_initial_event",
+            node_type: "goal",
+            summary: "首轮项目目标",
+            description: "项目首轮目标已经建立。",
+            fields: { status: "established", completion_score: 0 },
+            history: "[step0_initial_event] 建立首轮项目目标。",
+          },
+          {
+            kind: "create_node",
+            temp_id: "work_block_initial_event",
+            node_type: "work_block",
+            summary: "首轮工作块",
+            description: "首轮工作块用于组织初始工作。",
+            fields: { status: "active", linked_goal_id: "goal_initial_event" },
+            history: "[step0_initial_event] 创建首轮工作块并归属首轮目标。",
+          },
+          {
+            kind: "create_node",
+            temp_id: "work_item_initial_event",
+            node_type: "work_item",
+            summary: "首轮计划工作项",
+            description: "首轮工作项尚未开始。",
+            fields: { status: "planned", linked_work_block_id: "work_block_initial_event" },
+            history: "[step0_initial_event] 创建首轮计划工作项并归属首轮工作块。",
+          },
+        ],
+      }, null, 2) + "\n", "utf8")
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "生成图操作草案",
+        payload: {
+          summary: "登记首轮事件图操作。",
+          change_id: "step0_initial_event",
+          artifacts: { operationNotes: true, operationsDraft: true },
+        },
+      })
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "应用图操作",
+        payload: { confirm: true },
+      })
+      await Instance.provide({ directory: projectDir, fn: () => Session.remove(chatSessionID as SessionID) })
+
+      const res = await app.fetch(new Request("http://localhost/project/workflow/action?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "重做最近提交", payload: { confirm: true } }),
+      }))
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.state?.sessionID).toMatch(/^ses_/)
+      expect(body.state?.sessionID).not.toBe(chatSessionID)
+      expect(body.state?.warmupSessionID).toBe(warmupSessionID)
+      const messagesRes = await app.fetch(new Request("http://localhost/project/workflow/messages?project=demo"))
+      const messages = await messagesRes.json()
+      expect(JSON.stringify(messages.messages)).not.toContain("archived warmup should remain hidden")
     } finally {
       process.chdir(originalCwd)
     }

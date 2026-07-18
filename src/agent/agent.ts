@@ -15,6 +15,8 @@ import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import PROMPT_PROJECT_WORKFLOW from "./prompt/project-workflow.txt"
+import PROMPT_PROJECT_WORKFLOW_CORRECTION from "./prompt/project-workflow-correction.txt"
+import PROMPT_PROJECT_WORKFLOW_CORRECTION_WARMUP from "./prompt/project-workflow-correction-warmup.txt"
 import PROMPT_PROJECT_WORKFLOW_WARMUP from "./prompt/project-workflow-warmup.txt"
 import PROMPT_PROJECT_WORKFLOW_GRAPH_OPERATION_REVIEWER from "./prompt/project-workflow-graph-operation-reviewer.txt"
 import { Permission } from "@/permission"
@@ -230,7 +232,10 @@ export namespace Agent {
               "*": "deny",
               "project-workflow-graph-operation-draft": "allow",
             },
-            read: "allow",
+            read: {
+              "*": "allow",
+              [path.join(Instance.directory, "workflows", "active", "state.json")]: "deny",
+            },
           }),
           user,
         ),
@@ -247,17 +252,79 @@ export namespace Agent {
           defaults,
           Permission.fromConfig({
             "*": "deny",
-            read: "allow",
+            read: {
+              "*": "allow",
+              [path.join(Instance.directory, "workflows", "active", "state.json")]: "deny",
+            },
             grep: "allow",
             glob: "allow",
             skill: {
               "*": "deny",
               "project-workflow-graph-operation-draft": "allow",
+              "project-workflow-correction-draft": "allow",
             },
           }),
           user,
         ),
         prompt: PROMPT_PROJECT_WORKFLOW_GRAPH_OPERATION_REVIEWER,
+      },
+      project_workflow_correction: {
+        name: "project_workflow_correction",
+        description: "项目图谱软更正主 Agent。用于追加 correction 提交，修正、补充或逻辑废弃历史图数据。",
+        mode: "primary",
+        native: true,
+        hidden: true,
+        options: {},
+        permission: Permission.merge(
+          defaults,
+          Permission.fromConfig({
+            "*": "deny",
+            workflow_action: "allow",
+            task: {
+              "*": "deny",
+              project_workflow_graph_operation_reviewer: "allow",
+            },
+            edit: {
+              "*": "deny",
+              [path.relative(Instance.worktree, path.join(Instance.directory, "workflows", "active", "note.md")).replaceAll("\\", "/")]: "ask",
+              [path.relative(Instance.worktree, path.join(Instance.directory, "workflows", "active", "operation_notes.md")).replaceAll("\\", "/")]: "allow",
+              [path.relative(Instance.worktree, path.join(Instance.directory, "workflows", "active", "operations.draft.json")).replaceAll("\\", "/")]: "allow",
+            },
+            skill: {
+              "*": "deny",
+              "project-workflow-correction-draft": "allow",
+              "project-workflow-graph-operation-draft": "allow",
+            },
+            read: {
+              "*": "allow",
+              [path.join(Instance.directory, "workflows", "active", "state.json")]: "deny",
+            },
+          }),
+          user,
+        ),
+        prompt: PROMPT_PROJECT_WORKFLOW_CORRECTION,
+      },
+      project_workflow_correction_warmup: {
+        name: "project_workflow_correction_warmup",
+        description: "项目图谱软更正上下文预热 Agent。只读当前正式图谱和最近提交，为 correction chat 建立轻量上下文。",
+        mode: "primary",
+        native: true,
+        hidden: true,
+        options: {},
+        permission: Permission.merge(
+          defaults,
+          Permission.fromConfig({
+            "*": "deny",
+            read: {
+              "*": "allow",
+              [path.join(Instance.directory, "workflows", "active", "state.json")]: "deny",
+            },
+            grep: "allow",
+            glob: "allow",
+          }),
+          user,
+        ),
+        prompt: PROMPT_PROJECT_WORKFLOW_CORRECTION_WARMUP,
       },
       project_workflow_warmup: {
         name: "project_workflow_warmup",
@@ -270,7 +337,10 @@ export namespace Agent {
           defaults,
           Permission.fromConfig({
             "*": "deny",
-            read: "allow",
+            read: {
+              "*": "allow",
+              [path.join(Instance.directory, "workflows", "active", "state.json")]: "deny",
+            },
             grep: "allow",
             glob: "allow",
             skill: {

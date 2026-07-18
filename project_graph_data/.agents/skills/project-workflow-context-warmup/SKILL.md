@@ -1,13 +1,11 @@
 ---
 name: project-workflow-context-warmup
-description: 用于已有图数据项目进入工作推进前的轻量项目上下文预热。只读取项目主干索引和少量 goal、issue、work_block 信息，建立后续 workflow chat session 可继承的大致上下文；不生成正式汇报，不下钻 notes，不直接生成工作笔记或图操作。
+description: 用于非空 active/base_graph 进入工作推进前的轻量项目上下文预热。只读取固定基线中的主干索引和少量 goal、issue、work_block 信息，建立后续 workflow chat session 可继承的大致上下文；不生成正式汇报，不下钻 notes，不直接生成工作笔记或图操作。
 ---
 
 # 项目上下文预热 Skill
 
-本技能只用于已有图数据项目的工作推进预热。预热要轻，只建立“大致项目主干”，不要试图在用户提出具体问题前完成深度定位。
-
-未初始化项目不要使用本技能，直接进入项目初始化流程。
+本技能只用于 `workflows/active/base_graph/` 非空时的工作推进预热。该目录是本轮 active 固定的图数据基线；不要改读可能已变化的项目根目录图入口。预热要轻，只建立“大致项目主干”，不要试图在用户提出具体问题前完成深度定位。
 
 ## 预热目标
 
@@ -48,10 +46,10 @@ description: 用于已有图数据项目进入工作推进前的轻量项目上�
 
 读取顺序：
 
-1. 如果存在 `changes/changelog.txt`，只快速读取最近若干 step 和开头若干 step，用于判断项目主线和最近变化；不要完整复盘每一步。
-2. 优先读取 `descriptions_output/description_summary/` 下与 `goal_*.txt`、`issue_*.txt`、`work_block_*.txt` 对应的少量文件。
-3. 如果 `description_summary` 缺失，再读取 `nodes/goal/`、`nodes/issue/`、`nodes/work_block/` 下的 JSON。只提取 `id`、`summary`、`description` 的当前概括、状态/完成度和关联 work_block/work_item 数量等主干字段。
-4. 可以读取 `workflows/active/state.json`，了解当前 active 草案阶段；如果已有 `context_warmup.md`，可以参考但不要照抄。
+1. 如果存在 `workflows/active/base_graph/changes/changelog.txt`，只快速读取最近若干 step 和开头若干 step，用于判断项目主线和最近变化；不要完整复盘每一步。
+2. 优先读取 `workflows/active/base_graph/descriptions_output/description_summary/` 下与 `goal_*.txt`、`issue_*.txt`、`work_block_*.txt` 对应的少量文件。
+3. 如果 `description_summary` 缺失，再读取 `workflows/active/base_graph/nodes/goal/`、`workflows/active/base_graph/nodes/issue/`、`workflows/active/base_graph/nodes/work_block/` 下的 JSON。只提取 `id`、`summary`、`description` 的当前概括、状态/完成度和关联 work_block/work_item 数量等主干字段。
+4. 不读取 `workflows/active/state.json` 这类 active 内部状态文件；active 阶段、恢复方式和入口约束由后端状态机与页面控制。若已有 `context_warmup.md`，可以参考但不要照抄。
 5. 默认不要读取 `notes/`、`source/`、`nodes/work_item/`、`nodes/result/`、`edges/` 或完整 snapshots。只有在 goal/issue/work_block 完全无法判断项目主线时，才允许读取极少量最相关的文件，并在输出中说明这是预热阶段的弱理解。
 
 硬性预算：

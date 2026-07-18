@@ -108,6 +108,13 @@ async function readEdges(projectDir: string): Promise<RawEdge[]> {
   return Promise.all(files.map((file) => readJsonFile<RawEdge>(file)))
 }
 
+function activeEdges(nodes: RawNode[], edges: RawEdge[]) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  return edges.filter((edge) =>
+    nodeById.get(edge.from_node_id)?.outgoing_edges?.includes(edge.id) &&
+    nodeById.get(edge.to_node_id)?.incoming_edges?.includes(edge.id))
+}
+
 function buildGoalHierarchy(edges: RawEdge[]) {
   const childToParent = new Map<string, string>()
   for (const edge of edges) {
@@ -420,14 +427,15 @@ function buildCollapsedEdges(
 
 async function loadGraphForMode(projectDir: string, mode: GraphView): Promise<GraphPayload> {
   const [rawNodes, rawEdges, layout] = await Promise.all([readNodes(projectDir), readEdges(projectDir), readSavedLayout(projectDir, mode)])
+  const currentEdges = activeEdges(rawNodes, rawEdges)
   const visibleTypes = mode === "expanded" ? EXPANDED_VISIBLE_NODE_TYPES : COLLAPSED_VISIBLE_NODE_TYPES
   const remapEdges = mode !== "expanded"
-  const { visibleNodes, nodeById, workItemToBlock, resolveTopGoal, topGoalIds } = buildVisibleNodes(rawNodes, rawEdges, visibleTypes, remapEdges)
+  const { visibleNodes, nodeById, workItemToBlock, resolveTopGoal, topGoalIds } = buildVisibleNodes(rawNodes, currentEdges, visibleTypes, remapEdges)
   const visibleIds = new Set(visibleNodes.map((node) => node.id))
   const graphEdges = mode === "expanded"
-    ? buildExpandedEdges(rawEdges, visibleIds, nodeById, resolveTopGoal)
-    : buildCollapsedEdges(rawEdges, visibleIds, workItemToBlock, nodeById, resolveTopGoal)
-  const structuralEdges = buildStructuralEdges(rawNodes, rawEdges, visibleIds, resolveTopGoal)
+    ? buildExpandedEdges(currentEdges, visibleIds, nodeById, resolveTopGoal)
+    : buildCollapsedEdges(currentEdges, visibleIds, workItemToBlock, nodeById, resolveTopGoal)
+  const structuralEdges = buildStructuralEdges(rawNodes, currentEdges, visibleIds, resolveTopGoal)
 
   const allEdgeMap = new Map<string, GraphEdge>()
   for (const edge of [...graphEdges, ...structuralEdges]) {
@@ -440,7 +448,7 @@ async function loadGraphForMode(projectDir: string, mode: GraphView): Promise<Gr
     meta: {
       rawNodeCount: rawNodes.length,
       visibleNodeCount: visibleNodes.length,
-      rawEdgeCount: rawEdges.length,
+      rawEdgeCount: currentEdges.length,
       visibleEdgeCount: visibleEdges.length,
       topGoalCount: topGoalIds.size,
     },

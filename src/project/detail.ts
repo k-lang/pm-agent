@@ -183,23 +183,47 @@ export namespace ProjectDetail {
     change_id: z.string().optional(),
     success: z.boolean().optional(),
     snapshot: z.string().optional(),
+    graphVersion: z.string().optional(),
   })
 
+  async function readApplyResult(file: string) {
+    const raw = await fs.readFile(file, "utf8").catch(() => undefined)
+    if (!raw) return undefined
+    try {
+      const parsed = ApplyResultFile.safeParse(JSON.parse(raw))
+      return parsed.success ? parsed.data : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  async function publishedActiveGraphVersion(directory: string) {
+    const result = await readApplyResult(path.join(directory, "workflows", "active", "apply_result.json"))
+    const version = result?.snapshot || result?.change_id
+    if (result?.success !== true || !result.graphVersion || !version) return undefined
+    const [publishedGraph, latestGraph] = await Promise.all([
+      fs.realpath(path.resolve(directory, result.graphVersion)).catch(() => undefined),
+      fs.realpath(path.join(directory, "workflows", "latest_graph")).catch(() => undefined),
+    ])
+    return publishedGraph && publishedGraph === latestGraph ? version : undefined
+  }
+
   export async function currentGraphVersion(directory: string) {
+    const activeVersion = await publishedActiveGraphVersion(directory)
+    if (activeVersion) return activeVersion
+
     const appliedRoot = path.join(directory, "workflows", "applied")
     const appliedEntries = await fs.readdir(appliedRoot, { withFileTypes: true }).catch(() => [])
     const appliedResults = await Promise.all(appliedEntries
       .filter((entry) => entry.isDirectory())
       .map(async (entry) => {
-        const raw = await fs.readFile(path.join(appliedRoot, entry.name, "apply_result.json"), "utf8").catch(() => undefined)
-        if (!raw) return undefined
-        const parsed = ApplyResultFile.safeParse(JSON.parse(raw))
-        if (!parsed.success || parsed.data.success === false) return undefined
-        const version = parsed.data.snapshot || parsed.data.change_id
+        const result = await readApplyResult(path.join(appliedRoot, entry.name, "apply_result.json"))
+        if (!result || result.success === false) return undefined
+        const version = result.snapshot || result.change_id
         if (!version) return undefined
         return {
           version,
-          appliedAt: parsed.data.appliedAt ? Date.parse(parsed.data.appliedAt) || 0 : 0,
+          appliedAt: result.appliedAt ? Date.parse(result.appliedAt) || 0 : 0,
         }
       }))
     const latestApplied = appliedResults
@@ -212,7 +236,7 @@ export namespace ProjectDetail {
   async function withComputedSummaryStatus(directory: string, summary: SummaryRecord): Promise<SummaryRecord> {
     if (summary.status !== "completed") return summary
     const currentVersion = await currentGraphVersion(directory)
-    if (summary.graphVersion && currentVersion && summary.graphVersion !== currentVersion) {
+    if (summary.graphVersion !== currentVersion) {
       return { ...summary, status: "expired" }
     }
     return summary

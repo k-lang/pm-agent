@@ -80,9 +80,19 @@ export class GraphStorage {
     return edges.filter((edge): edge is GraphEdge => !!edge)
   }
 
+  async getActiveEdges(input: { nodes?: GraphNode[]; edges?: GraphEdge[] } = {}): Promise<GraphEdge[]> {
+    const [nodes, edges] = await Promise.all([
+      input.nodes ? Promise.resolve(input.nodes) : this.getAllNodes(),
+      input.edges ? Promise.resolve(input.edges) : this.getAllEdges(),
+    ])
+    const nodeByID = new Map(nodes.map((node) => [node.id, node]))
+    return edges.filter((edge) =>
+      nodeByID.get(edge.from_node_id)?.outgoing_edges.includes(edge.id) &&
+      nodeByID.get(edge.to_node_id)?.incoming_edges.includes(edge.id))
+  }
+
   async saveSnapshot(snapshot: GraphSnapshot) {
     await this.ensureDirectories()
     await fs.writeFile(this.snapshotPath(snapshot.id), JSON.stringify(GraphSnapshot.parse(snapshot), null, 2) + "\n", "utf8")
   }
 }
-
