@@ -21,7 +21,6 @@ export const ProjectSummaryRecordTable = sqliteTable(
     kind: text().notNull(),
     source: text().notNull(),
     is_current_baseline: integer({ mode: "boolean" }).notNull().default(false),
-    summary_text: text(),
     report_path: text(),
     report_link_path: text(),
     graph_version: text(),

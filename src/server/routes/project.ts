@@ -60,7 +60,7 @@ const ProjectSourceQuery = z.object({
 })
 
 const UpdateSummaryInput = z.object({
-  summaryText: z.string(),
+  summaryText: z.string().refine((value) => value.trim().length > 0, "Summary text cannot be empty"),
 })
 
 const AskQuestionInput = z.object({

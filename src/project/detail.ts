@@ -101,42 +101,12 @@ export namespace ProjectDetail {
     return path.join(reportRoot(directory), CURRENT_REPORT_LINK_NAME)
   }
 
-  async function findLatestReportPath(directory: string) {
-    const root = reportRoot(directory)
-    const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => [])
-    const dirs = entries
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name)
-      .sort()
-      .reverse()
-
-    for (const name of dirs) {
-      const finalReport = path.join(root, name, "final_report.md")
-      const exists = await fs.stat(finalReport).then(() => true).catch(() => false)
-      if (exists) return finalReport
-    }
-    return undefined
-  }
-
-  async function readCurrentReport(directory: string, preferredPath?: string, allowLatestFallback = true) {
+  async function readSummaryReport(directory: string, reportPath?: string) {
     const linkPath = currentReportLinkPath(directory)
-    const candidates = [
-      preferredPath,
-      await fs.readlink(linkPath).then((linked) => path.resolve(path.dirname(linkPath), linked)).catch(() => undefined),
-      allowLatestFallback ? await findLatestReportPath(directory) : undefined,
-    ].filter((value): value is string => !!value)
-
-    for (const resolved of candidates) {
-      const summaryText = await fs.readFile(resolved, "utf8").catch(() => undefined)
-      if (summaryText === undefined) continue
-      return {
-        reportPath: resolved,
-        reportLinkPath: linkPath,
-        summaryText,
-      }
-    }
-
-    return { reportPath: undefined, reportLinkPath: undefined, summaryText: undefined }
+    if (!reportPath) return { reportPath: undefined, reportLinkPath: undefined, summaryText: undefined }
+    const summaryText = await fs.readFile(reportPath, "utf8").catch(() => undefined)
+    if (summaryText === undefined) return { reportPath: undefined, reportLinkPath: undefined, summaryText: undefined }
+    return { reportPath, reportLinkPath: linkPath, summaryText }
   }
 
   const LatestRunFile = z.object({
@@ -251,7 +221,6 @@ export namespace ProjectDetail {
       kind: "summary",
       source: SummarySource.parse(row.source),
       isCurrentBaseline: !!row.is_current_baseline,
-      summaryText: row.summary_text ?? undefined,
       reportPath: row.report_path ?? undefined,
       reportLinkPath: row.report_link_path ?? undefined,
       graphVersion: row.graph_version ?? undefined,
@@ -388,17 +357,19 @@ export namespace ProjectDetail {
         .map(summaryFromRow),
     )
 
-    return Promise.all(summaries.map(async (summary) => {
-      const source = await readCurrentReport(input.directory, summary.reportPath)
+    const resolved = await Promise.all(summaries.map(async (summary) => {
+      const source = await readSummaryReport(input.directory, summary.reportPath)
+      if (summary.status === "completed" && (!source.reportPath || !source.summaryText?.trim())) return undefined
       return withComputedSummaryStatus(input.directory, {
         ...summary,
-        summaryText: source.reportPath === summary.reportPath ? source.summaryText ?? summary.summaryText : summary.summaryText,
-        reportPath: source.reportPath === summary.reportPath ? source.reportPath ?? summary.reportPath : summary.reportPath,
+        summaryText: source.summaryText,
+        reportPath: source.reportPath ?? summary.reportPath,
         reportLinkPath: summary.isCurrentBaseline
           ? source.reportLinkPath ?? summary.reportLinkPath
           : summary.reportLinkPath,
       })
     }))
+    return resolved.filter((summary): summary is SummaryRecord => !!summary)
   })
 
   export const listQuestions = fn(z.object({ directory: z.string() }), async (input) => {
@@ -456,10 +427,11 @@ export namespace ProjectDetail {
     )
     if (!row) return undefined
     const summary = summaryFromRow(row)
-    const report = await readCurrentReport(input.directory, summary.reportPath, summary.status === "completed")
+    const report = await readSummaryReport(input.directory, summary.reportPath)
+    if (summary.status === "completed" && (!report.reportPath || !report.summaryText?.trim())) return undefined
     return withComputedSummaryStatus(input.directory, {
       ...summary,
-      summaryText: report.summaryText ?? summary.summaryText,
+      summaryText: report.summaryText,
       reportPath: report.reportPath ?? summary.reportPath,
       reportLinkPath: report.reportLinkPath ?? summary.reportLinkPath,
     })
@@ -534,7 +506,6 @@ export namespace ProjectDetail {
           kind: "summary",
           source: input.source,
           is_current_baseline: true,
-          summary_text: null,
           report_path: null,
           report_link_path: linkPath,
           graph_version: graphVersion ?? null,
@@ -560,15 +531,17 @@ export namespace ProjectDetail {
           })
 
           const latestRun = await readLatestRunFile(input.directory)
-          const resolvedReportPath = latestRun?.reportPath
-          const reportLinkPath = resolvedReportPath ? await pointCurrentReportLink(input.directory, resolvedReportPath) : linkPath
-          const report = await readCurrentReport(input.directory, resolvedReportPath)
+          const report = await readSummaryReport(input.directory, latestRun?.reportPath)
+          const reportReady = !!report.reportPath && !!report.summaryText?.trim()
+          const resolvedReportPath = reportReady ? report.reportPath : undefined
+          const reportLinkPath = resolvedReportPath
+            ? await pointCurrentReportLink(input.directory, resolvedReportPath)
+            : linkPath
           Database.use((db) =>
             db
               .update(ProjectSummaryRecordTable)
               .set({
                 status: resolvedReportPath ? "completed" : "failed",
-                summary_text: report.summaryText ?? null,
                 report_path: resolvedReportPath ?? null,
                 report_link_path: reportLinkPath ?? null,
                 graph_version: graphVersion ?? null,
@@ -599,7 +572,6 @@ export namespace ProjectDetail {
         kind: "summary",
         source: input.source,
         is_current_baseline: true,
-        summary_text: null,
         report_path: null,
         report_link_path: linkPath,
         graph_version: graphVersion ?? null,
@@ -612,7 +584,7 @@ export namespace ProjectDetail {
   export const updateSummary = fn(
     z.object({
       id: z.string(),
-      summaryText: z.string(),
+      summaryText: z.string().refine((value) => value.trim().length > 0, "Summary text cannot be empty"),
     }),
     async (input) => {
       const row = Database.use((db) =>
@@ -620,15 +592,17 @@ export namespace ProjectDetail {
       )
       if (!row) throw new NamedError.Unknown({ message: `Summary not found: ${input.id}` })
 
-      const reportPath = row.report_path ?? (await readCurrentReport(row.project_directory)).reportPath
-      if (!reportPath) throw new NamedError.Unknown({ message: `Summary report file not found for: ${input.id}` })
+      const report = await readSummaryReport(row.project_directory, row.report_path ?? undefined)
+      if (!report.reportPath || !report.summaryText?.trim()) {
+        throw new NamedError.Unknown({ message: `Summary report file not found for: ${input.id}` })
+      }
+      const reportPath = report.reportPath
 
       await fs.writeFile(reportPath, input.summaryText, "utf8")
       const updated = Database.use((db) =>
         db
           .update(ProjectSummaryRecordTable)
           .set({
-            summary_text: input.summaryText,
             report_path: reportPath,
             report_link_path: row.report_link_path ?? currentReportLinkPath(row.project_directory),
             time_updated: Date.now(),
@@ -638,7 +612,10 @@ export namespace ProjectDetail {
           .get(),
       )
       if (!updated) throw new NamedError.Unknown({ message: `Summary not found after update: ${input.id}` })
-      return summaryFromRow(updated)
+      return withComputedSummaryStatus(row.project_directory, {
+        ...summaryFromRow(updated),
+        summaryText: input.summaryText,
+      })
     },
   )
 

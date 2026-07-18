@@ -36,8 +36,24 @@ const TEST_MODEL_CONFIG = {
   },
 }
 
-function insertBaselineSummary(directory: string, sessionID: SessionID, options: { now?: number; source?: "auto" | "manual"; graphVersion?: string } = {}) {
+async function insertBaselineSummary(
+  directory: string,
+  sessionID: SessionID,
+  options: {
+    now?: number
+    source?: "auto" | "manual"
+    graphVersion?: string
+    reportExists?: boolean
+    registerReportPath?: boolean
+    summaryText?: string
+  } = {},
+) {
   const now = options.now ?? Date.now()
+  const reportPath = path.join(directory, "report_output", `test-summary-${now}`, "final_report.md")
+  if (options.reportExists !== false) {
+    await fs.mkdir(path.dirname(reportPath), { recursive: true })
+    await fs.writeFile(reportPath, options.summaryText ?? "summary body", "utf8")
+  }
   Database.use((db) => {
     db.insert(ProjectSummaryRecordTable).values({
       id: `summary-${now}`,
@@ -47,14 +63,14 @@ function insertBaselineSummary(directory: string, sessionID: SessionID, options:
       kind: "summary",
       source: options.source ?? "manual",
       is_current_baseline: true,
-      summary_text: "summary body",
-      report_path: null,
-      report_link_path: null,
+      report_path: options.registerReportPath === false ? null : reportPath,
+      report_link_path: path.join(directory, "report_output", "current_final_report.md"),
       graph_version: options.graphVersion ?? null,
       time_created: now,
       time_updated: now,
     }).run()
   })
+  return reportPath
 }
 
 describe("server routes", () => {
@@ -245,7 +261,7 @@ describe("server routes", () => {
       directory: tmp.path,
       fn: async () => {
         const baseline = await Session.create({ title: "项目总结" })
-        insertBaselineSummary(tmp.path, baseline.id)
+        await insertBaselineSummary(tmp.path, baseline.id)
 
         const firstResult = await ProjectDetail.askQuestion({
           directory: tmp.path,
@@ -280,7 +296,7 @@ describe("server routes", () => {
       directory: tmp.path,
       fn: async () => {
         const baseline = await Session.create({ title: "项目总结" })
-        insertBaselineSummary(tmp.path, baseline.id)
+        await insertBaselineSummary(tmp.path, baseline.id)
 
         const first = await ProjectDetail.askQuestion({
           directory: tmp.path,
@@ -318,7 +334,7 @@ describe("server routes", () => {
       directory: tmp.path,
       fn: async () => {
         const baseline = await Session.create({ title: "项目总结" })
-        insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "old_graph_version" })
+        await insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "old_graph_version" })
       },
     })
     await fs.mkdir(path.join(tmp.path, "workflows", "applied", "new_graph_version"), { recursive: true })
@@ -345,7 +361,7 @@ describe("server routes", () => {
       directory: tmp.path,
       fn: async () => {
         const baseline = await Session.create({ title: "项目总结" })
-        insertBaselineSummary(tmp.path, baseline.id)
+        await insertBaselineSummary(tmp.path, baseline.id)
       },
     })
     await fs.mkdir(path.join(tmp.path, "workflows", "applied", "step0_first_submit"), { recursive: true })
@@ -373,7 +389,7 @@ describe("server routes", () => {
       directory: tmp.path,
       fn: async () => {
         const baseline = await Session.create({ title: "项目总结" })
-        insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "old_graph_version" })
+        await insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "old_graph_version" })
       },
     })
     const { latest } = await GraphVersionStore.ensure(tmp.path)
@@ -404,7 +420,7 @@ describe("server routes", () => {
       directory: tmp.path,
       fn: async () => {
         const baseline = await Session.create({ title: "项目总结" })
-        insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "same_graph_version" })
+        await insertBaselineSummary(tmp.path, baseline.id, { graphVersion: "same_graph_version" })
       },
     })
     await fs.mkdir(path.join(tmp.path, "workflows", "applied", "same_graph_version"), { recursive: true })
@@ -423,6 +439,133 @@ describe("server routes", () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.currentSummary?.status).toBe("completed")
+    expect(body.currentSummary?.summaryText).toBe("summary body")
+  })
+
+  test("GET /project/detail treats a completed summary without its report file as not generated", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const app = Server.createApp({})
+    const now = Date.now()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const baseline = await Session.create({ title: "项目总结" })
+        await insertBaselineSummary(tmp.path, baseline.id, { now, reportExists: false })
+      },
+    })
+
+    const res = await app.fetch(
+      new Request(`http://localhost/project/detail?directory=${encodeURIComponent(tmp.path)}`),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.currentSummary).toBeUndefined()
+    expect(body.summaries).toEqual([])
+
+    await expect(ProjectDetail.updateSummary({
+      id: `summary-${now}`,
+      summaryText: "must not recreate missing report",
+    })).rejects.toMatchObject({
+      data: { message: expect.stringContaining("Summary report file not found") },
+    })
+  })
+
+  test("PATCH /project/summary writes the report file as the only summary body", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const app = Server.createApp({})
+    const now = Date.now()
+    let reportPath = ""
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const baseline = await Session.create({ title: "项目总结" })
+        reportPath = await insertBaselineSummary(tmp.path, baseline.id, {
+          now,
+          graphVersion: "old_graph_version",
+        })
+      },
+    })
+    await fs.mkdir(path.join(tmp.path, "workflows", "applied", "new_graph_version"), { recursive: true })
+    await fs.writeFile(path.join(tmp.path, "workflows", "applied", "new_graph_version", "apply_result.json"), JSON.stringify({
+      appliedAt: new Date().toISOString(),
+      change_id: "new_graph_version",
+      success: true,
+      snapshot: "new_graph_version",
+    }, null, 2) + "\n", "utf8")
+
+    const res = await app.fetch(
+      new Request(`http://localhost/project/summary/summary-${now}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ summaryText: "updated report body" }),
+      }),
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.summaryText).toBe("updated report body")
+    expect(body.status).toBe("expired")
+    expect(await fs.readFile(reportPath, "utf8")).toBe("updated report body")
+  })
+
+  test("PATCH /project/summary rejects blank content without changing the report", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const app = Server.createApp({})
+    const now = Date.now()
+    let reportPath = ""
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const baseline = await Session.create({ title: "项目总结" })
+        reportPath = await insertBaselineSummary(tmp.path, baseline.id, { now })
+      },
+    })
+
+    const res = await app.fetch(
+      new Request(`http://localhost/project/summary/summary-${now}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ summaryText: "  \n\t" }),
+      }),
+    )
+    expect(res.status).toBe(400)
+    expect(await fs.readFile(reportPath, "utf8")).toBe("summary body")
+    const current = await ProjectDetail.currentSummary({ directory: tmp.path })
+    expect(current?.status).toBe("completed")
+    expect(current?.summaryText).toBe("summary body")
+  })
+
+  test("summary lookup and editing never infer a report from the project current link", async () => {
+    await using tmp = await tmpdir({ config: TEST_MODEL_CONFIG })
+    const now = Date.now()
+    let reportPath = ""
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const baseline = await Session.create({ title: "项目总结" })
+        reportPath = await insertBaselineSummary(tmp.path, baseline.id, {
+          now,
+          registerReportPath: false,
+          summaryText: "previous report body",
+        })
+      },
+    })
+    const linkPath = path.join(tmp.path, "report_output", "current_final_report.md")
+    await fs.symlink(path.relative(path.dirname(linkPath), reportPath), linkPath)
+
+    const detail = await ProjectDetail.currentSummary({ directory: tmp.path })
+    expect(detail).toBeUndefined()
+
+    await expect(ProjectDetail.updateSummary({
+      id: `summary-${now}`,
+      summaryText: "must not overwrite previous report",
+    })).rejects.toMatchObject({
+      data: { message: expect.stringContaining("Summary report file not found") },
+    })
+    expect(await fs.readFile(reportPath, "utf8")).toBe("previous report body")
   })
 
   test("POST /project/summary/run records automatic summary source", async () => {
@@ -456,7 +599,7 @@ describe("server routes", () => {
       directory: tmp.path,
       fn: async () => {
         const baseline = await Session.create({ title: "项目总结" })
-        insertBaselineSummary(tmp.path, baseline.id)
+        await insertBaselineSummary(tmp.path, baseline.id)
       },
     })
 
