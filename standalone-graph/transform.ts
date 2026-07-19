@@ -208,6 +208,9 @@ function buildVisibleNodes(nodes: RawNode[], edges: RawEdge[], visibleTypes: Set
   for (const node of nodes) {
     if (node.type === "goal") communityByNodeId.set(node.id, resolveTopGoal(node.id))
     if (node.type === "work_block") communityByNodeId.set(node.id, workBlockCommunity.get(node.id) || null)
+    if (node.type === "work_item") {
+      communityByNodeId.set(node.id, workBlockCommunity.get(node.linked_work_block_id || "") || null)
+    }
   }
 
   for (const node of nodes.filter((node) => node.type === "result")) {

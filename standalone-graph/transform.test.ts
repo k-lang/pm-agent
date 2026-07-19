@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import fs from "fs/promises"
+import os from "os"
 import path from "path"
 import { loadExpandedGraph, loadGraph, readSavedLayout, saveLayout } from "./transform"
 
@@ -116,6 +118,58 @@ describe("standalone expanded graph transform", () => {
     expect(item?.linkedWorkBlockId).toBe("work_block_analyze_b_vendor_solution")
     expect(item?.communityGoalId).toBe("goal_emergency_solution_design")
     expect(result?.producingWorkBlockId).toBe("work_block_emergency_solution_design")
+  })
+
+  test("derives event community through a work item in expanded mode", async () => {
+    const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "expanded-event-community-"))
+    const nodesDir = path.join(projectDir, "nodes")
+    const edgesDir = path.join(projectDir, "edges")
+    const edgeId = "event_requirement|work_item_assessment|leads_to"
+    try {
+      await Promise.all([
+        fs.mkdir(nodesDir, { recursive: true }),
+        fs.mkdir(edgesDir, { recursive: true }),
+      ])
+      await Promise.all([
+        fs.writeFile(path.join(nodesDir, "goal.json"), JSON.stringify({
+          id: "goal_main",
+          type: "goal",
+          incoming_edges: [],
+          outgoing_edges: [],
+        }), "utf8"),
+        fs.writeFile(path.join(nodesDir, "block.json"), JSON.stringify({
+          id: "work_block_main",
+          type: "work_block",
+          linked_goal_id: "goal_main",
+          incoming_edges: [],
+          outgoing_edges: [],
+        }), "utf8"),
+        fs.writeFile(path.join(nodesDir, "item.json"), JSON.stringify({
+          id: "work_item_assessment",
+          type: "work_item",
+          linked_work_block_id: "work_block_main",
+          incoming_edges: [edgeId],
+          outgoing_edges: [],
+        }), "utf8"),
+        fs.writeFile(path.join(nodesDir, "event.json"), JSON.stringify({
+          id: "event_requirement",
+          type: "event",
+          incoming_edges: [],
+          outgoing_edges: [edgeId],
+        }), "utf8"),
+        fs.writeFile(path.join(edgesDir, "event-to-item.json"), JSON.stringify({
+          id: edgeId,
+          from_node_id: "event_requirement",
+          to_node_id: "work_item_assessment",
+          type: "leads_to",
+        }), "utf8"),
+      ])
+
+      const graph = await loadExpandedGraph(projectDir)
+      expect(graph.nodes.find((node) => node.id === "event_requirement")?.communityGoalId).toBe("goal_main")
+    } finally {
+      await fs.rm(projectDir, { recursive: true, force: true })
+    }
   })
 
   test("preserves node detail urls in expanded mode", async () => {
