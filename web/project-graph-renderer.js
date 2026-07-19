@@ -66,10 +66,22 @@ export function graphDetailUrlKey(nodeId, detailUrl) {
   return `${nodeId}\u0000${detailUrl}`
 }
 
-export function shouldUseDraftNoteFallback(options, nodeId, detailUrl) {
+export function shouldUseActiveDraftNote(options, nodeId, detailUrl) {
   return options.mode === 'draft-preview'
     && String(detailUrl).startsWith('notes/')
     && options.draftDetailUrlKeys.has(graphDetailUrlKey(nodeId, detailUrl))
+}
+
+export async function loadGraphDetailContent({ fetchImpl = fetch, projectName, detailUrl, useDraftNote = false }) {
+  const url = useDraftNote
+    ? `/project/workflow/note?project=${encodeURIComponent(projectName)}`
+    : `/project/file/content?project=${encodeURIComponent(projectName)}&path=${encodeURIComponent(detailUrl)}`
+  const response = await fetchImpl(url)
+  if (!response.ok) throw new Error(await response.text())
+  const result = await response.json()
+  if (!useDraftNote) return result
+  if (!result?.exists) throw new Error('当前工作笔记不存在')
+  return { type: 'text', content: result.content || '' }
 }
 
 export function graphNodeCardFields(node) {
@@ -871,8 +883,8 @@ export class ProjectGraphRenderer {
       if (projectGraphDetailHref(this.projectName, value) !== value) {
         link.addEventListener('click', (event) => {
           event.preventDefault()
-          const draftNote = shouldUseDraftNoteFallback(this.state.options, node?.id, value)
-          this.openDetailViewer(value, { draftNote })
+          const useDraftNote = shouldUseActiveDraftNote(this.state.options, node?.id, value)
+          this.openDetailViewer(value, { useDraftNote })
         })
       }
       valueEl.append(link)
@@ -893,25 +905,17 @@ export class ProjectGraphRenderer {
     this.nodeCardEl.classList.add('hidden')
   }
 
-  async openDetailViewer(detailUrl, { draftNote = false } = {}) {
+  async openDetailViewer(detailUrl, { useDraftNote = false } = {}) {
     const loadSeq = ++this.detailLoadSeq
     this.detailViewerPathEl.textContent = detailUrl
     this.detailViewerContentEl.textContent = '加载中...'
     this.detailViewerEl.classList.remove('hidden')
     try {
-      const response = await fetch(`/project/file/content?project=${encodeURIComponent(this.projectName)}&path=${encodeURIComponent(detailUrl)}`)
-      let result
-      if (response.ok) {
-        result = await response.json()
-      } else if (draftNote) {
-        const draftResponse = await fetch(`/project/workflow/note?project=${encodeURIComponent(this.projectName)}`)
-        if (!draftResponse.ok) throw new Error(await draftResponse.text())
-        const draft = await draftResponse.json()
-        if (!draft?.exists) throw new Error(await response.text())
-        result = { type: 'text', content: draft.content }
-      } else {
-        throw new Error(await response.text())
-      }
+      const result = await loadGraphDetailContent({
+        projectName: this.projectName,
+        detailUrl,
+        useDraftNote,
+      })
       if (loadSeq !== this.detailLoadSeq) return
       this.detailViewerContentEl.textContent = result?.type === 'binary'
         ? '该文件不可作为文本预览'

@@ -5,10 +5,11 @@ import {
   graphNodeCardFields,
   graphDetailUrlKey,
   isEdgeHighlighted,
+  loadGraphDetailContent,
   normalizeGraphPayload,
   normalizeGraphRenderOptions,
   projectGraphDetailHref,
-  shouldUseDraftNoteFallback,
+  shouldUseActiveDraftNote,
 } from "./project-graph-renderer.js"
 
 const nodes = [
@@ -72,9 +73,50 @@ describe("project graph renderer helpers", () => {
     })
 
     expect(options.draftNodeIds.has("work_item_main")).toBe(true)
-    expect(shouldUseDraftNoteFallback(options, "work_item_main", "notes/result.md")).toBe(false)
-    expect(shouldUseDraftNoteFallback(options, "result_main", "notes/result.md")).toBe(true)
-    expect(shouldUseDraftNoteFallback(options, "result_main", "https://example.com/result")).toBe(false)
+    expect(shouldUseActiveDraftNote(options, "work_item_main", "notes/result.md")).toBe(false)
+    expect(shouldUseActiveDraftNote(options, "result_main", "notes/result.md")).toBe(true)
+    expect(shouldUseActiveDraftNote(options, "result_main", "https://example.com/result")).toBe(false)
+  })
+
+  test("uses the active note before an existing project note for draft detail urls", async () => {
+    const requested = []
+    const fetchImpl = async (url) => {
+      requested.push(url)
+      if (url.startsWith("/project/workflow/note")) {
+        return new Response(JSON.stringify({ exists: true, content: "active correction note" }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ type: "text", content: "older archived note" }), { status: 200 })
+    }
+
+    const result = await loadGraphDetailContent({
+      fetchImpl,
+      projectName: "zxzq-demo",
+      detailUrl: "notes/reused_name.md",
+      useDraftNote: true,
+    })
+
+    expect(result).toEqual({ type: "text", content: "active correction note" })
+    expect(requested).toEqual(["/project/workflow/note?project=zxzq-demo"])
+  })
+
+  test("keeps formal project files authoritative outside draft note paths", async () => {
+    const requested = []
+    const fetchImpl = async (url) => {
+      requested.push(url)
+      return new Response(JSON.stringify({ type: "text", content: "archived note" }), { status: 200 })
+    }
+
+    const result = await loadGraphDetailContent({
+      fetchImpl,
+      projectName: "zxzq-demo",
+      detailUrl: "notes/existing.md",
+      useDraftNote: false,
+    })
+
+    expect(result).toEqual({ type: "text", content: "archived note" })
+    expect(requested).toEqual([
+      "/project/file/content?project=zxzq-demo&path=notes%2Fexisting.md",
+    ])
   })
 
   test("computes expanded positions for graph preview payloads", () => {
