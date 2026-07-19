@@ -42,6 +42,44 @@ export function workflowLoadBlocksInteraction({ loading = false, workflow }) {
   return !!loading && !workflow
 }
 
+export function effectiveWorkflowWarmupStatus({ persistedStatus, warmupStarting = false, statusAvailable = false, sessionStatus }) {
+  if (warmupStarting) return 'running'
+  if (persistedStatus !== 'running') return persistedStatus || ''
+  if (!statusAvailable) return 'running'
+  if (sessionStatus?.type === 'busy' || sessionStatus?.type === 'retry') return 'running'
+  return 'stale'
+}
+
+export function workflowRuntimeIsRunning({
+  warmupStatus,
+  sessionStatuses = [],
+  statusAvailable = true,
+  statusRequired = false,
+  chatSending = false,
+  awaitingReply = false,
+}) {
+  if (warmupStatus === 'running') return true
+  if (statusRequired && !statusAvailable) return true
+  if (sessionStatuses.some((status) => status?.type === 'busy' || status?.type === 'retry')) return true
+  return chatSending || awaitingReply
+}
+
+export function workflowTerminalActionsBlocked({ runtimeRunning = false, persistedWarmupStatus }) {
+  return runtimeRunning || persistedWarmupStatus === 'running'
+}
+
+export function shouldClearWorkflowAwaitingReply({
+  chatSending = false,
+  sessionStatuses = [],
+  statusAvailable = true,
+  hasUnansweredUser = false,
+}) {
+  if (!hasUnansweredUser) return true
+  if (!statusAvailable) return false
+  const sessionRunning = sessionStatuses.some((status) => status?.type === 'busy' || status?.type === 'retry')
+  return !chatSending && !sessionRunning
+}
+
 export function workflowOperationArtifactsChanged(previousState, nextState) {
   const artifactStages = new Set(['图操作已生成', '图操作需修订'])
   if (!artifactStages.has(previousState?.stage) && !artifactStages.has(nextState?.stage)) return false
@@ -460,10 +498,13 @@ export function workflowMessageID(message) {
   return message.info?.id || message.id || ''
 }
 
-export function renderWorkflowToolPart(part, message = null) {
+export function renderWorkflowToolPart(part, message = null, options = {}) {
   const status = part.state?.status || 'pending'
   const title = part.state?.title || part.tool || 'tool'
   const metadata = part.state?.metadata || {}
+  if (options.interrupted && (status === 'pending' || status === 'running')) {
+    return `<div class="message-tool tool-error"><span>${esc(title)} · 执行已中断</span></div>`
+  }
   if (isWriteTool(part.tool) && status === 'completed') {
     const record = writeToolRecord(part, message)
     const button = record ? `<button type="button" class="btn-secondary tool-diff-open" data-tool-diff-open="${esc(record.id)}">${esc(record.buttonLabel)}</button>` : ''

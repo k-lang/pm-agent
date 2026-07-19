@@ -1,6 +1,7 @@
 import {
   allWorkflowDiffRecords as collectWorkflowDiffRecords,
   canShowWorkflowGraphPreview,
+  effectiveWorkflowWarmupStatus,
   esc,
   markWorkflowPermissionRecord as markWorkflowPermissionRecords,
   mergeWorkflowReadiness,
@@ -11,6 +12,7 @@ import {
   renderWorkflowReviewBody,
   renderWorkflowToolPart,
   resetWorkflowViewState,
+  shouldClearWorkflowAwaitingReply,
   shouldDiscardWorkflowFromRestoreChoice,
   upsertWorkflowPermissionRecord as upsertWorkflowPermissionRecordList,
   workflowMaximizeBodyClass,
@@ -20,6 +22,8 @@ import {
   workflowLoadBlocksInteraction,
   workflowMessageErrorText,
   workflowOperationArtifactsChanged,
+  workflowRuntimeIsRunning,
+  workflowTerminalActionsBlocked,
   workflowViewRequestMatches,
   workflowPermissionDiff,
   workflowPermissionFile,
@@ -149,6 +153,7 @@ let activePermissionReviewID = ''
 let permissionReplying = false
 let maximizedPanel = ''
 const workflowStatusById = new Map()
+let workflowStatusAvailable = false
 const shownPermissionModalIds = new Set()
 const previewRenderKeys = new WeakMap()
 
@@ -214,6 +219,7 @@ function clearWorkflowView() {
   shownPermissionModalIds.clear()
   workflowAwaitingReply = reset.workflowAwaitingReply
   workflowStatusById.clear()
+  workflowStatusAvailable = false
   resources = []
   archivedNotes = []
   selectedResourcePath = ''
@@ -507,20 +513,28 @@ async function loadWorkflow() {
       const previousState = currentWorkflowState()
       const previousStage = previousState?.stage || ''
       const previousGraphInitialized = !!project.graphInitialized
-      const [result, statuses] = await Promise.all([
+      const [result, statusResult] = await Promise.all([
         fetchJson(API + `/project/workflow/messages?project=${encodeURIComponent(project.name)}`),
-        fetchJson(API + `/session/status?directory=${encodeURIComponent(project.directory)}`).catch(() => ({})),
+        fetchJson(API + `/session/status?directory=${encodeURIComponent(project.directory)}`)
+          .then((statuses) => ({ available: true, statuses: statuses || {} }))
+          .catch(() => ({ available: false, statuses: null })),
       ])
       if (!isCurrentWorkflowViewRequest(request)) return
       workflow = result?.workflow || null
       workflowMessages = result?.messages || []
-      syncWorkflowStatuses(statuses || {})
+      workflowStatusAvailable = statusResult.available
+      if (statusResult.available) syncWorkflowStatuses(statusResult.statuses)
       await loadPendingWorkflowPermissions(request)
       if (!isCurrentWorkflowViewRequest(request)) return
       if (pendingUserText && workflowMessages.some((message) => visibleUserText(message) === pendingUserText)) {
         pendingUserText = ''
       }
-      if (!workflowHasUnansweredUser()) workflowAwaitingReply = false
+      if (shouldClearWorkflowAwaitingReply({
+        chatSending,
+        sessionStatuses: [...workflowStatusById.values()],
+        statusAvailable: workflowStatusAvailable,
+        hasUnansweredUser: workflowHasUnansweredUser(),
+      })) workflowAwaitingReply = false
       const nextState = currentWorkflowState()
       const nextStage = nextState?.stage || ''
       if (workflowOperationArtifactsChanged(previousState, nextState)) {
@@ -656,6 +670,15 @@ function connectWorkflowSSE() {
 function workflowSessionIDs() {
   const state = currentWorkflowState()
   return new Set([state?.sessionID, state?.warmupSessionID].filter(Boolean))
+}
+
+function effectiveWarmupStatus(state = currentWorkflowState()) {
+  return effectiveWorkflowWarmupStatus({
+    persistedStatus: state?.warmupStatus,
+    warmupStarting,
+    statusAvailable: workflowStatusAvailable,
+    sessionStatus: state?.warmupSessionID ? workflowStatusById.get(state.warmupSessionID) : undefined,
+  })
 }
 
 function syncWorkflowStatuses(statuses) {
@@ -1191,30 +1214,41 @@ function updateTerminalActionButtons() {
   const state = currentWorkflowState()
   const hasProject = !!project && !workflowLoadBlocksInteraction({ loading: workflowLoading, workflow }) && !terminalActionPending
   const running = workflowIsRunning()
+  const terminalActionsBlocked = workflowTerminalActionsBlocked({
+    runtimeRunning: running,
+    persistedWarmupStatus: state?.warmupStatus,
+  })
+  const warmupRecoveryRequired = !running && state?.warmupStatus === 'running'
   if (btnDiscardWorkflow) {
     btnDiscardWorkflow.disabled = !hasProject
     btnDiscardWorkflow.title = state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
   }
   if (btnApply) {
-    btnApply.disabled = !hasProject || running
+    btnApply.disabled = !hasProject || terminalActionsBlocked
     btnApply.classList.toggle('pending-action', !!workflowActionEntry('应用图操作').available)
-    btnApply.title = running
-      ? '大模型、预热或工具审批仍在处理，暂不能提交。'
+    btnApply.title = warmupRecoveryRequired
+      ? '项目上下文预热已中断，请先重新预热再提交。'
+      : terminalActionsBlocked
+        ? '大模型、预热或工具审批仍在处理，暂不能提交。'
       : state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
   }
-  const correctionDisabled = !hasProject || running
+  const correctionDisabled = !hasProject || terminalActionsBlocked
   if (btnHardCorrection) {
     btnHardCorrection.disabled = correctionDisabled
-    btnHardCorrection.title = running
-      ? '大模型、预热或工具审批仍在处理，暂不能重做最近提交。'
+    btnHardCorrection.title = warmupRecoveryRequired
+      ? '项目上下文预热已中断，请先重新预热再重做最近提交。'
+      : terminalActionsBlocked
+        ? '大模型、预热或工具审批仍在处理，暂不能重做最近提交。'
       : state
       ? '当前已有 active 草案；重做最近提交会先放弃当前草案。'
       : '恢复最近一次提交的草案，用提交前图数据生成更正预览。'
   }
   if (btnSoftCorrection) {
     btnSoftCorrection.disabled = correctionDisabled
-    btnSoftCorrection.title = running
-      ? '大模型、预热或工具审批仍在处理，暂不能追加更正记录。'
+    btnSoftCorrection.title = warmupRecoveryRequired
+      ? '项目上下文预热已中断，请先重新预热再追加更正记录。'
+      : terminalActionsBlocked
+        ? '大模型、预热或工具审批仍在处理，暂不能追加更正记录。'
       : state
       ? '当前已有 active 草案；追加更正记录会先放弃当前草案。'
       : '新建一轮只追加更正记录的草案。'
@@ -1339,7 +1373,14 @@ function renderMessagePart(part, message) {
     return `<div class="message-text">${esc(part.text || '')}</div>`
   }
   if (part.type === 'tool') {
-    return renderWorkflowToolPart(part, message)
+    const status = part.state?.status
+    const sessionID = part.sessionID || message?.info?.sessionID || message?.sessionID
+    const sessionRunning = sessionID
+      ? workflowStatusById.has(sessionID)
+      : [...workflowStatusById.values()].some((item) => item.type === 'busy' || item.type === 'retry')
+    return renderWorkflowToolPart(part, message, {
+      interrupted: workflowStatusAvailable && (status === 'pending' || status === 'running') && !sessionRunning,
+    })
   }
   return ''
 }
@@ -1452,29 +1493,34 @@ async function replyActivePermissionReview(reply) {
 
 function workflowIsRunning() {
   const state = currentWorkflowState()
-  if (state?.warmupStatus === 'running') return true
-  if ([...workflowStatusById.values()].some((status) => status.type === 'busy' || status.type === 'retry')) return true
-  if (chatSending || workflowAwaitingReply || workflowHasUnansweredUser()) return true
-  return workflowMessages.some((message) =>
-    (message.parts || []).some((part) => {
-      const status = part.state?.status
-      return status === 'pending' || status === 'running'
-    }))
+  return workflowRuntimeIsRunning({
+    warmupStatus: effectiveWarmupStatus(state),
+    sessionStatuses: [...workflowStatusById.values()],
+    statusAvailable: workflowStatusAvailable,
+    statusRequired: workflowSessionIDs().size > 0,
+    chatSending,
+    awaitingReply: workflowAwaitingReply,
+  })
 }
 
 function chatLockReason(project, state) {
   if (terminalActionPending) return '工作推进操作正在处理，请等待完成。'
-  return workflowChatLockReason({ project, workflow, state, loading: workflowLoading })
+  if (!workflowStatusAvailable && workflowSessionIDs().size > 0) return '暂时无法确认工作推进运行状态，正在重试。'
+  const effectiveState = state?.warmupStatus === 'running'
+    ? { ...state, warmupStatus: effectiveWarmupStatus(state) }
+    : state
+  return workflowChatLockReason({ project, workflow, state: effectiveState, loading: workflowLoading })
 }
 
 function renderChat() {
   const project = selectedProject()
   const state = currentWorkflowState()
+  const currentWarmupStatus = effectiveWarmupStatus(state)
   const lockReason = chatLockReason(project, state)
   const running = workflowIsRunning()
   updateTerminalActionButtons()
   const canChat = !!project && !running && !lockReason
-  const canWarmup = !!project && !terminalActionPending && !warmupStarting && state?.warmupStatus !== 'running'
+  const canWarmup = !!project && !terminalActionPending && workflowStatusAvailable && currentWarmupStatus !== 'running'
   const hasNote = !!workflowNote?.exists
   const readyHint = !project
     ? '选择或新建项目后可以开始工作推进。'
@@ -1500,7 +1546,7 @@ function renderChat() {
     ? '恢复推进会话'
     : state?.warmupStatus === 'completed' ? '重新预热项目上下文' : '开始项目上下文预热'
   const showWarmupStatus = showWarmupControl
-  const warmupDisplayStatus = warmupStarting ? 'running' : (state?.warmupStatus || '')
+  const warmupDisplayStatus = currentWarmupStatus
   warmupStatus.classList.toggle('hidden', !showWarmupStatus)
   const warmupPrefix = state?.correction ? '软更正：' : ''
   warmupStatus.textContent = showWarmupStatus

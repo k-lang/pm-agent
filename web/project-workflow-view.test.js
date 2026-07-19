@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   allWorkflowDiffRecords,
   canShowWorkflowGraphPreview,
+  effectiveWorkflowWarmupStatus,
   editToolRecords,
   isEditTool,
   isWriteTool,
@@ -17,6 +18,7 @@ import {
   renderWriteContent,
   rejectedEditToolRecords,
   resetWorkflowViewState,
+  shouldClearWorkflowAwaitingReply,
   shouldDiscardWorkflowFromRestoreChoice,
   upsertWorkflowPermissionRecord,
   visibleWorkflowPermissionRecords,
@@ -28,6 +30,8 @@ import {
   workflowLoadBlocksInteraction,
   workflowMessageErrorText,
   workflowOperationArtifactsChanged,
+  workflowRuntimeIsRunning,
+  workflowTerminalActionsBlocked,
   workflowViewRequestMatches,
 } from "./project-workflow-view.js"
 
@@ -82,6 +86,83 @@ describe("project workflow chat readiness", () => {
     expect(workflowLoadBlocksInteraction({ loading: true, workflow })).toBe(false)
     expect(workflowChatLockReason({ project, workflow, state: workflow.state, loading: true })).toBe("")
     expect(workflowLoadBlocksInteraction({ loading: true, workflow: null })).toBe(true)
+  })
+
+  test("uses live session status and local request state instead of persisted message residue", () => {
+    expect(workflowRuntimeIsRunning({ sessionStatuses: [{ type: "busy" }] })).toBe(true)
+    expect(workflowRuntimeIsRunning({ sessionStatuses: [{ type: "retry" }] })).toBe(true)
+    expect(workflowRuntimeIsRunning({ warmupStatus: "running" })).toBe(true)
+    expect(workflowRuntimeIsRunning({ chatSending: true })).toBe(true)
+    expect(workflowRuntimeIsRunning({ awaitingReply: true })).toBe(true)
+    expect(workflowRuntimeIsRunning({ statusAvailable: false, statusRequired: true })).toBe(true)
+    expect(workflowRuntimeIsRunning({ statusAvailable: false, statusRequired: false })).toBe(false)
+    expect(workflowRuntimeIsRunning({ sessionStatuses: [] })).toBe(false)
+  })
+
+  test("derives running warmup state from its live session after status is available", () => {
+    expect(effectiveWorkflowWarmupStatus({
+      persistedStatus: "running",
+      statusAvailable: true,
+      sessionStatus: { type: "busy" },
+    })).toBe("running")
+    expect(effectiveWorkflowWarmupStatus({
+      persistedStatus: "running",
+      statusAvailable: true,
+    })).toBe("stale")
+    expect(effectiveWorkflowWarmupStatus({
+      persistedStatus: "running",
+      statusAvailable: false,
+    })).toBe("running")
+    expect(effectiveWorkflowWarmupStatus({
+      persistedStatus: "failed",
+      statusAvailable: true,
+      sessionStatus: { type: "busy" },
+    })).toBe("failed")
+  })
+
+  test("keeps terminal actions blocked until an interrupted persisted warmup is replaced", () => {
+    expect(workflowTerminalActionsBlocked({
+      runtimeRunning: false,
+      persistedWarmupStatus: "running",
+    })).toBe(true)
+    expect(workflowTerminalActionsBlocked({
+      runtimeRunning: false,
+      persistedWarmupStatus: "completed",
+    })).toBe(false)
+    expect(workflowTerminalActionsBlocked({
+      runtimeRunning: true,
+      persistedWarmupStatus: "completed",
+    })).toBe(true)
+  })
+
+  test("keeps the optimistic reply lock through startup but releases it after authoritative idle", () => {
+    expect(shouldClearWorkflowAwaitingReply({
+      chatSending: true,
+      sessionStatuses: [],
+      hasUnansweredUser: true,
+    })).toBe(false)
+    expect(shouldClearWorkflowAwaitingReply({
+      chatSending: false,
+      sessionStatuses: [{ type: "busy" }],
+      hasUnansweredUser: true,
+    })).toBe(false)
+    expect(shouldClearWorkflowAwaitingReply({
+      chatSending: false,
+      sessionStatuses: [],
+      statusAvailable: false,
+      hasUnansweredUser: true,
+    })).toBe(false)
+    expect(shouldClearWorkflowAwaitingReply({
+      chatSending: false,
+      sessionStatuses: [],
+      statusAvailable: true,
+      hasUnansweredUser: true,
+    })).toBe(true)
+    expect(shouldClearWorkflowAwaitingReply({
+      chatSending: false,
+      sessionStatuses: [{ type: "busy" }],
+      hasUnansweredUser: false,
+    })).toBe(true)
   })
 
   test("extracts provider errors from assistant message metadata", () => {
@@ -390,6 +471,19 @@ describe("project workflow view helpers", () => {
 
     expect(html).toContain("状态机动作 · completed")
     expect(html).not.toContain("data-tool-diff-open")
+  })
+
+  test("renders stale running tools as interrupted without changing their stored state", () => {
+    const part = {
+      type: "tool",
+      tool: "write",
+      state: { status: "running", title: "写入工作笔记" },
+    }
+    const html = renderWorkflowToolPart(part, null, { interrupted: true })
+
+    expect(html).toContain("写入工作笔记 · 执行已中断")
+    expect(html).toContain("tool-error")
+    expect(part.state.status).toBe("running")
   })
 
   test("renders completed write tool part with a content button", () => {
