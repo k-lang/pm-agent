@@ -129,6 +129,72 @@ describe("project graph renderer helpers", () => {
     expect(layout.containers.work_block_main).toMatchObject({ blockId: "work_block_main" })
   })
 
+  test("places nested subgoals in goal layers above all work and result nodes", () => {
+    const nestedNodes = [
+      { id: "goal_root", type: "goal", summary: "根目标", firstStep: 0, communityGoalId: "goal_root" },
+      { id: "goal_parent", type: "goal", summary: "一级子目标", firstStep: 1, parentGoalId: "goal_root", topGoalId: "goal_root", communityGoalId: "goal_root" },
+      { id: "goal_nested", type: "goal", summary: "二级子目标", firstStep: 2, parentGoalId: "goal_parent", topGoalId: "goal_root", communityGoalId: "goal_root" },
+      { id: "block_parent", type: "work_block", summary: "父目标工作块", firstStep: 1, ownerGoalId: "goal_parent", topGoalId: "goal_root", communityGoalId: "goal_root" },
+      { id: "item_parent", type: "work_item", summary: "父目标工作项", firstStep: 1, linkedWorkBlockId: "block_parent", topGoalId: "goal_root", communityGoalId: "goal_root" },
+      { id: "result_parent", type: "result", summary: "父目标结果", firstStep: 2, producingWorkBlockId: "block_parent", topGoalId: "goal_root", communityGoalId: "goal_root" },
+      { id: "block_nested", type: "work_block", summary: "二级目标工作块", firstStep: 2, ownerGoalId: "goal_nested", topGoalId: "goal_root", communityGoalId: "goal_root" },
+      { id: "result_nested", type: "result", summary: "二级目标结果", firstStep: 3, producingWorkBlockId: "block_nested", topGoalId: "goal_root", communityGoalId: "goal_root" },
+      { id: "goal_other", type: "goal", summary: "另一个顶级目标", firstStep: 0, communityGoalId: "goal_other" },
+      { id: "block_other", type: "work_block", summary: "另一个目标的工作块", firstStep: 1, ownerGoalId: "goal_other", communityGoalId: "goal_other" },
+    ]
+    const nestedEdges = [
+      { id: "root-parent", source: "goal_root", target: "goal_parent", type: "subgoal", label: "subgoal" },
+      { id: "parent-nested", source: "goal_parent", target: "goal_nested", type: "subgoal", label: "subgoal" },
+    ]
+
+    for (const view of ["expanded", "collapsed"]) {
+      const layout = defaultGraphPositions(nestedNodes, nestedEdges, view)
+      const goalBottom = Math.max(
+        ...nestedNodes
+          .filter((node) => node.type === "goal")
+          .map((node) => layout.positions[node.id].y + NODE_SIZE.goal.height / 2),
+      )
+      const workTop = Math.min(
+        ...nestedNodes
+          .filter((node) => node.type === "work_block" || node.type === "result")
+          .map((node) => layout.positions[node.id].y - NODE_SIZE[node.type].height / 2),
+      )
+
+      expect(layout.positions.goal_nested.y).toBeGreaterThan(layout.positions.goal_parent.y)
+      expect(goalBottom).toBeLessThan(workTop)
+      expect(new Set(
+        nestedNodes
+          .filter((node) => node.type === "work_block")
+          .map((node) => layout.positions[node.id].y),
+      ).size).toBe(1)
+      expect(Math.abs(layout.positions.goal_nested.x - layout.positions.goal_parent.x)).toBeLessThan(1000)
+    }
+  })
+
+  test("keeps fallback nodes below deeply nested goals", () => {
+    const deepNodes = [
+      { id: "goal_depth_0", type: "goal", communityGoalId: "goal_depth_0" },
+      { id: "result_unplaced", type: "result" },
+    ]
+    for (let depth = 1; depth <= 6; depth += 1) {
+      deepNodes.push({
+        id: `goal_depth_${depth}`,
+        type: "goal",
+        parentGoalId: `goal_depth_${depth - 1}`,
+        topGoalId: "goal_depth_0",
+        communityGoalId: "goal_depth_0",
+      })
+    }
+
+    for (const view of ["expanded", "collapsed"]) {
+      const { positions } = defaultGraphPositions(deepNodes, [], view)
+      const deepestGoalBottom = positions.goal_depth_6.y + NODE_SIZE.goal.height / 2
+      const fallbackResultTop = positions.result_unplaced.y - NODE_SIZE.result.height / 2
+
+      expect(fallbackResultTop).toBeGreaterThan(deepestGoalBottom)
+    }
+  })
+
   test("keeps issue rows centered and prevents overlap in both graph views", () => {
     const issueNodes = [
       { id: "goal_issue_owner", type: "goal", summary: "问题所属目标", firstStep: 0, communityGoalId: "goal_issue_owner" },

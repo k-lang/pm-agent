@@ -19,7 +19,6 @@ const LAYOUT = {
   goalY: 510,
   subgoalY: 840,
   topWorkBlockY: 1200,
-  subgoalWorkBlockY: 1200,
   resultY: 1620,
   resultGapY: 180,
   subgoalGapX: 840,
@@ -33,6 +32,8 @@ const LAYOUT = {
   workItemPaddingX: 120,
   workItemPaddingY: 120,
   resultLaneGapX: 360,
+  nestedGoalGapY: 260,
+  nestedBranchGapX: 180,
 }
 
 let rendererSeq = 0
@@ -179,7 +180,10 @@ function buildCollapsedCommunities(nodes) {
   const topGoals = nodes.filter((node) => node.type === 'goal' && !node.parentGoalId).sort(sortByStepThenId)
   return topGoals.map((topGoal) => {
     const communityNodes = nodes.filter((node) => node.communityGoalId === topGoal.id || node.id === topGoal.id)
-    const subgoals = communityNodes.filter((node) => node.type === 'goal' && node.parentGoalId === topGoal.id).sort(sortByStepThenId)
+    const childGoalsByParent = groupBy(
+      communityNodes.filter((node) => node.type === 'goal' && node.parentGoalId),
+      (node) => node.parentGoalId,
+    )
     const topWorkBlocks = communityNodes.filter((node) => node.type === 'work_block' && node.ownerGoalId === topGoal.id).sort(sortByStepThenId)
     const workBlocksByOwner = groupBy(
       communityNodes.filter((node) => node.type === 'work_block' && node.ownerGoalId && node.ownerGoalId !== topGoal.id),
@@ -189,38 +193,101 @@ function buildCollapsedCommunities(nodes) {
       communityNodes.filter((node) => node.type === 'result' && node.producingWorkBlockId),
       (node) => node.producingWorkBlockId,
     )
+    const buildSubgoalColumn = (subgoal) => ({
+      subgoal,
+      workBlocks: (workBlocksByOwner.get(subgoal.id) || []).sort(sortByStepThenId),
+      children: (childGoalsByParent.get(subgoal.id) || []).sort(sortByStepThenId).map(buildSubgoalColumn),
+    })
     return {
       topGoal,
       events: communityNodes.filter((node) => node.type === 'event').sort(sortByStepThenId),
       issues: communityNodes.filter((node) => node.type === 'issue').sort(sortByStepThenId),
       topWorkBlocks,
-      subgoalColumns: subgoals.map((subgoal) => ({
-        subgoal,
-        workBlocks: (workBlocksByOwner.get(subgoal.id) || []).sort(sortByStepThenId),
-      })),
+      subgoalColumns: (childGoalsByParent.get(topGoal.id) || []).sort(sortByStepThenId).map(buildSubgoalColumn),
       resultsByWorkBlock,
     }
   })
 }
 
+function measureCollapsedSubgoalColumn(column) {
+  const workWidth = centeredRowWidth(column.workBlocks.length, NODE_SIZE.work_block.width, LAYOUT.topWorkGapX)
+  const segmentWidths = [
+    ...(workWidth ? [workWidth] : []),
+    ...column.children.map(measureCollapsedSubgoalColumn),
+  ]
+  const contentWidth = segmentWidths.reduce((sum, segmentWidth) => sum + segmentWidth, 0)
+    + Math.max(0, segmentWidths.length - 1) * LAYOUT.nestedBranchGapX
+  return Math.max(LAYOUT.subgoalGapX, contentWidth)
+}
+
+function collapsedSubgoalGeometry(column, left) {
+  const width = measureCollapsedSubgoalColumn(column)
+  const workWidth = centeredRowWidth(column.workBlocks.length, NODE_SIZE.work_block.width, LAYOUT.topWorkGapX)
+  const childWidths = column.children.map(measureCollapsedSubgoalColumn)
+  const segmentWidths = [...(workWidth ? [workWidth] : []), ...childWidths]
+  const contentWidth = segmentWidths.reduce((sum, segmentWidth) => sum + segmentWidth, 0)
+    + Math.max(0, segmentWidths.length - 1) * LAYOUT.nestedBranchGapX
+  return {
+    width,
+    workWidth,
+    childWidths,
+    contentLeft: left + (width - contentWidth) / 2,
+  }
+}
+
+function maxSubgoalDepth(columns, depth = 1) {
+  return columns.reduce(
+    (maxDepth, column) => Math.max(maxDepth, depth, maxSubgoalDepth(column.children, depth + 1)),
+    0,
+  )
+}
+
 function measureCollapsedCommunity(community) {
   const issueWidth = centeredRowWidth(community.issues.length, NODE_SIZE.issue.width, LAYOUT.issueGapX)
   const topWorkWidth = Math.max(1, community.topWorkBlocks.length) * LAYOUT.topWorkGapX
-  const subgoalBranchWidth = community.subgoalColumns.reduce((sum, column) => {
-    const workWidth = Math.max(1, column.workBlocks.length) * 165
-    return sum + Math.max(LAYOUT.subgoalGapX, workWidth)
-  }, 0)
+  const subgoalBranchWidth = community.subgoalColumns.reduce((sum, column) => sum + measureCollapsedSubgoalColumn(column), 0)
   const totalBranchWidth = topWorkWidth + (community.topWorkBlocks.length && community.subgoalColumns.length ? LAYOUT.branchGapX : 0) + Math.max(0, subgoalBranchWidth)
   return Math.max(420, issueWidth, totalBranchWidth)
 }
 
-function placeResultStack(positions, results, x) {
+function placeResultStack(positions, results, x, startY) {
   results.forEach((result, index) => {
-    positions[result.id] = { x, y: LAYOUT.resultY + index * LAYOUT.resultGapY }
+    positions[result.id] = { x, y: startY + index * LAYOUT.resultGapY }
   })
 }
 
-function placeCollapsedCommunity(positions, containers, community, centerX) {
+function placeCollapsedSubgoalGoals(positions, column, left, goalY) {
+  const geometry = collapsedSubgoalGeometry(column, left)
+  positions[column.subgoal.id] = { x: left + geometry.width / 2, y: goalY }
+
+  let childCursor = geometry.contentLeft
+  if (geometry.workWidth) childCursor += geometry.workWidth + LAYOUT.nestedBranchGapX
+  column.children.forEach((child, index) => {
+    placeCollapsedSubgoalGoals(positions, child, childCursor, goalY + LAYOUT.nestedGoalGapY)
+    childCursor += geometry.childWidths[index] + LAYOUT.nestedBranchGapX
+  })
+}
+
+function placeCollapsedSubgoalWork(positions, column, left, workBlockY, resultsByWorkBlock) {
+  const geometry = collapsedSubgoalGeometry(column, left)
+  const resultY = workBlockY + (LAYOUT.resultY - LAYOUT.topWorkBlockY)
+  let cursor = geometry.contentLeft
+  const workCenterX = cursor + geometry.workWidth / 2
+  column.workBlocks.forEach((node, blockIndex) => {
+    const x = workCenterX - ((column.workBlocks.length - 1) * LAYOUT.topWorkGapX) / 2 + blockIndex * LAYOUT.topWorkGapX
+    positions[node.id] = { x, y: workBlockY }
+    const results = resultsByWorkBlock.get(node.id) || []
+    placeResultStack(positions, results, x, resultY)
+  })
+
+  if (geometry.workWidth) cursor += geometry.workWidth + LAYOUT.nestedBranchGapX
+  column.children.forEach((child, index) => {
+    placeCollapsedSubgoalWork(positions, child, cursor, workBlockY, resultsByWorkBlock)
+    cursor += geometry.childWidths[index] + LAYOUT.nestedBranchGapX
+  })
+}
+
+function placeCollapsedCommunity(positions, containers, community, centerX, deepestGoalY) {
   void containers
   const width = measureCollapsedCommunity(community)
   positions[community.topGoal.id] = { x: centerX, y: LAYOUT.goalY }
@@ -235,31 +302,27 @@ function placeCollapsedCommunity(positions, containers, community, centerX) {
   })
 
   const topWorkWidth = Math.max(1, community.topWorkBlocks.length) * LAYOUT.topWorkGapX
-  const subgoalBranchWidth = community.subgoalColumns.reduce((sum, column) => {
-    const workWidth = Math.max(1, column.workBlocks.length) * 165
-    return sum + Math.max(LAYOUT.subgoalGapX, workWidth)
-  }, 0)
+  const subgoalBranchWidth = community.subgoalColumns.reduce((sum, column) => sum + measureCollapsedSubgoalColumn(column), 0)
   const combinedWidth = topWorkWidth + (community.topWorkBlocks.length && community.subgoalColumns.length ? LAYOUT.branchGapX : 0) + Math.max(0, subgoalBranchWidth)
   const leftEdge = centerX - combinedWidth / 2
+  const workBlockY = Math.max(
+    LAYOUT.topWorkBlockY,
+    deepestGoalY + (LAYOUT.topWorkBlockY - LAYOUT.subgoalY),
+  )
+  const resultY = workBlockY + (LAYOUT.resultY - LAYOUT.topWorkBlockY)
 
   const topWorkCenter = leftEdge + topWorkWidth / 2
   community.topWorkBlocks.forEach((node, index) => {
     const x = topWorkCenter - ((community.topWorkBlocks.length - 1) * LAYOUT.topWorkGapX) / 2 + index * LAYOUT.topWorkGapX
-    positions[node.id] = { x, y: LAYOUT.topWorkBlockY }
-    placeResultStack(positions, community.resultsByWorkBlock.get(node.id) || [], x)
+    positions[node.id] = { x, y: workBlockY }
+    placeResultStack(positions, community.resultsByWorkBlock.get(node.id) || [], x, resultY)
   })
 
   let subgoalCursor = leftEdge + topWorkWidth + (community.topWorkBlocks.length && community.subgoalColumns.length ? LAYOUT.branchGapX : 0)
   community.subgoalColumns.forEach((column) => {
-    const workWidth = Math.max(1, column.workBlocks.length) * 165
-    const branchWidth = Math.max(LAYOUT.subgoalGapX, workWidth)
-    const branchCenter = subgoalCursor + branchWidth / 2
-    positions[column.subgoal.id] = { x: branchCenter, y: LAYOUT.subgoalY }
-    column.workBlocks.forEach((node, blockIndex) => {
-      const x = branchCenter - ((column.workBlocks.length - 1) * 110) / 2 + blockIndex * 165
-      positions[node.id] = { x, y: LAYOUT.subgoalWorkBlockY }
-      placeResultStack(positions, column.resultsByWorkBlock?.get(node.id) || community.resultsByWorkBlock.get(node.id) || [], x)
-    })
+    const branchWidth = measureCollapsedSubgoalColumn(column)
+    placeCollapsedSubgoalGoals(positions, column, subgoalCursor, LAYOUT.subgoalY)
+    placeCollapsedSubgoalWork(positions, column, subgoalCursor, workBlockY, community.resultsByWorkBlock)
     subgoalCursor += branchWidth
   })
 
@@ -270,7 +333,10 @@ function buildExpandedCommunities(nodes) {
   const topGoals = nodes.filter((node) => node.type === 'goal' && !node.parentGoalId).sort(sortByStepThenId)
   return topGoals.map((topGoal) => {
     const communityNodes = nodes.filter((node) => node.communityGoalId === topGoal.id || node.id === topGoal.id)
-    const subgoals = communityNodes.filter((node) => node.type === 'goal' && node.parentGoalId === topGoal.id).sort(sortByStepThenId)
+    const childGoalsByParent = groupBy(
+      communityNodes.filter((node) => node.type === 'goal' && node.parentGoalId),
+      (node) => node.parentGoalId,
+    )
     const blocks = communityNodes.filter((node) => node.type === 'work_block').sort(sortByStepThenId)
     const itemsByBlock = groupBy(
       communityNodes.filter((node) => node.type === 'work_item' && node.linkedWorkBlockId),
@@ -285,6 +351,15 @@ function buildExpandedCommunities(nodes) {
       blocks.filter((block) => block.ownerGoalId && block.ownerGoalId !== topGoal.id),
       (block) => block.ownerGoalId,
     )
+    const buildSubgoalColumn = (subgoal) => ({
+      subgoal,
+      blocks: (blocksByOwner.get(subgoal.id) || []).sort(sortByStepThenId).map((block) => ({
+        block,
+        items: (itemsByBlock.get(block.id) || []).sort(sortByStepThenId),
+        results: (resultsByBlock.get(block.id) || []).sort(sortByStepThenId),
+      })),
+      children: (childGoalsByParent.get(subgoal.id) || []).sort(sortByStepThenId).map(buildSubgoalColumn),
+    })
 
     return {
       topGoal,
@@ -295,14 +370,7 @@ function buildExpandedCommunities(nodes) {
         items: (itemsByBlock.get(block.id) || []).sort(sortByStepThenId),
         results: (resultsByBlock.get(block.id) || []).sort(sortByStepThenId),
       })),
-      subgoalColumns: subgoals.map((subgoal) => ({
-        subgoal,
-        blocks: (blocksByOwner.get(subgoal.id) || []).sort(sortByStepThenId).map((block) => ({
-          block,
-          items: (itemsByBlock.get(block.id) || []).sort(sortByStepThenId),
-          results: (resultsByBlock.get(block.id) || []).sort(sortByStepThenId),
-        })),
-      })),
+      subgoalColumns: (childGoalsByParent.get(topGoal.id) || []).sort(sortByStepThenId).map(buildSubgoalColumn),
     }
   })
 }
@@ -421,14 +489,79 @@ function placeHolderExpandedWidth(cluster, edges) {
   return measureExpandedCluster(cluster, edges).width
 }
 
+function expandedClusterRowWidth(clusters, edges) {
+  return clusters.reduce(
+    (sum, cluster, index) => sum + placeHolderExpandedWidth(cluster, edges) + (index ? LAYOUT.nestedBranchGapX : 0),
+    0,
+  )
+}
+
+function measureExpandedSubgoalColumn(column, edges) {
+  const blocksWidth = expandedClusterRowWidth(column.blocks, edges)
+  const segmentWidths = [
+    ...(blocksWidth ? [blocksWidth] : []),
+    ...column.children.map((child) => measureExpandedSubgoalColumn(child, edges)),
+  ]
+  const contentWidth = segmentWidths.reduce((sum, segmentWidth) => sum + segmentWidth, 0)
+    + Math.max(0, segmentWidths.length - 1) * LAYOUT.nestedBranchGapX
+  return Math.max(LAYOUT.subgoalGapX, contentWidth)
+}
+
+function expandedSubgoalGeometry(column, left, edges) {
+  const width = measureExpandedSubgoalColumn(column, edges)
+  const blocksWidth = expandedClusterRowWidth(column.blocks, edges)
+  const childWidths = column.children.map((child) => measureExpandedSubgoalColumn(child, edges))
+  const segmentWidths = [...(blocksWidth ? [blocksWidth] : []), ...childWidths]
+  const contentWidth = segmentWidths.reduce((sum, segmentWidth) => sum + segmentWidth, 0)
+    + Math.max(0, segmentWidths.length - 1) * LAYOUT.nestedBranchGapX
+  return {
+    width,
+    blocksWidth,
+    childWidths,
+    contentLeft: left + (width - contentWidth) / 2,
+  }
+}
+
+function placeExpandedSubgoalGoals(positions, column, left, goalY, edges) {
+  const geometry = expandedSubgoalGeometry(column, left, edges)
+  positions[column.subgoal.id] = { x: left + geometry.width / 2, y: goalY }
+
+  let childCursor = geometry.contentLeft
+  if (geometry.blocksWidth) childCursor += geometry.blocksWidth + LAYOUT.nestedBranchGapX
+  column.children.forEach((child, index) => {
+    placeExpandedSubgoalGoals(positions, child, childCursor, goalY + LAYOUT.nestedGoalGapY, edges)
+    childCursor += geometry.childWidths[index] + LAYOUT.nestedBranchGapX
+  })
+}
+
+function placeExpandedSubgoalWork(positions, containers, column, left, blockTop, edges) {
+  const geometry = expandedSubgoalGeometry(column, left, edges)
+  let cursor = geometry.contentLeft
+  column.blocks.forEach((cluster, blockIndex) => {
+    if (blockIndex) cursor += LAYOUT.nestedBranchGapX
+    const measure = measureExpandedCluster(cluster, edges)
+    placeExpandedCluster(positions, containers, cluster, cursor, blockTop, edges)
+    cursor += measure.width
+  })
+
+  if (geometry.blocksWidth) cursor += LAYOUT.nestedBranchGapX
+  column.children.forEach((child, index) => {
+    placeExpandedSubgoalWork(positions, containers, child, cursor, blockTop, edges)
+    cursor += geometry.childWidths[index] + LAYOUT.nestedBranchGapX
+  })
+}
+
 function measureExpandedCommunity(community, edges) {
   const issueWidth = centeredRowWidth(community.issues.length, NODE_SIZE.issue.width, LAYOUT.issueGapX)
   const topWidth = community.topBlocks.reduce((sum, cluster) => sum + placeHolderExpandedWidth(cluster, edges), 0)
-  const subWidth = community.subgoalColumns.reduce((sum, column) => sum + Math.max(LAYOUT.subgoalGapX, column.blocks.reduce((inner, cluster) => inner + placeHolderExpandedWidth(cluster, edges), 0) || LAYOUT.subgoalGapX), 0)
+  const subWidth = community.subgoalColumns.reduce(
+    (sum, column, index) => sum + measureExpandedSubgoalColumn(column, edges) + (index ? LAYOUT.nestedBranchGapX : 0),
+    0,
+  )
   return Math.max(600, issueWidth, topWidth + (topWidth && subWidth ? LAYOUT.branchGapX : 0) + subWidth)
 }
 
-function placeExpandedCommunity(positions, containers, community, centerX, edges) {
+function placeExpandedCommunity(positions, containers, community, centerX, deepestGoalY, edges) {
   const width = measureExpandedCommunity(community, edges)
   positions[community.topGoal.id] = { x: centerX, y: LAYOUT.goalY }
 
@@ -443,34 +576,29 @@ function placeExpandedCommunity(positions, containers, community, centerX, edges
 
   const topBlocksWidth = community.topBlocks.reduce((sum, cluster, index) => sum + placeHolderExpandedWidth(cluster, edges) + (index ? LAYOUT.topWorkGapX : 0), 0)
   const subgoalWidth = community.subgoalColumns.reduce((sum, column, columnIndex) => {
-    const blocksWidth = column.blocks.reduce((inner, cluster, blockIndex) => inner + placeHolderExpandedWidth(cluster, edges) + (blockIndex ? 180 : 0), 0)
-    return sum + Math.max(LAYOUT.subgoalGapX, blocksWidth || LAYOUT.subgoalGapX) + (columnIndex ? 180 : 0)
+    return sum + measureExpandedSubgoalColumn(column, edges) + (columnIndex ? LAYOUT.nestedBranchGapX : 0)
   }, 0)
 
   const combinedWidth = topBlocksWidth + (topBlocksWidth && subgoalWidth ? LAYOUT.branchGapX : 0) + subgoalWidth
   let cursor = centerX - combinedWidth / 2
+  const blockTop = Math.max(
+    LAYOUT.topWorkBlockY - 100,
+    deepestGoalY + (LAYOUT.topWorkBlockY - 100 - LAYOUT.subgoalY),
+  )
 
   community.topBlocks.forEach((cluster, index) => {
     if (index) cursor += LAYOUT.topWorkGapX
     const clusterWidth = placeHolderExpandedWidth(cluster, edges)
-    placeExpandedCluster(positions, containers, cluster, cursor, LAYOUT.topWorkBlockY - 100, edges)
+    placeExpandedCluster(positions, containers, cluster, cursor, blockTop, edges)
     cursor += clusterWidth
   })
 
   if (community.topBlocks.length && community.subgoalColumns.length) cursor += LAYOUT.branchGapX
   community.subgoalColumns.forEach((column, columnIndex) => {
-    if (columnIndex) cursor += 180
-    const blocksWidth = column.blocks.reduce((inner, cluster, blockIndex) => inner + placeHolderExpandedWidth(cluster, edges) + (blockIndex ? 180 : 0), 0)
-    const branchWidth = Math.max(LAYOUT.subgoalGapX, blocksWidth || LAYOUT.subgoalGapX)
-    const branchCenter = cursor + branchWidth / 2
-    positions[column.subgoal.id] = { x: branchCenter, y: LAYOUT.subgoalY }
-    let blockCursor = cursor
-    column.blocks.forEach((cluster, blockIndex) => {
-      if (blockIndex) blockCursor += 180
-      const clusterWidth = placeHolderExpandedWidth(cluster, edges)
-      placeExpandedCluster(positions, containers, cluster, blockCursor, LAYOUT.subgoalWorkBlockY - 100, edges)
-      blockCursor += clusterWidth
-    })
+    if (columnIndex) cursor += LAYOUT.nestedBranchGapX
+    const branchWidth = measureExpandedSubgoalColumn(column, edges)
+    placeExpandedSubgoalGoals(positions, column, cursor, LAYOUT.subgoalY, edges)
+    placeExpandedSubgoalWork(positions, containers, column, cursor, blockTop, edges)
     cursor += branchWidth
   })
 
@@ -481,18 +609,26 @@ export function defaultGraphPositions(nodes, edges, view = 'collapsed') {
   const positions = {}
   const containers = {}
   const communities = view === 'expanded' ? buildExpandedCommunities(nodes) : buildCollapsedCommunities(nodes)
+  const subgoalDepth = Math.max(0, ...communities.map((community) => maxSubgoalDepth(community.subgoalColumns)))
+  const deepestGoalY = subgoalDepth
+    ? LAYOUT.subgoalY + (subgoalDepth - 1) * LAYOUT.nestedGoalGapY
+    : LAYOUT.goalY
   let cursorX = LAYOUT.marginX
 
   communities.forEach((community) => {
     const width = view === 'expanded' ? measureExpandedCommunity(community, edges) : measureCollapsedCommunity(community)
     const centerX = cursorX + width / 2
-    if (view === 'expanded') placeExpandedCommunity(positions, containers, community, centerX, edges)
-    else placeCollapsedCommunity(positions, containers, community, centerX)
+    if (view === 'expanded') placeExpandedCommunity(positions, containers, community, centerX, deepestGoalY, edges)
+    else placeCollapsedCommunity(positions, containers, community, centerX, deepestGoalY)
     cursorX += width + LAYOUT.communityGapX
   })
 
+  const fallbackStartY = Math.max(
+    LAYOUT.fallbackY,
+    deepestGoalY + (LAYOUT.topWorkBlockY - LAYOUT.subgoalY),
+  )
   nodes.filter((node) => !positions[node.id]).sort(sortByStepThenId).forEach((node, index) => {
-    positions[node.id] = { x: cursorX, y: LAYOUT.fallbackY + index * 120 }
+    positions[node.id] = { x: cursorX, y: fallbackStartY + index * 120 }
   })
 
   return { positions, containers }
