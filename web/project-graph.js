@@ -106,6 +106,7 @@ async function load() {
   renderer?.destroy()
   renderer = new ProjectGraphRenderer({
     root: canvasPanel,
+    projectName,
     view,
     showLegend: true,
     showControls: true,

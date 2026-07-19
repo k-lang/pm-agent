@@ -1164,6 +1164,66 @@ export namespace ProjectWorkflowExecution {
     await fs.writeFile(artifactPath(input.directory, "note.md"), input.content.trimEnd() + "\n", "utf8")
   }
 
+  async function removeExistingArtifacts(input: {
+    directory: string
+    files: string[]
+    directories: { name: string; path: string }[]
+  }) {
+    const targets = [
+      ...input.files.map((name) => ({ name, path: artifactPath(input.directory, name), recursive: false })),
+      ...input.directories.map((item) => ({ ...item, recursive: true })),
+    ]
+    const invalidatedArtifacts = (await Promise.all(targets.map(async (target) => ({
+      ...target,
+      exists: await fileExists(target.path),
+    })))).filter((target) => target.exists).map((target) => target.name)
+    await Promise.all(targets.map((target) => fs.rm(target.path, {
+      recursive: target.recursive,
+      force: true,
+    })))
+    return invalidatedArtifacts
+  }
+
+  function graphArtifactInvalidation(invalidatedArtifacts: string[]) {
+    const draftNames = new Set([
+      "operation_notes.md",
+      "changelog_entry.txt",
+      "operations.draft.json",
+      "operations.json",
+      "operation_index.json",
+    ])
+    const submissionNames = new Set([
+      "apply_result.json",
+      "apply_result.json.preparing",
+      "step.md",
+      "step.md.preparing",
+    ])
+    const kinds = {
+      noteReview: invalidatedArtifacts.includes("note_review.json"),
+      graphDraft: invalidatedArtifacts.some((name) => draftNames.has(name)),
+      validation: invalidatedArtifacts.includes("validation.json"),
+      preview: invalidatedArtifacts.some((name) => name === "preview.json" || name.startsWith("preview_graph")),
+      submissionPreparation: invalidatedArtifacts.some((name) => submissionNames.has(name)),
+    }
+    const graphLabels = [
+      kinds.graphDraft ? "图操作草案" : undefined,
+      kinds.validation ? "校验结果" : undefined,
+      kinds.preview ? "图谱预览" : undefined,
+      kinds.submissionPreparation ? "提交准备产物" : undefined,
+    ].filter((label): label is string => !!label)
+    const labels = [
+      kinds.noteReview ? "笔记充分性检查" : undefined,
+      ...graphLabels,
+    ].filter((label): label is string => !!label)
+    return {
+      downstreamArtifactsInvalidated: labels.length > 0,
+      graphOperationArtifactsInvalidated: graphLabels.length > 0,
+      invalidatedArtifacts,
+      invalidatedArtifactKinds: kinds,
+      invalidationSummary: labels.length ? `已失效并清理：${labels.join("、")}。` : undefined,
+    }
+  }
+
   export async function clearGraphDraftArtifacts(input: { directory: string; includeNoteReview?: boolean }) {
     const files = [
       ...(input.includeNoteReview ? ["note_review.json"] : []),
@@ -1179,26 +1239,38 @@ export namespace ProjectWorkflowExecution {
       "step.md",
       "step.md.preparing",
     ]
-    await Promise.all([
-      ...files.map((file) => fs.rm(artifactPath(input.directory, file), { force: true })),
-      fs.rm(previewGraphDir(input.directory), { recursive: true, force: true }),
-      fs.rm(previewGraphBuildDir(input.directory), { recursive: true, force: true }),
-    ])
+    const previewGraph = previewGraphDir(input.directory)
+    const previewGraphBuild = previewGraphBuildDir(input.directory)
+    const invalidatedArtifacts = await removeExistingArtifacts({
+      directory: input.directory,
+      files,
+      directories: [
+        { name: "preview_graph", path: previewGraph },
+        { name: "preview_graph.preparing", path: previewGraphBuild },
+      ],
+    })
     await GraphVersionStore.cleanup(input.directory)
+    return invalidatedArtifacts
   }
 
   async function clearValidationAndPreview(directory: string) {
-    await Promise.all([
-      fs.rm(artifactPath(directory, "validation.json"), { force: true }),
-      fs.rm(artifactPath(directory, "preview.json"), { force: true }),
-      fs.rm(artifactPath(directory, "apply_result.json"), { force: true }),
-      fs.rm(artifactPath(directory, "apply_result.json.preparing"), { force: true }),
-      fs.rm(artifactPath(directory, "step.md"), { force: true }),
-      fs.rm(artifactPath(directory, "step.md.preparing"), { force: true }),
-      fs.rm(previewGraphDir(directory), { recursive: true, force: true }),
-      fs.rm(previewGraphBuildDir(directory), { recursive: true, force: true }),
-    ])
+    const invalidatedArtifacts = await removeExistingArtifacts({
+      directory,
+      files: [
+        "validation.json",
+        "preview.json",
+        "apply_result.json",
+        "apply_result.json.preparing",
+        "step.md",
+        "step.md.preparing",
+      ],
+      directories: [
+        { name: "preview_graph", path: previewGraphDir(directory) },
+        { name: "preview_graph.preparing", path: previewGraphBuildDir(directory) },
+      ],
+    })
     await GraphVersionStore.cleanup(directory)
+    return invalidatedArtifacts
   }
 
   async function prepareOperationArtifactManifest(input: {
@@ -2109,8 +2181,24 @@ export namespace ProjectWorkflowExecution {
       if (!(await fileExists(artifactPath(directory, "note.md")))) {
         return ProjectWorkflow.runAction(input)
       }
-      await clearGraphDraftArtifacts({ directory, includeNoteReview: true })
-      return ProjectWorkflow.runAction(input)
+      const invalidatedArtifacts = await clearGraphDraftArtifacts({ directory, includeNoteReview: true })
+      const result = await ProjectWorkflow.runAction(input)
+      const invalidation = graphArtifactInvalidation(invalidatedArtifacts)
+      return {
+        ...result,
+        message: invalidation.invalidationSummary
+          ? `已同步工作笔记变更；${invalidation.invalidationSummary}`
+          : result.message,
+        data: {
+          ...result.data,
+          ...invalidation,
+          nextAction: invalidation.graphOperationArtifactsInvalidated
+            ? "不要继续使用上述已失效产物；仅在用户明确要求后，基于最新工作笔记重新生成图操作和预览。"
+            : invalidation.invalidatedArtifactKinds.noteReview
+              ? "以最新工作笔记为依据，重新检查笔记充分性。"
+              : "以最新工作笔记作为后续工作的依据。",
+        },
+      }
     }
 
     if (input.action === "生成图操作草案") {
@@ -2185,10 +2273,21 @@ export namespace ProjectWorkflowExecution {
     if (input.action === "提出修订意见") {
       const target = typeof input.payload?.target === "string" ? input.payload.target : undefined
       const result = await ProjectWorkflow.runAction(input)
-      if (target === "图操作") await clearValidationAndPreview(directory)
-      else await clearGraphDraftArtifacts({ directory, includeNoteReview: true })
+      const invalidatedArtifacts = target === "图操作"
+        ? await clearValidationAndPreview(directory)
+        : await clearGraphDraftArtifacts({ directory, includeNoteReview: true })
+      const invalidation = graphArtifactInvalidation(invalidatedArtifacts)
       const refreshed = await ProjectWorkflow.getActive({ project: input.project, directory })
-      return { ...refreshed, message: result.message, data: result.data }
+      return {
+        ...refreshed,
+        message: invalidation.invalidationSummary
+          ? `${result.message} ${invalidation.invalidationSummary}`
+          : result.message,
+        data: {
+          ...result.data,
+          ...invalidation,
+        },
+      }
     }
 
     if (input.action === "应用图操作") {

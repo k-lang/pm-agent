@@ -54,6 +54,10 @@ export function workflowCorrectionKind(state) {
   return ''
 }
 
+export function shouldDiscardWorkflowFromRestoreChoice(choice) {
+  return choice === 'discard'
+}
+
 export function workflowMessageErrorText(error) {
   if (!error) return ''
   if (typeof error === 'string') return error

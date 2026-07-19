@@ -2,9 +2,13 @@ import { describe, expect, test } from "bun:test"
 import {
   NODE_SIZE,
   defaultGraphPositions,
+  graphNodeCardFields,
+  graphDetailUrlKey,
   isEdgeHighlighted,
   normalizeGraphPayload,
   normalizeGraphRenderOptions,
+  projectGraphDetailHref,
+  shouldUseDraftNoteFallback,
 } from "./project-graph-renderer.js"
 
 const nodes = [
@@ -21,6 +25,18 @@ const edges = [
 ]
 
 describe("project graph renderer helpers", () => {
+  test("shows issue resolution scores including zero in node details", () => {
+    expect(graphNodeCardFields({ id: "issue_open", type: "issue", resolutionScore: 0 })).toContainEqual(["Resolution", "0"])
+    expect(graphNodeCardFields({ id: "issue_active", type: "issue", resolutionScore: 40 })).toContainEqual(["Resolution", "40"])
+  })
+
+  test("routes project-relative detail urls through the project file viewer", () => {
+    expect(projectGraphDetailHref("zxzq-demo", "notes/top level.md"))
+      .toBe("/web/project-files.html?project=zxzq-demo&path=notes%2Ftop%20level.md")
+    expect(projectGraphDetailHref("zxzq-demo", "https://example.com/detail"))
+      .toBe("https://example.com/detail")
+  })
+
   test("normalizes payload without coupling renderer to a project fetch", () => {
     const payload = normalizeGraphPayload({ nodes, edges, layout: { nodes: {}, edges: {} } })
 
@@ -35,6 +51,7 @@ describe("project graph renderer helpers", () => {
       highlightEdgeIds: ["work_item_main|result_main|creates"],
       draftNodeIds: ["result_main"],
       draftEdgeIds: ["work_item_main|result_main|creates"],
+      draftDetailUrlKeys: [graphDetailUrlKey("result_main", "notes/result.md")],
       focusNodeId: "work_item_main",
     })
 
@@ -43,7 +60,21 @@ describe("project graph renderer helpers", () => {
     expect(options.highlightEdgeIds.has("work_item_main|result_main|creates")).toBe(true)
     expect(options.draftNodeIds.has("result_main")).toBe(true)
     expect(options.draftEdgeIds.has("work_item_main|result_main|creates")).toBe(true)
+    expect(options.draftDetailUrlKeys.has(graphDetailUrlKey("result_main", "notes/result.md"))).toBe(true)
     expect(options.focusNodeId).toBe("work_item_main")
+  })
+
+  test("does not treat an unchanged detail url as an active draft note", () => {
+    const options = normalizeGraphRenderOptions({
+      mode: "draft-preview",
+      draftNodeIds: ["work_item_main"],
+      draftDetailUrlKeys: [graphDetailUrlKey("result_main", "notes/result.md")],
+    })
+
+    expect(options.draftNodeIds.has("work_item_main")).toBe(true)
+    expect(shouldUseDraftNoteFallback(options, "work_item_main", "notes/result.md")).toBe(false)
+    expect(shouldUseDraftNoteFallback(options, "result_main", "notes/result.md")).toBe(true)
+    expect(shouldUseDraftNoteFallback(options, "result_main", "https://example.com/result")).toBe(false)
   })
 
   test("computes expanded positions for graph preview payloads", () => {

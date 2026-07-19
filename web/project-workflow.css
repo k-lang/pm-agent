@@ -857,6 +857,18 @@ body.workflow-maximized-chat #chat-panel {
 .note-modal-card {
   width: min(760px, calc(100vw - 32px));
 }
+.restore-workflow-modal-card {
+  width: min(640px, calc(100vw - 32px));
+}
+.restore-workflow-policy {
+  border: 1px solid #4b5563;
+  background: #111827;
+  color: #d1d5db;
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+}
 .permission-modal-card {
   width: min(1040px, calc(100vw - 32px));
   max-height: calc(100vh - 40px);

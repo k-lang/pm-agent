@@ -2,6 +2,7 @@ import { describe, test, expect } from "bun:test"
 import { SessionTable } from "../session/session.sql"
 import { Database, eq } from "../storage/db"
 import { ProjectID } from "../project/schema"
+import { MessageID } from "../session/schema"
 
 describe("Session CRUD", () => {
   test("create and get session", async () => {
@@ -97,6 +98,42 @@ describe("Session CRUD", () => {
         await Session.remove(session.id)
 
         await expect(Session.get(session.id)).rejects.toThrow()
+      },
+    })
+  })
+
+  test("appendSyntheticContext appends hidden context to a normal workflow session", async () => {
+    const { Instance } = await import("../project/instance")
+    const { Session } = await import("../session/index")
+
+    await Instance.provide({
+      directory: "/workspace/opencode",
+      fn: async () => {
+        const session = await Session.create({ title: "workflow context" })
+        await Session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID: session.id,
+          role: "user",
+          time: { created: Date.now() },
+          agent: "project_workflow",
+          model: { providerID: "test", modelID: "test-model" } as any,
+        })
+
+        const appended = await Session.appendSyntheticContext({
+          sessionID: session.id,
+          text: "workflow note changed",
+          metadata: { workflowContextEvent: "manual_note_updated" },
+        })
+
+        expect(appended.appended).toBe(true)
+        const messages = await Session.messages({ sessionID: session.id })
+        const context = messages.flatMap((message) => message.parts).find((part) =>
+          part.type === "text" && part.metadata?.workflowContextEvent === "manual_note_updated")
+        expect(context).toMatchObject({
+          type: "text",
+          text: "workflow note changed",
+          synthetic: true,
+        })
       },
     })
   })

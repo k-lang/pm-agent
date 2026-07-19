@@ -17,6 +17,7 @@ import {
   renderWriteContent,
   rejectedEditToolRecords,
   resetWorkflowViewState,
+  shouldDiscardWorkflowFromRestoreChoice,
   upsertWorkflowPermissionRecord,
   visibleWorkflowPermissionRecords,
   writeToolRecords,
@@ -120,6 +121,15 @@ describe("project workflow chat readiness", () => {
     expect(workflowViewRequestMatches({ projectName: "demo", generation: 4 }, current)).toBe(true)
     expect(workflowViewRequestMatches({ projectName: "demo", generation: 3 }, current)).toBe(false)
     expect(workflowViewRequestMatches({ projectName: "other", generation: 4 }, current)).toBe(false)
+  })
+})
+
+describe("project workflow restore safety", () => {
+  test("discards only after the explicit destructive choice", () => {
+    expect(shouldDiscardWorkflowFromRestoreChoice("discard")).toBe(true)
+    expect(shouldDiscardWorkflowFromRestoreChoice("continue")).toBe(false)
+    expect(shouldDiscardWorkflowFromRestoreChoice(false)).toBe(false)
+    expect(shouldDiscardWorkflowFromRestoreChoice(undefined)).toBe(false)
   })
 })
 

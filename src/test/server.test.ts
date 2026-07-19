@@ -11,7 +11,7 @@ import { SessionStatus } from "../session/status"
 import { ProjectDetail } from "../project/detail"
 import { Database } from "../storage/db"
 import { ProjectSummaryRecordTable } from "../project/project.sql"
-import { SessionID } from "../session/schema"
+import { MessageID, SessionID } from "../session/schema"
 import { ProjectWorkflow } from "../workflow/state"
 import { ProjectWorkflowExecution } from "../workflow/execution"
 import { GraphVersionStore } from "../graph/version-store"
@@ -638,9 +638,33 @@ describe("server routes", () => {
       expect(first.status).toBe(200)
       const firstBody = await first.json()
       expect(firstBody).toMatchObject({ exists: true, content: "first note\n", path: "workflows/active/note.md" })
+      const session = await Instance.provide({
+        directory: projectDir,
+        fn: () => Session.create({ title: "工作推进" }),
+      })
+      await Instance.provide({
+        directory: projectDir,
+        fn: () => Session.updateMessage({
+          id: MessageID.ascending(),
+          sessionID: session.id,
+          role: "user",
+          time: { created: Date.now() },
+          agent: "project_workflow",
+          model: { providerID: "test", modelID: "test-model" } as any,
+        }),
+      })
+      await ProjectWorkflow.bindSessions({
+        project: "demo",
+        directory: projectDir,
+        sessionID: session.id,
+        warmupStatus: "completed",
+      })
+      await fs.writeFile(path.join(activeDir, "operation_notes.md"), "operation notes\n", "utf8")
+      await fs.writeFile(path.join(activeDir, "operations.draft.json"), "{}\n", "utf8")
       await fs.writeFile(path.join(activeDir, "operations.json"), "{}\n", "utf8")
       await fs.writeFile(path.join(activeDir, "validation.json"), "{}\n", "utf8")
       await fs.writeFile(path.join(activeDir, "preview.json"), "{}\n", "utf8")
+      await fs.mkdir(path.join(activeDir, "preview_graph"), { recursive: true })
 
       const second = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
         method: "POST",
@@ -655,6 +679,54 @@ describe("server routes", () => {
       await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
       await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
       await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+      const messages = await Instance.provide({
+        directory: projectDir,
+        fn: () => Session.messages({ sessionID: session.id }),
+      })
+      const contextPart = messages.flatMap((message) => message.parts).find((part) =>
+        part.type === "text" && part.metadata?.workflowContextEvent === "manual_note_updated")
+      expect(contextPart).toMatchObject({ type: "text", synthetic: true })
+      expect(contextPart && "text" in contextPart ? contextPart.text : "").toContain("已失效并清理：图操作草案、校验结果、图谱预览")
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  test("POST /project/workflow/note/import reports success when the optional session context notification fails", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "开始或恢复",
+        payload: {},
+      })
+      await ProjectWorkflow.bindSessions({
+        project: "demo",
+        directory: projectDir,
+        sessionID: "ses_missing_note_context",
+        warmupStatus: "completed",
+      })
+
+      const response = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "saved even when context notification fails" }),
+      }))
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({
+        exists: true,
+        content: "saved even when context notification fails\n",
+      })
+      await expect(fs.readFile(path.join(projectDir, "workflows", "active", "note.md"), "utf8"))
+        .resolves.toBe("saved even when context notification fails\n")
     } finally {
       process.chdir(originalCwd)
     }

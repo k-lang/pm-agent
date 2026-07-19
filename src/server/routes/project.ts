@@ -21,7 +21,10 @@ import { MessageV2 } from "@/session/message-v2"
 import { ProjectWorkflow } from "@/workflow/state"
 import { ProjectWorkflowExecution } from "@/workflow/execution"
 import { GraphVersionStore } from "@/graph/version-store"
+import { Log } from "@/util/log"
 import { loadExpandedGraph, loadGraph, saveLayout } from "../../../standalone-graph/transform"
+
+const log = Log.create({ service: "project.routes" })
 
 const ProjectDirectory = z.object({
   name: z.string(),
@@ -673,6 +676,41 @@ async function readWorkflowOperationArtifacts(project: string) {
   return ProjectWorkflowExecution.readOperationArtifacts({ project, directory })
 }
 
+async function notifyWorkflowChatOfManualNoteUpdate(
+  directory: string,
+  workflow: ProjectWorkflow.ActionResult,
+) {
+  const sessionID = workflow.state?.sessionID
+  if (!sessionID) return { appended: false as const, reason: "no_session" as const }
+  const invalidatedArtifacts = Array.isArray(workflow.data?.invalidatedArtifacts)
+    ? workflow.data.invalidatedArtifacts.filter((item): item is string => typeof item === "string")
+    : []
+  const invalidationSummary = typeof workflow.data?.invalidationSummary === "string"
+    ? workflow.data.invalidationSummary
+    : undefined
+  const text = invalidationSummary
+    ? [
+        "<workflow-context-event>",
+        `用户已在页面中更新工作笔记。执行层${invalidationSummary}`,
+        `已清理：${invalidatedArtifacts.join(", ")}。`,
+        "后续不要继续引用上述已失效产物；仅在用户明确要求后，基于最新 workflows/active/note.md 重新生成图操作和预览。",
+        "</workflow-context-event>",
+      ].join("\n")
+    : [
+        "<workflow-context-event>",
+        "用户已在页面中更新工作笔记。后续以最新 workflows/active/note.md 为准。",
+        "</workflow-context-event>",
+      ].join("\n")
+  return Instance.provide({
+    directory,
+    fn: () => Session.appendSyntheticContext({
+      sessionID: sessionID as SessionID,
+      text,
+      metadata: { workflowContextEvent: "manual_note_updated" },
+    }),
+  })
+}
+
 async function readWorkflowGraph(project: string, view: z.infer<typeof GraphView>) {
   const directory = projectDirectoryForName(project)
   await ensureExistingProject(directory)
@@ -707,6 +745,14 @@ async function importWorkflowNote(input: {
   if (workflow.data?.recoveredPublishedApply) {
     throw new HTTPException(409, { message: "上一轮图操作已经发布并完成归档，本次工作笔记修改未执行。" })
   }
+  await notifyWorkflowChatOfManualNoteUpdate(directory, workflow).catch((error) => {
+    log.warn("failed to append workflow note update context", {
+      project: input.project,
+      workflowID: workflow.workflowID,
+      sessionID: workflow.state?.sessionID,
+      error,
+    })
+  })
   return WorkflowNote.parse({
     exists: true,
     content: input.content.trimEnd() + "\n",

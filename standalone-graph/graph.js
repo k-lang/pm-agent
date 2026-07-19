@@ -758,6 +758,7 @@ function renderNodeFields(node) {
     ['ID', node.id],
     ['Status', node.status],
     ['Completion', node.completionScore == null ? null : `${node.completionScore}`],
+    ['Resolution', node.resolutionScore == null ? null : `${node.resolutionScore}`],
     ['Detail URL', node.detailUrl],
     ['First step', node.firstStep == null ? null : String(node.firstStep)],
     ['First seen', node.firstSeenAt],
@@ -767,7 +768,7 @@ function renderNodeFields(node) {
     ['Top goal', node.topGoalId],
     ['Producing block', node.producingWorkBlockId],
     ['Linked work block', node.linkedWorkBlockId],
-  ].filter(([, value]) => value)
+  ].filter(([, value]) => value !== null && value !== undefined && value !== '')
 
   fields.forEach(([label, value]) => {
     nodeCardFieldsEl.append(cardField(label, value))

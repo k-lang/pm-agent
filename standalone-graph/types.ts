@@ -11,6 +11,7 @@ export type RawNode = {
   history?: unknown[]
   status?: string
   completion_score?: number
+  resolution_score?: number
   linked_work_blocks?: string[]
   linked_goal_id?: string | null
   linked_work_block_id?: string | null
@@ -52,6 +53,7 @@ export type GraphNode = {
   detailUrl: string | null
   status: string | null
   completionScore: number | null
+  resolutionScore: number | null
   topGoalId: string | null
   parentGoalId: string | null
   ownerGoalId: string | null

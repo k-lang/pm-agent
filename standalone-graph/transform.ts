@@ -274,6 +274,7 @@ function buildVisibleNodes(nodes: RawNode[], edges: RawEdge[], visibleTypes: Set
       detailUrl: node.detail_url ?? null,
       status: node.status ?? null,
       completionScore: typeof node.completion_score === "number" ? node.completion_score : null,
+      resolutionScore: typeof node.resolution_score === "number" ? node.resolution_score : null,
       topGoalId,
       parentGoalId,
       ownerGoalId,

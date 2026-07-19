@@ -56,9 +56,45 @@ export function normalizeGraphRenderOptions(options = {}) {
     highlightEdgeIds: new Set(options.highlightEdgeIds || []),
     draftNodeIds: new Set(options.draftNodeIds || []),
     draftEdgeIds: new Set(options.draftEdgeIds || []),
+    draftDetailUrlKeys: new Set(options.draftDetailUrlKeys || []),
     focusNodeId: options.focusNodeId || '',
     focusEdgeId: options.focusEdgeId || '',
   }
+}
+
+export function graphDetailUrlKey(nodeId, detailUrl) {
+  return `${nodeId}\u0000${detailUrl}`
+}
+
+export function shouldUseDraftNoteFallback(options, nodeId, detailUrl) {
+  return options.mode === 'draft-preview'
+    && String(detailUrl).startsWith('notes/')
+    && options.draftDetailUrlKeys.has(graphDetailUrlKey(nodeId, detailUrl))
+}
+
+export function graphNodeCardFields(node) {
+  return [
+    ['Type', node.type],
+    ['ID', node.id],
+    ['Status', node.status],
+    ['Completion', node.completionScore == null ? null : `${node.completionScore}`],
+    ['Resolution', node.resolutionScore == null ? null : `${node.resolutionScore}`],
+    ['Detail URL', node.detailUrl],
+    ['First step', node.firstStep == null ? null : String(node.firstStep)],
+    ['First seen', node.firstSeenAt],
+    ['Parent goal', node.parentGoalId],
+    ['Owner goal', node.ownerGoalId],
+    ['Community goal', node.communityGoalId],
+    ['Top goal', node.topGoalId],
+    ['Producing block', node.producingWorkBlockId],
+    ['Linked work block', node.linkedWorkBlockId],
+  ].filter(([, value]) => value !== null && value !== undefined && value !== '')
+}
+
+export function projectGraphDetailHref(projectName, detailUrl) {
+  if (!projectName || !detailUrl) return detailUrl || ''
+  if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|\/)/i.test(detailUrl)) return detailUrl
+  return `/web/project-files.html?project=${encodeURIComponent(projectName)}&path=${encodeURIComponent(detailUrl)}`
 }
 
 export function isEdgeHighlighted(edge, selectedNodeId, options = normalizeGraphRenderOptions()) {
@@ -451,15 +487,17 @@ export function defaultGraphPositions(nodes, edges, view = 'collapsed') {
 }
 
 export class ProjectGraphRenderer {
-  constructor({ root, view = 'collapsed', showLegend = true, showControls = true, readonly = true, initialScale = INITIAL_SCALE } = {}) {
+  constructor({ root, projectName = '', view = 'collapsed', showLegend = true, showControls = true, readonly = true, initialScale = INITIAL_SCALE } = {}) {
     if (!root) throw new Error('ProjectGraphRenderer requires root')
     this.root = root
+    this.projectName = projectName
     this.view = view === 'expanded' ? 'expanded' : 'collapsed'
     this.showLegend = showLegend
     this.showControls = showControls
     this.readonly = readonly
     this.initialScale = initialScale
     this.id = `pg-${++rendererSeq}`
+    this.detailLoadSeq = 0
     this.state = {
       payload: null,
       positions: {},
@@ -523,6 +561,19 @@ export class ProjectGraphRenderer {
             <pre class="pg-node-card-description"></pre>
           </section>
         </div>
+        <div class="pg-detail-viewer hidden" role="dialog" aria-modal="true" aria-label="来源文件预览">
+          <div class="pg-detail-viewer-backdrop"></div>
+          <section class="pg-detail-viewer-panel">
+            <header class="pg-detail-viewer-header">
+              <div>
+                <div class="pg-detail-viewer-title">来源文件</div>
+                <div class="pg-detail-viewer-path"></div>
+              </div>
+              <button class="pg-detail-viewer-close" type="button">关闭</button>
+            </header>
+            <pre class="pg-detail-viewer-content">请选择来源文件</pre>
+          </section>
+        </div>
       </section>
     `
     this.el = this.root.querySelector('.pg-renderer')
@@ -537,11 +588,16 @@ export class ProjectGraphRenderer {
     this.nodeCardMetaEl = this.root.querySelector('.pg-node-card-meta')
     this.nodeCardFieldsEl = this.root.querySelector('.pg-node-card-fields')
     this.nodeCardDescriptionEl = this.root.querySelector('.pg-node-card-description')
+    this.detailViewerEl = this.root.querySelector('.pg-detail-viewer')
+    this.detailViewerPathEl = this.root.querySelector('.pg-detail-viewer-path')
+    this.detailViewerContentEl = this.root.querySelector('.pg-detail-viewer-content')
     this.root.querySelector('[data-graph-action="zoom-out"]')?.addEventListener('click', () => this.zoomBy(1 / 1.2))
     this.root.querySelector('[data-graph-action="zoom-in"]')?.addEventListener('click', () => this.zoomBy(1.2))
     this.root.querySelector('[data-graph-action="fit"]')?.addEventListener('click', () => this.fit())
     this.root.querySelector('.pg-node-card-backdrop')?.addEventListener('click', () => this.hideNodeCard())
     this.root.querySelector('.pg-node-card-close')?.addEventListener('click', () => this.hideNodeCard())
+    this.root.querySelector('.pg-detail-viewer-backdrop')?.addEventListener('click', () => this.hideDetailViewer())
+    this.root.querySelector('.pg-detail-viewer-close')?.addEventListener('click', () => this.hideDetailViewer())
     this.svg.addEventListener('click', this._onSvgClick)
     this.svg.addEventListener('pointerdown', this._onPointerDown)
     this.svg.addEventListener('pointermove', this._onPointerMove)
@@ -549,6 +605,7 @@ export class ProjectGraphRenderer {
   }
 
   destroy() {
+    this.detailLoadSeq += 1
     this.svg?.removeEventListener('click', this._onSvgClick)
     this.svg?.removeEventListener('pointerdown', this._onPointerDown)
     this.svg?.removeEventListener('pointermove', this._onPointerMove)
@@ -797,7 +854,7 @@ export class ProjectGraphRenderer {
     }
   }
 
-  cardField(label, value) {
+  cardField(label, value, node) {
     const item = document.createElement('div')
     item.className = 'pg-node-card-field'
     const labelEl = document.createElement('div')
@@ -807,10 +864,17 @@ export class ProjectGraphRenderer {
     valueEl.className = 'pg-node-card-field-value'
     if (label === 'Detail URL') {
       const link = document.createElement('a')
-      link.href = value
+      link.href = projectGraphDetailHref(this.projectName, value)
       link.textContent = value
       link.target = '_blank'
       link.rel = 'noreferrer'
+      if (projectGraphDetailHref(this.projectName, value) !== value) {
+        link.addEventListener('click', (event) => {
+          event.preventDefault()
+          const draftNote = shouldUseDraftNoteFallback(this.state.options, node?.id, value)
+          this.openDetailViewer(value, { draftNote })
+        })
+      }
       valueEl.append(link)
     } else {
       valueEl.textContent = value
@@ -821,27 +885,46 @@ export class ProjectGraphRenderer {
 
   renderNodeFields(node) {
     this.nodeCardFieldsEl.innerHTML = ''
-    const fields = [
-      ['Type', node.type],
-      ['ID', node.id],
-      ['Status', node.status],
-      ['Completion', node.completionScore == null ? null : `${node.completionScore}`],
-      ['Detail URL', node.detailUrl],
-      ['First step', node.firstStep == null ? null : String(node.firstStep)],
-      ['First seen', node.firstSeenAt],
-      ['Parent goal', node.parentGoalId],
-      ['Owner goal', node.ownerGoalId],
-      ['Community goal', node.communityGoalId],
-      ['Top goal', node.topGoalId],
-      ['Producing block', node.producingWorkBlockId],
-      ['Linked work block', node.linkedWorkBlockId],
-    ].filter(([, value]) => value)
-    fields.forEach(([label, value]) => this.nodeCardFieldsEl.append(this.cardField(label, value)))
+    graphNodeCardFields(node).forEach(([label, value]) => this.nodeCardFieldsEl.append(this.cardField(label, value, node)))
   }
 
   hideNodeCard() {
     this.state.expandedNodeId = null
     this.nodeCardEl.classList.add('hidden')
+  }
+
+  async openDetailViewer(detailUrl, { draftNote = false } = {}) {
+    const loadSeq = ++this.detailLoadSeq
+    this.detailViewerPathEl.textContent = detailUrl
+    this.detailViewerContentEl.textContent = '加载中...'
+    this.detailViewerEl.classList.remove('hidden')
+    try {
+      const response = await fetch(`/project/file/content?project=${encodeURIComponent(this.projectName)}&path=${encodeURIComponent(detailUrl)}`)
+      let result
+      if (response.ok) {
+        result = await response.json()
+      } else if (draftNote) {
+        const draftResponse = await fetch(`/project/workflow/note?project=${encodeURIComponent(this.projectName)}`)
+        if (!draftResponse.ok) throw new Error(await draftResponse.text())
+        const draft = await draftResponse.json()
+        if (!draft?.exists) throw new Error(await response.text())
+        result = { type: 'text', content: draft.content }
+      } else {
+        throw new Error(await response.text())
+      }
+      if (loadSeq !== this.detailLoadSeq) return
+      this.detailViewerContentEl.textContent = result?.type === 'binary'
+        ? '该文件不可作为文本预览'
+        : result?.content || '未返回内容'
+    } catch (error) {
+      if (loadSeq !== this.detailLoadSeq) return
+      this.detailViewerContentEl.textContent = error instanceof Error ? error.message : '加载失败'
+    }
+  }
+
+  hideDetailViewer() {
+    this.detailLoadSeq += 1
+    this.detailViewerEl.classList.add('hidden')
   }
 
   renderSelection() {

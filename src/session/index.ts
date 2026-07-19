@@ -478,6 +478,47 @@ export namespace Session {
     },
   )
 
+  export const appendSyntheticContext = fn(
+    z.object({
+      sessionID: SessionID.zod,
+      text: z.string().min(1),
+      metadata: z.record(z.string(), z.unknown()).optional(),
+    }),
+    async (input) => {
+      await get(input.sessionID)
+      let source: MessageV2.User | undefined
+      for await (const message of MessageV2.stream(input.sessionID)) {
+        if (message.info.role !== "user") continue
+        source = message.info
+        break
+      }
+      if (!source) return { appended: false as const, reason: "no_user_context" as const }
+
+      const now = Date.now()
+      const info = MessageV2.User.parse({
+        id: MessageID.ascending(),
+        sessionID: input.sessionID,
+        role: "user",
+        time: { created: now },
+        agent: source.agent,
+        model: source.model,
+      })
+      const part = MessageV2.TextPart.parse({
+        id: PartID.ascending(),
+        messageID: info.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: input.text,
+        synthetic: true,
+        metadata: input.metadata,
+      })
+      await updateMessage(info)
+      await updatePart(part)
+      await touch(input.sessionID)
+      return { appended: true as const, messageID: info.id }
+    },
+  )
+
   export function* list(input?: {
     directory?: string
     roots?: boolean

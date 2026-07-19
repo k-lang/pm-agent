@@ -11,6 +11,7 @@ import {
   renderWorkflowReviewBody,
   renderWorkflowToolPart,
   resetWorkflowViewState,
+  shouldDiscardWorkflowFromRestoreChoice,
   upsertWorkflowPermissionRecord as upsertWorkflowPermissionRecordList,
   workflowMaximizeBodyClass,
   workflowMaximizeButtonState,
@@ -25,7 +26,7 @@ import {
   workflowPermissionStatusText,
   workflowPermissionTitle,
 } from './project-workflow-view.js'
-import { ProjectGraphRenderer } from './project-graph-renderer.js'
+import { graphDetailUrlKey, ProjectGraphRenderer } from './project-graph-renderer.js'
 
 const API = ''
 const params = new URLSearchParams(location.search)
@@ -86,6 +87,12 @@ const noteImportContent = document.getElementById('note-import-content')
 const noteImportError = document.getElementById('note-import-error')
 const btnCancelNoteImport = document.getElementById('btn-cancel-note-import')
 const btnConfirmNoteImport = document.getElementById('btn-confirm-note-import')
+const restoreWorkflowModal = document.getElementById('restore-workflow-modal')
+const restoreWorkflowSummary = document.getElementById('restore-workflow-summary')
+const restoreWorkflowPolicy = document.getElementById('restore-workflow-policy')
+const restoreWorkflowError = document.getElementById('restore-workflow-error')
+const btnDiscardRestoredWorkflow = document.getElementById('btn-discard-restored-workflow')
+const btnContinueRestoredWorkflow = document.getElementById('btn-continue-restored-workflow')
 const permissionReviewModal = document.getElementById('permission-review-modal')
 const permissionReviewTitle = document.getElementById('permission-review-title')
 const permissionReviewFile = document.getElementById('permission-review-file')
@@ -111,6 +118,7 @@ let graphError = ''
 let graphLoadSeq = 0
 let graphPreviewMode = 'map'
 let workflowOperations = null
+let workflowOperationsLoadSeq = 0
 let selectedOperationArtifactKey = 'operationNotes'
 let selectedOperationKey = ''
 let operationHighlight = { nodeIds: [], edgeIds: [], focusNodeId: '', focusEdgeId: '' }
@@ -134,7 +142,7 @@ let workflowPollTimer = null
 let currentSSE = null
 let refreshWorkflowTimer = null
 let restorePromptProject = ''
-let suppressRestorePrompt = false
+let restorePromptResolve = null
 let workflowAwaitingReply = false
 let pendingUserText = ''
 let activePermissionReviewID = ''
@@ -170,8 +178,21 @@ function resetPreviewRenderKey(element) {
   if (element) previewRenderKeys.delete(element)
 }
 
+function cancelRestoreWorkflowPrompt() {
+  const resolve = restorePromptResolve
+  restorePromptResolve = null
+  restoreWorkflowModal.classList.add('hidden')
+  restoreWorkflowError.textContent = ''
+  restoreWorkflowError.classList.add('hidden')
+  btnDiscardRestoredWorkflow.disabled = false
+  btnContinueRestoredWorkflow.disabled = false
+  resolve?.('cancel')
+}
+
 function clearWorkflowView() {
+  cancelRestoreWorkflowPrompt()
   workflowViewGeneration += 1
+  workflowOperationsLoadSeq += 1
   workflowRefreshQueued = false
   if (workflowPollTimer) clearTimeout(workflowPollTimer)
   workflowPollTimer = null
@@ -396,6 +417,7 @@ async function loadWorkflowNote(request = workflowViewRequest()) {
 async function loadWorkflowOperations(request = workflowViewRequest()) {
   const project = selectedProject()
   if (!isCurrentWorkflowViewRequest(request)) return
+  const loadSeq = ++workflowOperationsLoadSeq
   if (!project) {
     workflowOperations = null
     renderOperationPreview()
@@ -405,17 +427,17 @@ async function loadWorkflowOperations(request = workflowViewRequest()) {
   if (!workflowOperations) renderOperationPreview()
   try {
     const result = await fetchJson(API + `/project/workflow/operations?project=${encodeURIComponent(project.name)}`)
-    if (!isCurrentWorkflowViewRequest(request)) return
+    if (loadSeq !== workflowOperationsLoadSeq || !isCurrentWorkflowViewRequest(request)) return
     workflowOperations = result || null
     if (result?.workflow) workflow = mergeWorkflowReadiness(workflow, result.workflow)
     if (activeTab === 'graph' && graphPreviewMode === 'map') {
       await ensureGraphPreviewLoaded().catch(() => {})
     }
   } catch (error) {
-    if (!isCurrentWorkflowViewRequest(request)) return
+    if (loadSeq !== workflowOperationsLoadSeq || !isCurrentWorkflowViewRequest(request)) return
     workflowOperations = { files: [], error: error.message || '图操作草稿加载失败' }
   } finally {
-    if (!isCurrentWorkflowViewRequest(request)) return
+    if (loadSeq !== workflowOperationsLoadSeq || !isCurrentWorkflowViewRequest(request)) return
     workflowOperationsLoading = false
     renderWorkspace()
   }
@@ -780,6 +802,20 @@ function workflowPreviewGraph() {
   return workflowPreviewArtifact()?.graph || null
 }
 
+function workflowPreviewDraftDetailUrlKeys() {
+  const command = operationArtifactJson('operations')
+  if (!Array.isArray(command?.operations)) return []
+  return command.operations.flatMap((operation) => {
+    if (operation?.type === 'create_node' && typeof operation.temp_id === 'string' && typeof operation.data?.detail_url === 'string') {
+      return [graphDetailUrlKey(operation.temp_id, operation.data.detail_url)]
+    }
+    if (operation?.type === 'update_node' && typeof operation.node_id === 'string' && typeof operation.updates?.detail_url === 'string') {
+      return [graphDetailUrlKey(operation.node_id, operation.updates.detail_url)]
+    }
+    return []
+  })
+}
+
 function graphPreviewKey(project) {
   if (!project) return ''
   const preview = workflowPreviewArtifact()
@@ -801,6 +837,7 @@ function graphPreviewOptions() {
     mode: workflowPreviewGraph() ? 'draft-preview' : 'current',
     draftNodeIds: directNodeIds,
     draftEdgeIds: directEdgeIds,
+    draftDetailUrlKeys: workflowPreviewDraftDetailUrlKeys(),
     highlightNodeIds: operationHighlight.nodeIds,
     highlightEdgeIds: operationHighlight.edgeIds,
     focusNodeId: operationHighlight.focusNodeId,
@@ -886,6 +923,7 @@ async function ensureGraphPreviewLoaded({ force = false } = {}) {
     resetPreviewRenderKey(graphPreview)
     graphRenderer = new ProjectGraphRenderer({
       root: graphPreview,
+      projectName: project.name,
       view: 'expanded',
       showLegend: false,
       showControls: false,
@@ -1211,33 +1249,54 @@ async function maybeAskRestoreWorkflow() {
   const request = workflowViewRequest(project)
   const state = currentWorkflowState()
   if (!project || !hasUnfinishedActiveWorkflow(state)) return
-  if (suppressRestorePrompt) return
   if (restorePromptProject === project.name) return
   restorePromptProject = project.name
 
   const correctionType = workflowCorrectionKind(state)
   const discardNote = correctionType === 'hard'
-    ? '这是硬更正草案；选择“取消”只会放弃恢复出来的 active 现场，不保留本轮 note.md，正式图数据不会改变。'
+    ? '这是硬更正草案；点击“放弃当前草案”只会放弃恢复出来的 active 现场，不保留本轮 note.md，正式图数据不会改变。'
     : correctionType === 'soft'
-      ? '这是软更正草案；选择“取消”会清空本轮更正 note.md 和图操作草案，不保留为普通推进笔记。'
-      : '选择“取消”会结束并删除本轮 active workflow，包括 state、图操作草案、校验、预览和聊天会话；如果已有工作笔记，会只保留 workflows/active/note.md 供下一轮重新开始使用。已写入的正式图数据不会删除。'
-  const ok = confirm(`检测到项目「${project.name}」有未完成的工作推进草案，当前阶段：${state.stage}。是否恢复上次操作？\n\n选择“确定”会恢复本轮 active workflow。\n${discardNote}`)
-  if (ok) return
-
-  suppressRestorePrompt = true
-  try {
-    await fetchJson(API + `/project/workflow/action?project=${encodeURIComponent(project.name)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: '放弃草案', payload: {} }),
+      ? '这是软更正草案；点击“放弃当前草案”会清空本轮更正 note.md 和图操作草案，不保留为普通推进笔记。'
+      : '点击“放弃当前草案”会结束并删除本轮 active workflow，包括 state、图操作草案、校验、预览和聊天会话；如果已有工作笔记，会只保留 workflows/active/note.md 供下一轮重新开始使用。已写入的正式图数据不会删除。'
+  let discardError = ''
+  while (true) {
+    restoreWorkflowSummary.textContent = `项目「${project.name}」存在未完成草案，当前阶段：${state.stage}。`
+    restoreWorkflowPolicy.textContent = discardNote
+    restoreWorkflowError.textContent = discardError
+    restoreWorkflowError.classList.toggle('hidden', !discardError)
+    btnDiscardRestoredWorkflow.disabled = false
+    btnContinueRestoredWorkflow.disabled = false
+    restoreWorkflowModal.classList.remove('hidden')
+    let decisionResolve
+    const decision = await new Promise((resolve) => {
+      decisionResolve = resolve
+      restorePromptResolve = resolve
+      btnContinueRestoredWorkflow.focus()
     })
+    if (restorePromptResolve === decisionResolve) restorePromptResolve = null
     if (!isCurrentWorkflowViewRequest(request)) return
-    clearWorkflowView()
-    renderWorkspace()
-  } catch (error) {
-    chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '放弃草案失败')}</div>`
-  } finally {
-    suppressRestorePrompt = false
+    if (!shouldDiscardWorkflowFromRestoreChoice(decision)) {
+      restoreWorkflowModal.classList.add('hidden')
+      return
+    }
+
+    btnDiscardRestoredWorkflow.disabled = true
+    btnContinueRestoredWorkflow.disabled = true
+    try {
+      await fetchJson(API + `/project/workflow/action?project=${encodeURIComponent(project.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: '放弃草案', payload: {} }),
+      })
+      if (!isCurrentWorkflowViewRequest(request)) return
+      restoreWorkflowModal.classList.add('hidden')
+      clearWorkflowView()
+      renderWorkspace()
+      return
+    } catch (error) {
+      if (!isCurrentWorkflowViewRequest(request)) return
+      discardError = error.message || '放弃草案失败'
+    }
   }
 }
 
@@ -1818,11 +1877,19 @@ btnGraph.onclick = () => {
   const project = selectedProject()
   if (project?.graphInitialized) location.href = projectGraphUrl(project)
 }
-btnGraphRefresh.onclick = () => {
-  ensureGraphPreviewLoaded({ force: true }).catch((error) => {
+btnGraphRefresh.onclick = async () => {
+  const project = selectedProject()
+  const request = workflowViewRequest(project)
+  const previousKey = graphPreviewKey(project)
+  try {
+    await loadWorkflowOperations(request)
+    if (!isCurrentWorkflowViewRequest(request)) return
+    if (workflowOperations?.error) throw new Error(workflowOperations.error)
+    await ensureGraphPreviewLoaded({ force: previousKey === graphPreviewKey(project) })
+  } catch (error) {
     graphError = error.message || '图谱预览加载失败'
     renderGraphPreview(selectedProject(), !!selectedProject()?.graphInitialized)
-  })
+  }
 }
 btnGraphModeMap.onclick = () => {
   graphPreviewMode = 'map'
@@ -1849,6 +1916,25 @@ btnImportNoteFile.onclick = () => {
 btnCancelNoteImport.onclick = closeNoteImportModal
 btnConfirmNoteImport.onclick = () => importPastedNote().catch((error) => {
   showNoteImportError(error.message || '保存失败')
+})
+btnContinueRestoredWorkflow.onclick = () => restorePromptResolve?.('continue')
+btnDiscardRestoredWorkflow.onclick = () => restorePromptResolve?.('discard')
+document.addEventListener('keydown', (event) => {
+  if (restoreWorkflowModal.classList.contains('hidden') || event.key !== 'Tab') return
+  const buttons = [btnDiscardRestoredWorkflow, btnContinueRestoredWorkflow].filter((button) => !button.disabled)
+  if (!buttons.length) {
+    event.preventDefault()
+    return
+  }
+  const first = buttons[0]
+  const last = buttons[buttons.length - 1]
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
 })
 btnClosePermissionReview.onclick = closePermissionReviewModal
 btnApprovePermissionReview.onclick = () => replyActivePermissionReview('once')

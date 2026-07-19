@@ -245,7 +245,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 
 结果 `result` 表达工作产物、结论或验证结果带来的影响：
 
-- `result -> issue` 用 `affects_issue`：结果直接修正了对问题的认识、严重性、处理方式或认知边界。它不是“问题解决度推进”的主表达；issue 的 `status` / `resolution_score` 通常应由具体 `work_item` 的分析、验证、修复、复盘和后续 `update_node issue` 推进。
+- `result -> issue` 用 `affects_issue`：结果直接修正了对问题的认识、严重性、处理方式或认知边界，也可以表达该结果对既有 issue 解决进度的实际推动。若本轮确实改变了 issue 的状态或解决度，必须同时用 `update_node issue` 记录新的 `status` / `resolution_score`；边表达“哪个结果造成了影响”，字段更新表达“issue 当前进展到什么程度”。
 - `result -> goal` 用 `generates_result`：结果促成一个新目标或使目标成立。
 - `result -> goal` 用 `adjusts_result`：结果改变已有目标的状态、范围、完成度或判断。
 - `result -> goal` 用 `cancels_result`：结果使已有目标不再成立。
@@ -273,7 +273,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 - `event -> result` 的 `modifies`：事件修改已有结果；如果是新结果，用 `forms`。
 - `work_item -> result` 的 `modifies_work`：工作项修改已有结果；如果是新结果，用 `creates`。
 - `issue -> goal` 的 `adjusts_goal` / `cancels_goal`：问题调整或取消已有目标；如果问题促成新目标，用 `generates_goal`。
-- `result -> issue` 的 `affects_issue`：结果影响已有问题；如果工作中发现新问题，优先用 `work_item -> issue` 的 `discovers`。
+- `result -> issue` 的 `affects_issue`：结果影响已有问题，包括改变问题认识、处理方式、严重性或解决进度；如果只是工作过程中发现、澄清或暴露问题，没有形成影响该 issue 的结果，才使用 `work_item -> issue` 的 `discovers`。
 - `result -> goal` 的 `adjusts_result` / `cancels_result`：结果调整或取消已有目标；如果结果促成新目标，用 `generates_result`。
 
 `adjusts` / `adjusts_goal` / `adjusts_result` 表示“已有对象被本轮事实调整”。它不是“背景看起来改变了计划”的通用表达。`cancels` / `cancels_goal` / `cancels_result` 同理，表示已有对象被取消，不用于本轮新建节点。
@@ -320,6 +320,7 @@ description: 将工作推进 active workflow 的工作笔记转成可审核、�
 | 工作推进产出结果 | 某项工作已经推进或完成，并产生结论、交付物、验证结果或阶段进展 | 更新 `work_item`；新建 `result`；用 `work_item -> creates -> result`；必要时 `result -> adjusts_result -> existing_goal` | `work_item` 不能是未开始的 `planned`；`result` 必须有已发生工作支撑。`adjusts_result` 只能指向已有 goal；如果目标也是本轮新建，不要用调整类边。 |
 | 工作修正已有结果 | 本轮工作补充、修正、替换或推翻已有结果 | 更新 `work_item`；更新已有 `result`；用 `work_item -> modifies_work -> existing_result` | `result` 必须已存在。若本轮产生的是新结果，用 `creates`，不要用 `modifies_work`。 |
 | 工作中发现问题 | 问题是在分析、验证、实施、沟通或复盘过程中被发现或澄清 | 新建或更新 `issue`；用 `work_item -> discovers -> issue` | 起点 work_item 必须有已推进证据。planned work_item 不能 discovers。issue 应是可处理、可澄清、可验证或需持续管理的实际缺口，不是泛化风险感受。 |
+| 工作结果推进既有问题 | 已完成或已推进的工作形成结果，并使既有 issue 的处理进度、严重性判断或应对方式发生变化 | 更新 `issue.status` / `issue.resolution_score`；用 `work_item -> creates/modifies_work -> result`，再用 `result -> affects_issue -> existing_issue` | `affects_issue` 不仅表示认知变化，也表示结果对既有 issue 的实际缓解或推进。解决度数值必须由工作笔记证据支持，不能只因存在结果就机械提高。若没有形成结果，只是工作中发现或澄清问题，使用 `discovers`。 |
 | 问题促成新目标 | 一个具体问题足以拉出新的目标或工作线 | 新建 `goal`；可新建 `work_block` 和起步 `work_item`；用 `issue -> generates_goal -> goal` | `goal` 必须是本轮新建；不要用旧写法 `issue -> generates -> goal`。如果问题只是调整已有目标，用 `adjusts_goal` 指向已有 goal。 |
 | 已有目标被事件调整 | 外部事件改变已有目标的范围、节奏、优先级、状态或成功标准 | 新建或更新 `event`；更新已有 `goal`；用 `event -> adjusts -> existing_goal` | 目标必须已存在。不要把本轮新建 goal 写成“被调整”；新目标成立通常用 description/history 或 `generates` 表达。 |
 | 顺承推进 | 新工作明确承接前序工作、失败后转向、基于上一轮结果继续推进 | 新建后续 `work_item`；用 `previous_work_item -> next -> new_work_item` | `next` 表示已发生或明确的推进顺承，不表示普通计划拆分。若只是计划中的并列任务，写进 work_block/work_item 描述或需审核点。 |

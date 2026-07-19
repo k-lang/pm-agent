@@ -123,4 +123,10 @@ describe("standalone expanded graph transform", () => {
     const issue = graph.nodes.find((node) => node.id === "issue_faq_insufficient")
     expect(issue?.detailUrl).toBe("jiedaidan_trace/progress/identify_ambiguities.txt")
   })
+
+  test("preserves issue resolution scores in expanded mode", async () => {
+    const graph = await loadExpandedGraph(PROJECT_DIR)
+    const issue = graph.nodes.find((node) => node.id === "issue_faq_insufficient")
+    expect(issue?.resolutionScore).toBe(30)
+  })
 })

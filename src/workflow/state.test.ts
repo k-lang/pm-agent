@@ -719,6 +719,14 @@ describe("ProjectWorkflow", () => {
     })
 
     expect(revised.stage).toBe("图操作需修订")
+    expect(revised.message).toContain("已失效并清理：校验结果、图谱预览")
+    expect(revised.data).toMatchObject({
+      invalidatedArtifactKinds: {
+        graphDraft: false,
+        validation: true,
+        preview: true,
+      },
+    })
     await expect(fs.stat(path.join(directory, "workflows", "active", "note.md"))).resolves.toBeTruthy()
     await expect(fs.stat(path.join(directory, "workflows", "active", "preview.json"))).rejects.toThrow()
     await expect(fs.stat(path.join(directory, "workflows", "active", "preview_graph"))).rejects.toThrow()
@@ -1993,6 +2001,26 @@ describe("ProjectWorkflow", () => {
     })
 
     expect(updated.stage).toBe("笔记已生成")
+    expect(updated.message).toContain("已失效并清理：图操作草案、校验结果、图谱预览")
+    expect(updated.data).toMatchObject({
+      graphOperationArtifactsInvalidated: true,
+      invalidatedArtifacts: expect.arrayContaining([
+        "operation_notes.md",
+        "operations.draft.json",
+        "operations.json",
+        "validation.json",
+        "preview.json",
+        "preview_graph",
+      ]),
+      invalidatedArtifactKinds: {
+        noteReview: false,
+        graphDraft: true,
+        validation: true,
+        preview: true,
+        submissionPreparation: false,
+      },
+    })
+    expect(updated.data?.nextAction).toContain("仅在用户明确要求后")
     await expect(fs.stat(path.join(activeDir, "note.md"))).resolves.toBeTruthy()
     await expect(fs.stat(path.join(activeDir, "note_review.json"))).rejects.toThrow()
     await expect(fs.stat(path.join(activeDir, "changelog_entry.txt"))).rejects.toThrow()
@@ -2028,6 +2056,52 @@ describe("ProjectWorkflow", () => {
     await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
     await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
     await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+  })
+
+  test("updating a note without graph artifacts does not claim a preview was invalidated", async () => {
+    await action("开始或恢复")
+
+    const updated = await action("更新工作笔记", {
+      content: "只有工作笔记，尚未生成图操作。",
+      summary: "首次写入工作笔记。",
+      source: "manual_edit",
+    })
+
+    expect(updated.data).toMatchObject({
+      graphOperationArtifactsInvalidated: false,
+      invalidatedArtifacts: [],
+      nextAction: "以最新工作笔记作为后续工作的依据。",
+    })
+    expect(updated.message).toBe("已同步工作笔记变更。")
+  })
+
+  test("updating a note with validation but no preview reports only the artifacts that existed", async () => {
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: "初版工作笔记。",
+      summary: "写入初版工作笔记。",
+      source: "manual_edit",
+    })
+    const activeDir = path.join(directory, "workflows", "active")
+    await fs.writeFile(path.join(activeDir, "validation.json"), "{}\n", "utf8")
+
+    const updated = await action("更新工作笔记", {
+      content: "修订后的工作笔记。",
+      summary: "修订工作笔记。",
+      source: "manual_edit",
+    })
+
+    expect(updated.data).toMatchObject({
+      graphOperationArtifactsInvalidated: true,
+      invalidatedArtifacts: ["validation.json"],
+      invalidatedArtifactKinds: {
+        graphDraft: false,
+        validation: true,
+        preview: false,
+      },
+    })
+    expect(updated.message).toContain("已失效并清理：校验结果")
+    expect(updated.message).not.toContain("图谱预览")
   })
 
   test("blocks unsafe actions but allows flexible non-destructive actions", async () => {
