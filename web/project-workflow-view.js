@@ -536,8 +536,16 @@ export function renderWorkflowToolPart(part, message = null, options = {}) {
   return `<div class="message-tool">${esc(title)} · ${esc(status)}</div>`
 }
 
+export function archivedNoteProgressLabel(resource) {
+  const progressIndex = Number(resource?.progressIndex)
+  if (!Number.isInteger(progressIndex) || progressIndex <= 0) return '未关联推进'
+  const changeId = String(resource?.changeId || '').trim()
+  return changeId ? `第 ${progressIndex} 次推进 · ${changeId}` : `第 ${progressIndex} 次推进`
+}
+
 export function renderResourceItem(resource, selectedResourcePath, metaText, options = {}) {
   const showDelete = options.showDelete !== false
+  const detailText = String(options.detailText || '').trim()
   return `
     <div class="resource-item ${resource.path === selectedResourcePath ? 'active' : ''}" role="button" tabindex="0" data-path="${esc(resource.path)}">
       <span class="resource-row">
@@ -545,6 +553,7 @@ export function renderResourceItem(resource, selectedResourcePath, metaText, opt
         ${showDelete ? `<button type="button" class="resource-delete" data-path="${esc(resource.path)}" title="删除资源">删除</button>` : ''}
       </span>
       <span class="resource-meta">${esc(metaText)}</span>
+      ${detailText ? `<span class="resource-meta">${esc(detailText)}</span>` : ''}
     </div>
   `
 }

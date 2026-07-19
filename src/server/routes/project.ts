@@ -126,7 +126,22 @@ const SourceResource = z.object({
   mimeType: z.string().optional(),
   uploadedAt: z.string().optional(),
   previewable: z.boolean().default(false),
+  changeId: z.string().optional(),
+  progressIndex: z.number().int().positive().optional(),
+  workTimestamp: z.string().optional(),
+  appliedAt: z.string().optional(),
 })
+
+const ArchivedWorkflowApplyResult = z.object({
+  appliedAt: z.string(),
+  change_id: z.string(),
+  success: z.boolean(),
+  notePath: z.string().optional(),
+}).passthrough()
+
+const ArchivedWorkflowOperations = z.object({
+  timestamp: z.string().optional(),
+}).passthrough()
 
 const SourceResourceRegistry = z.object({
   resources: z.array(SourceResource).default([]),
@@ -603,27 +618,108 @@ function resolveNotePath(project: string, relativePath = "") {
   }
 }
 
+function normalizeArchivedNotePath(notePath: string | undefined) {
+  if (!notePath) return undefined
+  const normalized = path.posix.normalize(notePath.replaceAll("\\", "/").replace(/^\.\//u, ""))
+  if (!normalized.startsWith("notes/") || normalized.includes("../")) return undefined
+  return normalized
+}
+
+async function readArchivedJson<T extends z.ZodTypeAny>(filePath: string, schema: T): Promise<z.infer<T> | undefined> {
+  try {
+    return schema.parse(JSON.parse(await fs.readFile(filePath, "utf8")))
+  } catch {
+    return undefined
+  }
+}
+
+async function archivedNoteProgress(directory: string, visibleNotePaths: Set<string>) {
+  const appliedRoot = path.join(directory, "workflows", "applied")
+  const entries = await fs.readdir(appliedRoot, { withFileTypes: true }).catch(() => [] as Dirent[])
+  const records = (await Promise.all(entries.map(async (entry) => {
+    if (!entry.isDirectory()) return undefined
+    const archiveDirectory = path.join(appliedRoot, entry.name)
+    const applyResult = await readArchivedJson(path.join(archiveDirectory, "apply_result.json"), ArchivedWorkflowApplyResult)
+    if (!applyResult?.success) return undefined
+    const operations = await readArchivedJson(path.join(archiveDirectory, "operations.json"), ArchivedWorkflowOperations)
+    return {
+      archiveName: entry.name,
+      appliedAt: applyResult.appliedAt,
+      changeId: applyResult.change_id,
+      notePath: normalizeArchivedNotePath(applyResult.notePath),
+      workTimestamp: operations?.timestamp,
+    }
+  }))).filter((record): record is NonNullable<typeof record> => !!record)
+
+  records.sort((a, b) => a.appliedAt.localeCompare(b.appliedAt) || a.archiveName.localeCompare(b.archiveName))
+  const latestByNotePath = new Map<string, {
+    firstAppliedAt: string
+    firstArchiveName: string
+    changeId: string
+    workTimestamp?: string
+    appliedAt: string
+  }>()
+  records.forEach((record) => {
+    if (!record.notePath || !visibleNotePaths.has(record.notePath)) return
+    const previous = latestByNotePath.get(record.notePath)
+    latestByNotePath.set(record.notePath, {
+      firstAppliedAt: previous?.firstAppliedAt ?? record.appliedAt,
+      firstArchiveName: previous?.firstArchiveName ?? record.archiveName,
+      changeId: record.changeId,
+      workTimestamp: record.workTimestamp,
+      appliedAt: record.appliedAt,
+    })
+  })
+  const byNotePath = new Map<string, {
+    changeId: string
+    progressIndex: number
+    workTimestamp?: string
+    appliedAt: string
+  }>()
+  Array.from(latestByNotePath.entries())
+    .sort(([, a], [, b]) => a.firstAppliedAt.localeCompare(b.firstAppliedAt) || a.firstArchiveName.localeCompare(b.firstArchiveName))
+    .forEach(([notePath, record], index) => {
+      byNotePath.set(notePath, {
+        changeId: record.changeId,
+        progressIndex: index + 1,
+        workTimestamp: record.workTimestamp,
+        appliedAt: record.appliedAt,
+      })
+    })
+  return byNotePath
+}
+
 async function listProjectNotes(project: string) {
   const { directory, notesRoot } = resolveNotePath(project)
   await ensureExistingProject(directory)
   const entries = await fs.readdir(notesRoot, { withFileTypes: true }).catch(() => [] as Dirent[])
+  const noteEntries = entries.filter((entry) => entry.isFile() && entry.name !== ".DS_Store")
+  const visibleNotePaths = new Set(noteEntries.map((entry) => `notes/${entry.name}`))
+  const progressByPath = noteEntries.length ? await archivedNoteProgress(directory, visibleNotePaths) : new Map()
   const notes: z.infer<typeof SourceResource>[] = []
-  for (const entry of entries) {
-    if (!entry.isFile() || entry.name === ".DS_Store") continue
+  for (const entry of noteEntries) {
     const full = path.join(notesRoot, entry.name)
     const stats = await fs.stat(full)
+    const notePath = `notes/${entry.name}`
+    const progress = progressByPath.get(notePath)
     notes.push(SourceResource.parse({
       id: `note:${entry.name}`,
       name: entry.name,
       originalName: entry.name,
-      path: `notes/${entry.name}`,
+      path: notePath,
       size: stats.size,
       mimeType: contentTypeForPath(full),
       uploadedAt: stats.mtime.toISOString(),
       previewable: isPreviewableSourcePath(full),
+      ...progress,
     }))
   }
-  notes.sort((a, b) => (b.uploadedAt || "").localeCompare(a.uploadedAt || "") || a.name.localeCompare(b.name))
+  notes.sort((a, b) => {
+    if (a.progressIndex && b.progressIndex) return b.progressIndex - a.progressIndex || a.name.localeCompare(b.name)
+    if (a.progressIndex) return -1
+    if (b.progressIndex) return 1
+    return (b.uploadedAt || "").localeCompare(a.uploadedAt || "") || a.name.localeCompare(b.name)
+  })
   return notes
 }
 

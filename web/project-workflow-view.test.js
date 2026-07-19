@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   allWorkflowDiffRecords,
+  archivedNoteProgressLabel,
   canShowWorkflowGraphPreview,
   effectiveWorkflowWarmupStatus,
   editToolRecords,
@@ -595,6 +596,25 @@ describe("project workflow view helpers", () => {
 
     expect(html).toContain('data-path="notes/past.md"')
     expect(html).not.toContain('resource-delete')
+  })
+
+  test("labels archived notes with their workflow progression", () => {
+    expect(archivedNoteProgressLabel({
+      progressIndex: 3,
+      changeId: "step2_delivery_review",
+    })).toBe("第 3 次推进 · step2_delivery_review")
+    expect(archivedNoteProgressLabel({})).toBe("未关联推进")
+
+    const html = renderResourceItem({
+      path: "notes/review.md",
+      originalName: "review.md",
+      name: "review.md",
+    }, "", "第 3 次推进 · step2_delivery_review", {
+      showDelete: false,
+      detailText: "2026-07-20T10:00:00+08:00 · 42 B / 可预览",
+    })
+    expect(html).toContain("第 3 次推进 · step2_delivery_review")
+    expect(html).toContain("2026-07-20T10:00:00+08:00 · 42 B / 可预览")
   })
 
   test("builds permission URLs with project directory so replies hit the correct instance", () => {

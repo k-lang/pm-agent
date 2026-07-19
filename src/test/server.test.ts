@@ -1567,6 +1567,70 @@ describe("server routes", () => {
     }
   })
 
+  test("GET /project/notes associates notes with successful progressions and sorts by progression", async () => {
+    await using tmp = await tmpdir()
+    const originalCwd = process.cwd()
+    process.chdir(tmp.path)
+    try {
+      const app = Server.createApp({})
+      const projectDir = path.join(tmp.path, "project_graph_data", "demo")
+      const notesDir = path.join(projectDir, "notes")
+      const appliedDir = path.join(projectDir, "workflows", "applied")
+      await fs.mkdir(notesDir, { recursive: true })
+      await fs.writeFile(path.join(projectDir, "README.md"), "# demo\n", "utf8")
+      await fs.writeFile(path.join(notesDir, "first.md"), "# First\n", "utf8")
+      await fs.writeFile(path.join(notesDir, "second.md"), "# Second\n", "utf8")
+      await fs.writeFile(path.join(notesDir, "legacy.md"), "# Legacy\n", "utf8")
+
+      const writeArchive = async (name: string, appliedAt: string, notePath: string, workTimestamp: string) => {
+        const archiveDir = path.join(appliedDir, name)
+        await fs.mkdir(archiveDir, { recursive: true })
+        await fs.writeFile(path.join(archiveDir, "apply_result.json"), JSON.stringify({
+          appliedAt,
+          change_id: name,
+          success: true,
+          notePath,
+        }), "utf8")
+        await fs.writeFile(path.join(archiveDir, "operations.json"), JSON.stringify({
+          timestamp: workTimestamp,
+        }), "utf8")
+      }
+      await writeArchive("step0_first", "2026-07-01T10:00:00.000Z", "notes/first.md", "2026-06-30")
+      await writeArchive("step_missing", "2026-07-02T10:00:00.000Z", "notes/missing.md", "2026-07-01")
+      await writeArchive("step1_second", "2026-07-03T10:00:00.000Z", "notes/second.md", "2026-07-02")
+      await writeArchive("step0_first_fix1", "2026-07-04T10:00:00.000Z", "notes/first.md", "2026-07-03")
+
+      // File times deliberately disagree with progression order.
+      await fs.utimes(path.join(notesDir, "first.md"), new Date("2026-07-20"), new Date("2026-07-20"))
+      await fs.utimes(path.join(notesDir, "second.md"), new Date("2026-07-10"), new Date("2026-07-10"))
+      await fs.utimes(path.join(notesDir, "legacy.md"), new Date("2026-07-30"), new Date("2026-07-30"))
+
+      const response = await app.fetch(new Request("http://localhost/project/notes?project=demo"))
+      expect(response.status).toBe(200)
+      const notes = await response.json()
+      expect(notes.map((item: { path: string }) => item.path)).toEqual([
+        "notes/second.md",
+        "notes/first.md",
+        "notes/legacy.md",
+      ])
+      expect(notes[0]).toMatchObject({
+        changeId: "step1_second",
+        progressIndex: 2,
+        workTimestamp: "2026-07-02",
+        appliedAt: "2026-07-03T10:00:00.000Z",
+      })
+      expect(notes[1]).toMatchObject({
+        changeId: "step0_first_fix1",
+        progressIndex: 1,
+        workTimestamp: "2026-07-03",
+        appliedAt: "2026-07-04T10:00:00.000Z",
+      })
+      expect(notes[2].progressIndex).toBeUndefined()
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
   test("GET /project/source previews html and image resources", async () => {
     await using tmp = await tmpdir()
     const originalCwd = process.cwd()

@@ -1,5 +1,6 @@
 import {
   allWorkflowDiffRecords as collectWorkflowDiffRecords,
+  archivedNoteProgressLabel,
   canShowWorkflowGraphPreview,
   effectiveWorkflowWarmupStatus,
   esc,
@@ -1623,9 +1624,17 @@ function renderResources() {
     resourceList.innerHTML = `<div class="placeholder">${esc(emptyList)}</div>`
     return
   }
-  resourceList.innerHTML = visibleResources.map((resource) => `
-    ${renderResourceItem(resource, selectedResourcePath, `${formatBytes(resource.size)}${resource.previewable ? ' / 可预览' : ' / 附件'}`, { showDelete: resourceMode === 'source' })}
-  `).join('')
+  resourceList.innerHTML = visibleResources.map((resource) => {
+    const fileMeta = `${formatBytes(resource.size)}${resource.previewable ? ' / 可预览' : ' / 附件'}`
+    if (resourceMode === 'notes') {
+      const detailText = resource.workTimestamp ? `${resource.workTimestamp} · ${fileMeta}` : fileMeta
+      return renderResourceItem(resource, selectedResourcePath, archivedNoteProgressLabel(resource), {
+        showDelete: false,
+        detailText,
+      })
+    }
+    return renderResourceItem(resource, selectedResourcePath, fileMeta)
+  }).join('')
   for (const item of Array.from(resourceList.querySelectorAll('.resource-item'))) {
     item.onclick = () => previewResource(item.dataset.path)
     item.onkeydown = (event) => {
