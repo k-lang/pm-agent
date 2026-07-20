@@ -22,6 +22,7 @@ import {
   workflowCorrectionKind,
   workflowLoadBlocksInteraction,
   workflowMessageErrorText,
+  workflowModePresentation,
   workflowOperationArtifactsChanged,
   workflowRuntimeIsRunning,
   workflowTerminalActionsBlocked,
@@ -1726,9 +1727,11 @@ function renderWorkspace() {
   const ready = !!project.graphInitialized
   const hasDraftPreviewGraph = !!workflowPreviewGraph()
   const state = currentWorkflowState()
+  const mode = state ? workflowModePresentation(state) : null
   workspaceSubtitle.textContent = `${project.name} / ${project.directory}`
   projectStatus.innerHTML = `
     <span class="badge ${ready ? 'ready' : 'pending'}">${ready ? '图数据已初始化' : '等待第一次图提交'}</span>
+    ${mode ? `<span class="badge workflow-mode ${esc(mode.className)}" title="${esc(mode.title)}">${esc(mode.label)}</span>` : ''}
     ${state ? `<span class="badge workflow-stage">${esc(state.stage)}</span>` : ''}
   `
   btnDetail.disabled = !ready
@@ -2065,7 +2068,8 @@ async function applyWorkflowFromButton() {
     return
   }
   const state = currentWorkflowState()
-  const ok = confirm(`确认提交项目「${project.name}」的本轮图操作吗？\n\n当前阶段：${state.stage}\n\n提交后将进入正式图数据写入流程。`)
+  const mode = workflowModePresentation(state)
+  const ok = confirm(`确认提交项目「${project.name}」的本轮图操作吗？\n\n当前模式：${mode.label}\n当前阶段：${state.stage}\n\n提交后将进入正式图数据写入流程。`)
   if (!ok) return
   setTerminalActionPending(true)
   try {

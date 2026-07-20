@@ -322,6 +322,18 @@ body.workflow-maximized-chat #chat-panel {
   background: #172554;
   color: #bfdbfe;
 }
+.badge.workflow-mode-regular {
+  background: #27272a;
+  color: #e4e4e7;
+}
+.badge.workflow-mode-soft {
+  background: #164e63;
+  color: #a5f3fc;
+}
+.badge.workflow-mode-hard {
+  background: #7c2d12;
+  color: #fde68a;
+}
 .preview-content,
 .side-list,
 #chat-log {

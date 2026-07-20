@@ -30,6 +30,7 @@ import {
   workflowCorrectionKind,
   workflowLoadBlocksInteraction,
   workflowMessageErrorText,
+  workflowModePresentation,
   workflowOperationArtifactsChanged,
   workflowRuntimeIsRunning,
   workflowTerminalActionsBlocked,
@@ -224,6 +225,32 @@ describe("project workflow correction semantics", () => {
       correction: { expectedChangeId: "correction1_" },
       hardCorrection: { expectedChangeId: "correction1_demo_fix1" },
     })).toBe("hard")
+  })
+
+  test("presents all active modes using user-facing workflow language", () => {
+    expect(workflowModePresentation({})).toMatchObject({
+      kind: "regular",
+      label: "新一轮推进",
+      className: "workflow-mode-regular",
+    })
+    expect(workflowModePresentation({ correction: { expectedChangeId: "correction1_" } })).toMatchObject({
+      kind: "soft",
+      label: "追加历史更正",
+      className: "workflow-mode-soft",
+    })
+    expect(workflowModePresentation({ hardCorrection: { expectedChangeId: "step0_demo_fix1" } })).toMatchObject({
+      kind: "hard-regular",
+      label: "重做最近推进",
+      className: "workflow-mode-hard",
+    })
+    expect(workflowModePresentation({
+      correction: { expectedChangeId: "correction1_" },
+      hardCorrection: { expectedChangeId: "correction1_demo_fix1" },
+    })).toMatchObject({
+      kind: "hard-soft",
+      label: "重做最近更正",
+      className: "workflow-mode-hard",
+    })
   })
 })
 

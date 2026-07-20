@@ -92,6 +92,39 @@ export function workflowCorrectionKind(state) {
   return ''
 }
 
+export function workflowModePresentation(state) {
+  if (state?.hardCorrection && state?.correction) {
+    return {
+      kind: 'hard-soft',
+      label: '重做最近更正',
+      title: '正在重做最近一次追加历史更正；提交后将替换该次更正。',
+      className: 'workflow-mode-hard',
+    }
+  }
+  if (state?.hardCorrection) {
+    return {
+      kind: 'hard-regular',
+      label: '重做最近推进',
+      title: '正在重做最近一次工作推进；提交后将替换该次推进。',
+      className: 'workflow-mode-hard',
+    }
+  }
+  if (state?.correction) {
+    return {
+      kind: 'soft',
+      label: '追加历史更正',
+      title: '将保留既有提交，并追加一条新的历史更正记录。',
+      className: 'workflow-mode-soft',
+    }
+  }
+  return {
+    kind: 'regular',
+    label: '新一轮推进',
+    title: '当前工作将作为新一轮项目推进提交。',
+    className: 'workflow-mode-regular',
+  }
+}
+
 export function shouldDiscardWorkflowFromRestoreChoice(choice) {
   return choice === 'discard'
 }
