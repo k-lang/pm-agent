@@ -26,6 +26,7 @@ import {
   writeToolRecords,
   workflowMaximizeBodyClass,
   workflowMaximizeButtonState,
+  workflowApplyButtonState,
   workflowChatLockReason,
   workflowCorrectionKind,
   workflowLoadBlocksInteraction,
@@ -135,6 +136,28 @@ describe("project workflow chat readiness", () => {
       runtimeRunning: true,
       persistedWarmupStatus: "completed",
     })).toBe(true)
+  })
+
+  test("enables graph apply only when the backend exposes the apply action", () => {
+    expect(workflowApplyButtonState({
+      hasProject: true,
+      available: false,
+      blockedReason: "工作笔记更新后需要复核并确认沿用。",
+      stage: "图操作待复核",
+    })).toEqual({
+      disabled: true,
+      title: "工作笔记更新后需要复核并确认沿用。",
+      pending: false,
+    })
+    expect(workflowApplyButtonState({
+      hasProject: true,
+      available: true,
+      stage: "图操作已生成",
+    })).toEqual({
+      disabled: false,
+      title: "当前阶段：图操作已生成",
+      pending: true,
+    })
   })
 
   test("keeps the optimistic reply lock through startup but releases it after authoritative idle", () => {

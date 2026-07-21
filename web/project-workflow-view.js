@@ -68,6 +68,25 @@ export function workflowTerminalActionsBlocked({ runtimeRunning = false, persist
   return runtimeRunning || persistedWarmupStatus === 'running'
 }
 
+export function workflowApplyButtonState({
+  hasProject = false,
+  terminalActionsBlocked = false,
+  warmupRecoveryRequired = false,
+  available = false,
+  blockedReason = '',
+  stage = '',
+}) {
+  const disabled = !hasProject || terminalActionsBlocked || !available
+  const title = warmupRecoveryRequired
+    ? '项目上下文预热已中断，请先重新预热再提交。'
+    : terminalActionsBlocked
+      ? '大模型、预热或工具审批仍在处理，暂不能提交。'
+      : !available
+        ? blockedReason || (stage ? `当前阶段：${stage}` : '当前没有 active 工作推进草案')
+        : stage ? `当前阶段：${stage}` : '图操作可以提交'
+  return { disabled, title, pending: available }
+}
+
 export function shouldClearWorkflowAwaitingReply({
   chatSending = false,
   sessionStatuses = [],

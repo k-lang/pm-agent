@@ -619,7 +619,7 @@ describe("server routes", () => {
     expect(body.detail?.questions.some((item: { id: string }) => item.id === body.question.id)).toBe(true)
   })
 
-  test("POST /project/workflow/note/import stores manual note and invalidates stale workflow artifacts", async () => {
+  test("POST /project/workflow/note/import preserves complete operations and requests read-only review", async () => {
     await using tmp = await tmpdir()
     const originalCwd = process.cwd()
     process.chdir(tmp.path)
@@ -660,11 +660,25 @@ describe("server routes", () => {
         warmupStatus: "completed",
       })
       await fs.writeFile(path.join(activeDir, "operation_notes.md"), "operation notes\n", "utf8")
-      await fs.writeFile(path.join(activeDir, "operations.draft.json"), "{}\n", "utf8")
-      await fs.writeFile(path.join(activeDir, "operations.json"), "{}\n", "utf8")
-      await fs.writeFile(path.join(activeDir, "validation.json"), "{}\n", "utf8")
-      await fs.writeFile(path.join(activeDir, "preview.json"), "{}\n", "utf8")
-      await fs.mkdir(path.join(activeDir, "preview_graph"), { recursive: true })
+      await fs.writeFile(path.join(activeDir, "operations.draft.json"), JSON.stringify({
+        change_id: "step0_note_review",
+        timestamp: "2026-07-21T10:00:00+08:00",
+        note_filename: "note_review.md",
+        changelog_entry: "[2026-07-21 10:00] step0_note_review: 建立工作笔记复核测试，图数据无须变更。",
+        items: [],
+      }, null, 2) + "\n", "utf8")
+      const generated = await ProjectWorkflowExecution.runAction({
+        project: "demo",
+        directory: projectDir,
+        action: "生成图操作草案",
+        payload: {
+          summary: "生成用于笔记复核测试的图操作。",
+          change_id: "step0_note_review",
+          artifacts: { operationNotes: true, operationsDraft: true },
+        },
+      })
+      expect(generated.stage).toBe("图操作已生成")
+      const retainedBefore = await fs.readFile(path.join(activeDir, "operations.json"), "utf8")
 
       const second = await app.fetch(new Request("http://localhost/project/workflow/note/import?project=demo", {
         method: "POST",
@@ -673,12 +687,19 @@ describe("server routes", () => {
       }))
       expect(second.status).toBe(200)
       const secondBody = await second.json()
-      expect(secondBody).toMatchObject({ exists: true, content: "second note\n" })
+      expect(secondBody).toMatchObject({
+        exists: true,
+        content: "second note\n",
+        workflow: {
+          stage: "图操作待复核",
+          data: { operationReviewRequired: true },
+        },
+      })
       await expect(fs.readFile(path.join(activeDir, "note.md"), "utf8")).resolves.toBe("second note\n")
-      await expect(fs.stat(path.join(activeDir, "operations.draft.json"))).rejects.toThrow()
-      await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
-      await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
-      await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+      await expect(fs.readFile(path.join(activeDir, "operations.json"), "utf8")).resolves.toBe(retainedBefore)
+      await expect(fs.stat(path.join(activeDir, "operations.draft.json"))).resolves.toBeTruthy()
+      await expect(fs.stat(path.join(activeDir, "validation.json"))).resolves.toBeTruthy()
+      await expect(fs.stat(path.join(activeDir, "preview.json"))).resolves.toBeTruthy()
       const messages = await Instance.provide({
         directory: projectDir,
         fn: () => Session.messages({ sessionID: session.id }),
@@ -686,7 +707,10 @@ describe("server routes", () => {
       const contextPart = messages.flatMap((message) => message.parts).find((part) =>
         part.type === "text" && part.metadata?.workflowContextEvent === "manual_note_updated")
       expect(contextPart).toMatchObject({ type: "text", synthetic: true })
-      expect(contextPart && "text" in contextPart ? contextPart.text : "").toContain("已失效并清理：图操作草案、校验结果、图谱预览")
+      const contextText = contextPart && "text" in contextPart ? contextPart.text : ""
+      expect(contextText).toContain("现有图操作、校验和预览已保留")
+      expect(contextText).toContain("只读检查")
+      expect(contextText).toContain("禁止直接修改图操作")
     } finally {
       process.chdir(originalCwd)
     }
@@ -1188,6 +1212,32 @@ describe("server routes", () => {
       })
     } finally {
       process.chdir(originalCwd)
+    }
+  })
+
+  test("POST /project/workflow/action rejects chat-only operation review actions", async () => {
+    const app = Server.createApp({})
+
+    for (const input of [
+      { action: "登记图操作复核", payload: { verdict: "consistent", issueCount: 0, summary: "伪造复核。" } },
+      {
+        action: "确认沿用现有图操作",
+        payload: {
+          confirm: true,
+          sessionID: "ses_forged",
+          userMessageID: "msg_forged",
+          userMessageCreatedAt: Date.now() + 60_000,
+        },
+      },
+    ]) {
+      const response = await app.fetch(new Request("http://localhost/project/workflow/action?project=demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      }))
+
+      expect(response.status).toBe(400)
+      expect(await response.text()).toContain("只能由工作推进聊天执行")
     }
   })
 

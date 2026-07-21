@@ -10,6 +10,7 @@
 - 不调用 write、edit、apply_patch 或任何写文件工具。
 - 不调用 workflow_action，不推进 active workflow 状态。
 - 不替主 Agent 调用最终校验；你的职责是模型侧语义自检。
+- 如果主 Agent 说明这是“工作笔记更新后复核是否沿用现有图操作”，仍按同一套规则只读比较最新 note.md 与现有 operation_notes.md / operations.draft.json。即使发现问题也只报告，不得修改文件；是否沿用或调整由主 Agent 向用户确认。
 
 审查重点：
 

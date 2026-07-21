@@ -732,6 +732,57 @@ describe("ProjectWorkflow", () => {
     await expect(fs.stat(path.join(directory, "workflows", "active", "preview_graph"))).rejects.toThrow()
   })
 
+  test("note-only revision feedback preserves complete operations until the note is actually updated", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await registerOperationDraft(await readStepCommand(18))
+    const activeDir = path.join(directory, "workflows", "active")
+    const operationsBefore = await fs.readFile(path.join(activeDir, "operations.json"), "utf8")
+
+    const revision = await action("提出修订意见", {
+      target: "工作笔记",
+      comment: "工作笔记需要补充一项事实，暂不判断图操作是否需要调整。",
+    })
+
+    expect(revision.stage).toBe("笔记需补充")
+    await expect(fs.readFile(path.join(activeDir, "operations.json"), "utf8")).resolves.toBe(operationsBefore)
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "preview_graph"))).resolves.toBeTruthy()
+
+    const updated = await action("更新工作笔记", {
+      content: `${await readOriginalNote("knowledge_entry_point.txt")}\n补充一项事实。\n`,
+      summary: "补充工作笔记事实。",
+    })
+    expect(updated.stage).toBe("图操作待复核")
+  })
+
+  test("combined revision feedback keeps the draft but invalidates validation and preview", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await registerOperationDraft(await readStepCommand(18))
+    const activeDir = path.join(directory, "workflows", "active")
+
+    const revision = await action("提出修订意见", {
+      target: "两者",
+      comment: "工作笔记和图操作都需要调整。",
+    })
+
+    expect(revision.stage).toBe("笔记需补充")
+    await expect(fs.stat(path.join(activeDir, "operations.draft.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "preview_graph"))).rejects.toThrow()
+  })
+
   test("regenerating operations invalidates validation and preview artifacts", async () => {
     await replayStepsBefore(18)
     await action("开始或恢复")
@@ -1974,7 +2025,7 @@ describe("ProjectWorkflow", () => {
     await expect(fs.stat(path.join(activeDir, "preview.json"))).resolves.toBeTruthy()
   })
 
-  test("updating note invalidates graph operation draft and downstream artifacts", async () => {
+  test("updating note preserves complete graph operations but requires review and explicit reuse approval", async () => {
     await replayStepsBefore(18)
     await action("开始或恢复")
     await action("更新工作笔记", {
@@ -1989,10 +2040,20 @@ describe("ProjectWorkflow", () => {
     })
 
     const activeDir = path.join(directory, "workflows", "active")
-    await expect(fs.stat(path.join(activeDir, "changelog_entry.txt"))).resolves.toBeTruthy()
-    await expect(fs.stat(path.join(activeDir, "operations.json"))).resolves.toBeTruthy()
-    await expect(fs.stat(path.join(activeDir, "validation.json"))).resolves.toBeTruthy()
-    await expect(fs.stat(path.join(activeDir, "preview.json"))).resolves.toBeTruthy()
+    const retainedFiles = [
+      "operation_notes.md",
+      "changelog_entry.txt",
+      "operations.draft.json",
+      "operations.json",
+      "operation_index.json",
+      "operation_basis.json",
+      "validation.json",
+      "preview.json",
+    ]
+    const before = Object.fromEntries(await Promise.all(retainedFiles.map(async (file) => [
+      file,
+      await fs.readFile(path.join(activeDir, file), "utf8"),
+    ]))) as Record<string, string>
 
     const updated = await action("更新工作笔记", {
       content: `${await readOriginalNote("knowledge_entry_point.txt")}\n\n补充：人工修订后需要重生成图操作。\n`,
@@ -2000,11 +2061,11 @@ describe("ProjectWorkflow", () => {
       source: "manual_edit",
     })
 
-    expect(updated.stage).toBe("笔记已生成")
-    expect(updated.message).toContain("已失效并清理：图操作草案、校验结果、图谱预览")
+    expect(updated.stage).toBe("图操作待复核")
+    expect(updated.message).toContain("现有图操作和预览已保留")
     expect(updated.data).toMatchObject({
-      graphOperationArtifactsInvalidated: true,
-      invalidatedArtifacts: expect.arrayContaining([
+      operationReviewRequired: true,
+      retainedArtifacts: expect.arrayContaining([
         "operation_notes.md",
         "operations.draft.json",
         "operations.json",
@@ -2012,24 +2073,61 @@ describe("ProjectWorkflow", () => {
         "preview.json",
         "preview_graph",
       ]),
-      invalidatedArtifactKinds: {
-        noteReview: false,
-        graphDraft: true,
-        validation: true,
-        preview: true,
-        submissionPreparation: false,
-      },
     })
-    expect(updated.data?.nextAction).toContain("仅在用户明确要求后")
+    expect(updated.data?.nextAction).toContain("只读检查")
+    expect(updated.availableActions.map((item) => item.action)).not.toContain("应用图操作")
+    expect(updated.availableActions.map((item) => item.action)).toContain("登记图操作复核")
     await expect(fs.stat(path.join(activeDir, "note.md"))).resolves.toBeTruthy()
     await expect(fs.stat(path.join(activeDir, "note_review.json"))).rejects.toThrow()
-    await expect(fs.stat(path.join(activeDir, "changelog_entry.txt"))).rejects.toThrow()
-    await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
-    await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
-    await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+    for (const [file, content] of Object.entries(before)) {
+      await expect(fs.readFile(path.join(activeDir, file), "utf8")).resolves.toBe(content)
+    }
+
+    await expect(action("应用图操作", { confirm: true })).rejects.toThrow("不能应用图操作")
+    const reviewed = await action("登记图操作复核", {
+      verdict: "issues",
+      issueCount: 1,
+      summary: "最新笔记增加了一项事实，需要用户决定是否仍沿用现有图操作。",
+    })
+    expect(reviewed.stage).toBe("图操作待复核")
+    expect(reviewed.availableActions.map((item) => item.action)).toContain("确认沿用现有图操作")
+    await ProjectWorkflow.bindSessions({
+      project: "demo",
+      directory,
+      sessionID: "ses_note_review",
+      warmupStatus: "completed",
+    })
+    await expect(action("确认沿用现有图操作", {
+      confirm: false,
+      sessionID: "ses_note_review",
+      userMessageID: "msg_reuse_rejected",
+      userMessageCreatedAt: Date.now() + 1_000,
+    })).rejects.toThrow("明确同意")
+    await expect(action("确认沿用现有图操作", {
+      confirm: true,
+      sessionID: "ses_other",
+      userMessageID: "msg_reuse_wrong_session",
+      userMessageCreatedAt: Date.now() + 1_000,
+    })).rejects.toThrow("当前工作推进聊天会话")
+    await expect(action("确认沿用现有图操作", {
+      confirm: true,
+      sessionID: "ses_note_review",
+      userMessageID: "msg_reuse_before_review",
+      userMessageCreatedAt: 0,
+    })).rejects.toThrow("复核完成后")
+
+    const approved = await action("确认沿用现有图操作", {
+      confirm: true,
+      sessionID: "ses_note_review",
+      userMessageID: "msg_reuse_approved",
+      userMessageCreatedAt: Date.now() + 1_000,
+    })
+    expect(approved.stage).toBe("图操作已生成")
+    expect(approved.availableActions.map((item) => item.action)).toContain("应用图操作")
+    await expect(fs.stat(path.join(activeDir, "operation_reuse_approval.json"))).resolves.toBeTruthy()
   })
 
-  test("syncing an externally edited note invalidates graph operation draft without rewriting note content", async () => {
+  test("syncing an externally edited note preserves complete graph operations without rewriting note content", async () => {
     await replayStepsBefore(18)
     await action("开始或恢复")
     await action("更新工作笔记", {
@@ -2049,13 +2147,145 @@ describe("ProjectWorkflow", () => {
       source: "llm_revision",
     })
 
-    expect(synced.stage).toBe("笔记已生成")
+    expect(synced.stage).toBe("图操作待复核")
+    expect(synced.data?.operationReviewRequired).toBe(true)
     await expect(fs.readFile(notePath, "utf8")).resolves.toBe(externallyEdited)
     await expect(fs.stat(path.join(activeDir, "note_review.json"))).rejects.toThrow()
-    await expect(fs.stat(path.join(activeDir, "changelog_entry.txt"))).rejects.toThrow()
-    await expect(fs.stat(path.join(activeDir, "operations.json"))).rejects.toThrow()
-    await expect(fs.stat(path.join(activeDir, "validation.json"))).rejects.toThrow()
-    await expect(fs.stat(path.join(activeDir, "preview.json"))).rejects.toThrow()
+    await expect(fs.stat(path.join(activeDir, "changelog_entry.txt"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "operations.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "validation.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(activeDir, "preview.json"))).resolves.toBeTruthy()
+  })
+
+  test("review approval is rejected when the note or operation draft changes after review", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await registerOperationDraft(await readStepCommand(18))
+    await action("更新工作笔记", {
+      content: `${await readOriginalNote("knowledge_entry_point.txt")}\n补充一项复核事实。\n`,
+      summary: "修改工作笔记后触发复核。",
+    })
+    await action("登记图操作复核", {
+      verdict: "consistent",
+      issueCount: 0,
+      summary: "现有图操作仍覆盖最新笔记。",
+    })
+    await ProjectWorkflow.bindSessions({
+      project: "demo",
+      directory,
+      sessionID: "ses_stale_review",
+      warmupStatus: "completed",
+    })
+
+    const draftPath = path.join(directory, "workflows", "active", "operations.draft.json")
+    await fs.appendFile(draftPath, "\n")
+    await expect(action("确认沿用现有图操作", {
+      confirm: true,
+      sessionID: "ses_stale_review",
+      userMessageID: "msg_stale_review",
+      userMessageCreatedAt: Date.now() + 1_000,
+    })).rejects.toThrow("复核后变化")
+    await expect(fs.stat(path.join(directory, "workflows", "active", "operation_reuse_approval.json"))).rejects.toThrow()
+  })
+
+  test("legacy active operations lazily gain a submission basis without migration", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await registerOperationDraft(await readStepCommand(18))
+    const basisPath = path.join(directory, "workflows", "active", "operation_basis.json")
+    await fs.rm(basisPath, { force: true })
+
+    const active = await ProjectWorkflowExecution.getActive({ project: "demo", directory })
+
+    expect(active.stage).toBe("图操作已生成")
+    expect(active.availableActions.map((item) => item.action)).toContain("应用图操作")
+    await expect(fs.stat(basisPath)).resolves.toBeTruthy()
+  })
+
+  test("malformed operation basis fails closed instead of being treated as legacy", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await registerOperationDraft(await readStepCommand(18))
+    const basisPath = path.join(directory, "workflows", "active", "operation_basis.json")
+    await fs.writeFile(basisPath, "{\"schemaVersion\":1}\n", "utf8")
+
+    await expect(ProjectWorkflowExecution.getActive({ project: "demo", directory })).rejects.toThrow()
+    await expect(action("应用图操作", { confirm: true })).rejects.toThrow()
+  })
+
+  test("soft correction uses the same note-update review gate", async () => {
+    await replayStepsBefore(18)
+    await action("开始软更正", { confirm: true })
+    await action("更新工作笔记", {
+      content: "修正一条既有关系的当前说明。\n",
+      summary: "软更正复核测试笔记。",
+    })
+    const [edge] = await new GraphStorage(directory).getActiveEdges()
+    expect(edge).toBeTruthy()
+    await registerCompressedDraft({
+      change_id: "correction1_review_gate",
+      timestamp: "2026-07-21T10:00:00+08:00",
+      note_filename: "correction_review_gate.md",
+      changelog_entry: "[2026-07-21 10:00] correction1_review_gate: 修正一条既有关系的当前说明。",
+      items: [{
+        kind: "update_edge",
+        edge_id: edge.id,
+        new_description: "该关系的当前说明已经与现有事实一致。",
+        reason: "原说明不够准确。",
+        history: "[correction1_review_gate] 修正该关系的当前说明。",
+      }],
+    })
+
+    const updated = await action("更新工作笔记", {
+      content: "修正一条既有关系的当前说明，并补充核验依据。\n",
+      summary: "补充软更正核验依据。",
+    })
+
+    expect(updated.stage).toBe("图操作待复核")
+    expect(updated.state?.correction).toMatchObject({ expectedChangeId: "correction1_" })
+    expect(updated.state?.hardCorrection).toBeUndefined()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview_graph"))).resolves.toBeTruthy()
+  })
+
+  test("hard correction uses the same note-update review gate after restored artifacts are rebuilt", async () => {
+    await replayStepsBefore(18)
+    await action("开始或恢复")
+    await action("更新工作笔记", {
+      content: await readOriginalNote("knowledge_entry_point.txt"),
+      summary: "使用 step18 对应原始工作笔记。",
+    })
+    await registerOperationDraft(await readStepCommand(18), "登记 step18 图操作和 changelog 草稿。", {
+      changelogEntry: step18ChangelogEntry,
+      noteFilename: "knowledge_entry_point.md",
+    })
+    await action("应用图操作", { confirm: true })
+    const restored = await action("重做最近提交", { confirm: true })
+    expect(restored.stage).toBe("图操作已生成")
+
+    const updated = await action("更新工作笔记", {
+      content: `${await readOriginalNote("knowledge_entry_point.txt")}\n补充硬更正核验事实。\n`,
+      summary: "补充硬更正核验事实。",
+    })
+
+    expect(updated.stage).toBe("图操作待复核")
+    expect(updated.state?.hardCorrection).toMatchObject({
+      ofChangeId: "step18_knowledge_scheme",
+      expectedChangeId: "step18_knowledge_scheme_fix1",
+    })
+    await expect(fs.stat(path.join(directory, "workflows", "active", "operation_basis.json"))).resolves.toBeTruthy()
+    await expect(fs.stat(path.join(directory, "workflows", "active", "preview_graph"))).resolves.toBeTruthy()
   })
 
   test("updating a note without graph artifacts does not claim a preview was invalidated", async () => {
@@ -3330,6 +3560,7 @@ describe("ProjectWorkflow", () => {
       missing_node_for_apply_failure: "测试 apply 失败后的图数据回滚。",
     }
     await fs.writeFile(path.join(activeDir, "operations.json"), JSON.stringify(brokenCommand, null, 2) + "\n", "utf8")
+    await fs.rm(path.join(activeDir, "operation_basis.json"), { force: true })
 
     await expect(action("应用图操作", { confirm: true })).rejects.toThrow("节点 'missing_node_for_apply_failure' 在storage中不存在")
 

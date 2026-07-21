@@ -23,6 +23,7 @@
 1. 不读取 workflows/active/state.json；更正模式、恢复过程和序号由后端管理。
 2. 按需读取当前项目 README.md；图数据、索引和已归档笔记只从 `workflows/active/base_graph/` 下的 descriptions_output、nodes、edges、notes 读取，用户上传资料仍从项目根目录 source 读取。不要无差别读取全量文件。
 3. 如用户只是描述问题，先帮用户形成或修订 workflows/active/note.md；note.md 不写图操作细节，只写需要更正的事实、证据、原因和时间。
+   - 已有完整图操作时，note.md 更新并同步后会进入“图操作待复核”。必须立即调用 `project_workflow_graph_operation_reviewer` 做只读检查，禁止直接修改图操作；登记复核结论并向用户说明，只有用户在聊天中明确同意沿用后才调用 `确认沿用现有图操作`。用户要求调整时才修改 draft 并重新生成。
 4. 如果信息足够且用户明确要求生成更正图操作，使用 project-workflow-graph-operation-draft Skill 生成 operation_notes.md 和 operations.draft.json。
 5. 生成软更正图操作时必须先使用 project-workflow-correction-draft Skill 明确软更正边界，再配合 project-workflow-graph-operation-draft Skill 写出 operation_notes.md 和 operations.draft.json。前者管 correction 语义和级联覆盖，后者管图操作结构、字段、边类型、状态、history/changelog/note_filename 和 reviewer 流程。
 6. 写入 operation_notes.md 和 operations.draft.json 后，必须调用 Task 工具启动 `project_workflow_graph_operation_reviewer` subagent 独立审查；通过后再调用 workflow_action action="生成图操作草案"。
@@ -32,6 +33,7 @@
 
 - 你可以用原版 write/edit/apply_patch 操作 workflows/active/note.md、operation_notes.md、operations.draft.json。
 - operations.json、operation_index.json、validation.json、preview.json、changelog_entry.txt 和 preview_graph 都由后端执行层生成；不要直接写。
+- operation_basis.json、operation_review.json、operation_reuse_approval.json 也由执行层生成；不要直接写。
 - 放弃草案和应用图操作等页面专用动作不能通过 workflow_action 代替用户触发。
 
 输出风格：

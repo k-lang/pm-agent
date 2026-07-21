@@ -20,6 +20,7 @@ import {
   workflowMaximizeButtonState,
   workflowChatLockReason,
   workflowCorrectionKind,
+  workflowApplyButtonState,
   workflowLoadBlocksInteraction,
   workflowMessageErrorText,
   workflowModePresentation,
@@ -78,6 +79,7 @@ const btnImportNoteFile = document.getElementById('btn-import-note-file')
 const btnPasteNote = document.getElementById('btn-paste-note')
 const noteFile = document.getElementById('note-file')
 const btnApply = document.getElementById('btn-apply')
+const operationReviewWarning = document.getElementById('operation-review-warning')
 const btnHardCorrection = document.getElementById('btn-hard-correction')
 const btnSoftCorrection = document.getElementById('btn-soft-correction')
 const btnDiscardWorkflow = document.getElementById('btn-discard-workflow')
@@ -1226,13 +1228,28 @@ function updateTerminalActionButtons() {
     btnDiscardWorkflow.title = state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
   }
   if (btnApply) {
-    btnApply.disabled = !hasProject || terminalActionsBlocked
-    btnApply.classList.toggle('pending-action', !!workflowActionEntry('应用图操作').available)
-    btnApply.title = warmupRecoveryRequired
-      ? '项目上下文预热已中断，请先重新预热再提交。'
-      : terminalActionsBlocked
-        ? '大模型、预热或工具审批仍在处理，暂不能提交。'
-      : state ? `当前阶段：${state.stage}` : '当前没有 active 工作推进草案'
+    const applyEntry = workflowActionEntry('应用图操作')
+    const buttonState = workflowApplyButtonState({
+      hasProject,
+      terminalActionsBlocked,
+      warmupRecoveryRequired,
+      available: !!applyEntry.available,
+      blockedReason: applyEntry.blocked?.reason || '',
+      stage: state?.stage || '',
+    })
+    btnApply.disabled = buttonState.disabled
+    btnApply.classList.toggle('pending-action', buttonState.pending)
+    btnApply.title = buttonState.title
+  }
+  if (operationReviewWarning) {
+    const reviewPending = state?.stage === '图操作待复核'
+    const reviewed = !!workflowActionEntry('确认沿用现有图操作').available
+    operationReviewWarning.classList.toggle('hidden', !reviewPending)
+    operationReviewWarning.textContent = reviewPending
+      ? reviewed
+        ? '现有图操作已按最新工作笔记复核。请在聊天中明确选择沿用或调整；确认沿用后才可提交。'
+        : '工作笔记已更新，现有图操作和预览已保留，正在等待只读复核；复核完成并经你确认前不能提交。'
+      : ''
   }
   const correctionDisabled = !hasProject || terminalActionsBlocked
   if (btnHardCorrection) {
@@ -1705,7 +1722,7 @@ function renderNotes() {
       <span>${esc(workflowNote.path || 'workflows/active/note.md')}</span>
       <span>当前阶段：${esc(state?.stage || '未知')}</span>
       <span>可人工替换，也可在对话中让 AI 基于这份笔记继续修改。</span>
-      <span>更新笔记会清空旧图操作、校验和预览。</span>
+      <span>更新笔记后，完整图操作和预览会保留并重新复核，不完整产物会被清理。</span>
     </div>
   `
 }
@@ -1840,7 +1857,7 @@ async function refreshAfterNoteImport() {
 }
 
 function confirmNoteReplacement() {
-  return confirm('保存后会替换当前工作笔记，并清空旧图操作、校验和预览。之后仍可让 AI 继续修改这份笔记。是否继续？')
+  return confirm('保存后会替换当前工作笔记。已有完整图操作和预览将保留并重新复核，不完整产物会被清理。是否继续？')
 }
 
 async function importNoteFile(file) {

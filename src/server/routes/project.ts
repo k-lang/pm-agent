@@ -756,7 +756,7 @@ async function readNoteImageResource(project: string, relativePath: string, requ
 async function readWorkflowNote(project: string) {
   const directory = projectDirectoryForName(project)
   await ensureExistingProject(directory)
-  const workflow = await ProjectWorkflow.getActive({ project, directory })
+  const workflow = await ProjectWorkflowExecution.getActive({ project, directory })
   const artifacts = await ProjectWorkflow.readActiveArtifacts({ project, directory })
   return WorkflowNote.parse({
     exists: !!artifacts.note,
@@ -784,7 +784,17 @@ async function notifyWorkflowChatOfManualNoteUpdate(
   const invalidationSummary = typeof workflow.data?.invalidationSummary === "string"
     ? workflow.data.invalidationSummary
     : undefined
-  const text = invalidationSummary
+  const operationReviewRequired = workflow.data?.operationReviewRequired === true
+  const text = operationReviewRequired
+    ? [
+        "<workflow-context-event>",
+        "用户已在页面中更新工作笔记。现有图操作、校验和预览已保留，但提交资格已撤销。",
+        "立即调用 project_workflow_graph_operation_reviewer subagent，只读检查最新 workflows/active/note.md 与现有 operation_notes.md、operations.draft.json 是否一致。",
+        "禁止直接修改图操作。reviewer 返回后，调用 workflow_action action=\"登记图操作复核\" 记录精简结论，向用户说明问题，并询问是沿用当前图操作还是按新笔记调整。",
+        "只有用户随后在聊天中明确同意沿用，才可调用 action=\"确认沿用现有图操作\"；该动作只开放页面提交按钮，不会直接提交。",
+        "</workflow-context-event>",
+      ].join("\n")
+    : invalidationSummary
     ? [
         "<workflow-context-event>",
         `用户已在页面中更新工作笔记。执行层${invalidationSummary}`,
@@ -841,14 +851,28 @@ async function importWorkflowNote(input: {
   if (workflow.data?.recoveredPublishedApply) {
     throw new HTTPException(409, { message: "上一轮图操作已经发布并完成归档，本次工作笔记修改未执行。" })
   }
-  await notifyWorkflowChatOfManualNoteUpdate(directory, workflow).catch((error) => {
+  const notification = await notifyWorkflowChatOfManualNoteUpdate(directory, workflow).catch((error) => {
     log.warn("failed to append workflow note update context", {
       project: input.project,
       workflowID: workflow.workflowID,
       sessionID: workflow.state?.sessionID,
       error,
     })
+    return undefined
   })
+  if (workflow.data?.operationReviewRequired === true && notification?.appended && workflow.state?.sessionID) {
+    void Instance.provide({
+      directory,
+      fn: () => SessionPrompt.loop({ sessionID: workflow.state!.sessionID as SessionID }),
+    }).catch((error) => {
+      log.warn("failed to start workflow operation review after manual note update", {
+        project: input.project,
+        workflowID: workflow.workflowID,
+        sessionID: workflow.state?.sessionID,
+        error,
+      })
+    })
+  }
   return WorkflowNote.parse({
     exists: true,
     content: input.content.trimEnd() + "\n",
@@ -1346,6 +1370,9 @@ export const ProjectRoutes = lazy(() =>
       async (c) => {
         const query = c.req.valid("query")
         const input = c.req.valid("json")
+        if (input.action === "登记图操作复核" || input.action === "确认沿用现有图操作") {
+          throw new HTTPException(400, { message: "该动作只能由工作推进聊天执行。" })
+        }
         const directory = projectDirectoryForName(query.project)
         const correctionConfirmed = input.payload?.confirm === true
         const correctionAction = input.action === "开始软更正" || input.action === "重做最近提交"
@@ -1479,7 +1506,7 @@ export const ProjectRoutes = lazy(() =>
         return c.json({
           sessionID,
           userMessageID: userMessage.info.id,
-          workflow: await ProjectWorkflow.getActive({ project, directory }),
+          workflow: await ProjectWorkflowExecution.getActive({ project, directory }),
         })
       },
     )

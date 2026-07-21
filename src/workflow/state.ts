@@ -11,6 +11,7 @@ export namespace ProjectWorkflow {
     "笔记已生成",
     "笔记需补充",
     "图操作已生成",
+    "图操作待复核",
     "图操作需修订",
     "应用中",
     "已应用",
@@ -28,6 +29,8 @@ export namespace ProjectWorkflow {
     "检查笔记充分性",
     "生成图操作草案",
     "校验图操作",
+    "登记图操作复核",
+    "确认沿用现有图操作",
     "提出修订意见",
     "应用图操作",
     "重做最近提交",
@@ -48,6 +51,9 @@ export namespace ProjectWorkflow {
     operationsDraft: z.string().default("operations.draft.json"),
     operations: z.string().default("operations.json"),
     operationIndex: z.string().default("operation_index.json"),
+    operationBasis: z.string().default("operation_basis.json"),
+    operationReview: z.string().default("operation_review.json"),
+    operationReuseApproval: z.string().default("operation_reuse_approval.json"),
     validation: z.string().default("validation.json"),
     preview: z.string().default("preview.json"),
     previewGraph: z.string().default("preview_graph"),
@@ -84,6 +90,9 @@ export namespace ProjectWorkflow {
       operationsDraft: "operations.draft.json",
       operations: "operations.json",
       operationIndex: "operation_index.json",
+      operationBasis: "operation_basis.json",
+      operationReview: "operation_review.json",
+      operationReuseApproval: "operation_reuse_approval.json",
       validation: "validation.json",
       preview: "preview.json",
       previewGraph: "preview_graph",
@@ -163,6 +172,7 @@ export namespace ProjectWorkflow {
     summary: z.string().optional(),
     source: z.enum(["llm_draft", "manual_import", "manual_edit", "llm_revision"]).optional(),
     sourcePath: z.string().optional(),
+    requiresOperationReview: z.boolean().optional(),
   })
 
   const OperationArtifactsPayload = z.object({
@@ -214,6 +224,18 @@ export namespace ProjectWorkflow {
   const ValidationRegisterPayload = z.object({
     passed: z.boolean().optional(),
     summary: z.string().optional(),
+  })
+
+  const OperationReviewRegisterPayload = z.object({
+    recorded: z.boolean().default(false),
+    verdict: z.enum(["consistent", "issues"]).optional(),
+    issueCount: z.number().int().nonnegative().optional(),
+    summary: z.string().max(2000).optional(),
+  })
+
+  const OperationReuseConfirmPayload = z.object({
+    confirm: z.boolean().default(false),
+    approved: z.boolean().default(false),
   })
 
   const ValidationArtifact = z.object({
@@ -373,18 +395,21 @@ export namespace ProjectWorkflow {
   }
 
   async function artifactStatus(directory: string, state: State) {
-    const [note, noteReview, operationNotes, operationsDraft, operations, operationIndex, validation, preview, previewGraph] = await Promise.all([
+    const [note, noteReview, operationNotes, operationsDraft, operations, operationIndex, operationBasis, operationReview, operationReuseApproval, validation, preview, previewGraph] = await Promise.all([
       fileExists(artifactPath(directory, state, "note")),
       fileExists(artifactPath(directory, state, "noteReview")),
       fileExists(artifactPath(directory, state, "operationNotes")),
       fileExists(artifactPath(directory, state, "operationsDraft")),
       fileExists(artifactPath(directory, state, "operations")),
       fileExists(artifactPath(directory, state, "operationIndex")),
+      fileExists(artifactPath(directory, state, "operationBasis")),
+      fileExists(artifactPath(directory, state, "operationReview")),
+      fileExists(artifactPath(directory, state, "operationReuseApproval")),
       fileExists(artifactPath(directory, state, "validation")),
       fileExists(artifactPath(directory, state, "preview")),
       fileExists(artifactPath(directory, state, "previewGraph")),
     ])
-    return { note, noteReview, operationNotes, operationsDraft, operations, operationIndex, validation, preview, previewGraph }
+    return { note, noteReview, operationNotes, operationsDraft, operations, operationIndex, operationBasis, operationReview, operationReuseApproval, validation, preview, previewGraph }
   }
 
   async function latestValidationPassed(directory: string, state: State) {
@@ -441,7 +466,7 @@ export namespace ProjectWorkflow {
     const blockedActions: { action: Action; reason: string }[] = []
 
     if (artifacts.note) {
-      availableActions.push({ action: "同步工作笔记变更", reason: "note.md 已由人工导入或原版编辑工具更新后，同步状态；执行层会清理过期下游产物。" })
+      availableActions.push({ action: "同步工作笔记变更", reason: "note.md 已由人工导入或原版编辑工具更新后，同步状态；已有图操作会保留并进入复核门禁。" })
       availableActions.push({ action: "检查笔记充分性", reason: "判断当前工作笔记是否足以支撑图操作生成。" })
     } else {
       blockedActions.push({ action: "同步工作笔记变更", reason: "尚未生成工作笔记，无法同步笔记变更。" })
@@ -454,6 +479,18 @@ export namespace ProjectWorkflow {
     if (artifacts.operations) availableActions.push({ action: "校验图操作", reason: "校验当前 operations.json 的基础合法性和布局语义。" })
     else blockedActions.push({ action: "校验图操作", reason: artifacts.operationNotes || artifacts.operationsDraft ? "尚未生成可执行 operations.json，当前中间说明或草稿不能替代图操作。" : "尚未生成图操作草案。" })
 
+    if (state.stage === "图操作待复核" && artifacts.operationsDraft && artifacts.operations) {
+      availableActions.push({ action: "登记图操作复核", reason: "使用只读 reviewer 检查最新工作笔记与现有图操作是否一致，再登记复核摘要。" })
+    } else {
+      blockedActions.push({ action: "登记图操作复核", reason: state.stage === "图操作待复核" ? "缺少可复核的图操作草案或可执行图操作。" : "当前图操作不处于笔记更新后的待复核状态。" })
+    }
+
+    if (state.stage === "图操作待复核" && artifacts.operationReview) {
+      availableActions.push({ action: "确认沿用现有图操作", reason: "仅在用户通过聊天明确同意沿用当前图操作后登记确认。", requiresUserConfirmation: true })
+    } else {
+      blockedActions.push({ action: "确认沿用现有图操作", reason: state.stage === "图操作待复核" ? "现有图操作尚未完成只读复核。" : "当前没有等待用户确认沿用的图操作。" })
+    }
+
     const previewReady = artifacts.preview && artifacts.previewGraph && await latestValidationPassed(directory, state)
     if (state.stage === "图操作已生成" && previewReady) {
       availableActions.push({ action: "应用图操作", reason: "图操作和预览已生成，可在用户明确确认时应用图操作。", requiresUserConfirmation: true })
@@ -464,6 +501,7 @@ export namespace ProjectWorkflow {
     const recommendations: string[] = []
     if (!artifacts.note) recommendations.push("先整理或更新工作笔记；材料不足时继续追加消息或登记资源。")
     if (state.stage === "笔记需补充") recommendations.push("当前笔记不足以支撑图操作，优先追问用户并修订工作笔记。")
+    if (state.stage === "图操作待复核") recommendations.push("工作笔记已更新；保留现有图操作，只读复核后向用户说明差异，未经用户明确同意不要确认沿用。")
     if (state.stage === "图操作需修订") recommendations.push("当前工作笔记可以保留，优先根据审核意见或校验结果修订图操作。")
     if (state.stage === "图操作已生成" && previewReady) recommendations.push("图操作和预览已生成后，用户可确认应用，也可继续修订图操作或回到工作笔记。")
     if (!recommendations.length) recommendations.push("根据用户意图选择补材料、改笔记、生成或修订图操作；状态机只做轻量护栏。")
@@ -481,6 +519,16 @@ export namespace ProjectWorkflow {
     if (action === "检查笔记充分性" && !artifacts.note) throw new Error("尚未生成工作笔记，不能检查笔记充分性。")
     if (action === "生成图操作草案" && !artifacts.note) throw new Error("尚未生成工作笔记，不能生成图操作草案。")
     if (action === "校验图操作" && !artifacts.validation && !artifacts.operations) throw new Error(artifacts.operationNotes || artifacts.operationsDraft ? "尚未生成校验结果，不能登记校验。" : "尚未生成图操作草案，不能校验。")
+    if (action === "登记图操作复核") {
+      if (state.stage !== "图操作待复核") throw new Error("当前图操作不处于待复核状态。")
+      if (!artifacts.operationsDraft || !artifacts.operations) throw new Error("缺少可复核的图操作草案或可执行图操作。")
+    }
+    if (action === "确认沿用现有图操作") {
+      const parsed = OperationReuseConfirmPayload.parse(payload)
+      if (state.stage !== "图操作待复核") throw new Error("当前没有等待确认沿用的图操作。")
+      if (!artifacts.operationReview) throw new Error("现有图操作尚未完成只读复核。")
+      if (!parsed.confirm) throw new Error("确认沿用现有图操作必须来自用户在聊天中的明确同意。")
+    }
     if (action === "应用图操作") {
       const parsed = ApplyPayload.parse(payload)
       if (state.stage !== "图操作已生成") throw new Error("尚未生成可审核的图操作预览，不能应用图操作。")
@@ -698,12 +746,13 @@ export namespace ProjectWorkflow {
 
       if (request.action === "同步工作笔记变更") {
         const payload = NoteSyncPayload.parse(request.payload)
-        const next = transition(state, "同步工作笔记变更", "笔记已生成")
+        const next = transition(state, "同步工作笔记变更", payload.requiresOperationReview ? "图操作待复核" : "笔记已生成")
         await writeState(directory, next)
-        return ok(project, directory, next, "已同步工作笔记变更。", {
+        return ok(project, directory, next, payload.requiresOperationReview ? "已同步工作笔记变更，现有图操作等待复核。" : "已同步工作笔记变更。", {
           notePath: next.artifacts.note,
           source: payload.source,
           sourcePath: payload.sourcePath,
+          requiresOperationReview: payload.requiresOperationReview ?? false,
         })
       }
 
@@ -759,6 +808,27 @@ export namespace ProjectWorkflow {
             issues: validation.issues,
           },
         })
+      }
+
+      if (request.action === "登记图操作复核") {
+        const payload = OperationReviewRegisterPayload.parse(request.payload)
+        if (!payload.recorded) throw new Error("图操作复核必须由执行层写入复核产物后登记。")
+        const next = touch(state, "登记图操作复核")
+        await writeState(directory, next)
+        return ok(project, directory, next, "已登记最新工作笔记与现有图操作的只读复核结果。", {
+          verdict: payload.verdict,
+          issueCount: payload.issueCount,
+          summary: payload.summary,
+        })
+      }
+
+      if (request.action === "确认沿用现有图操作") {
+        const payload = OperationReuseConfirmPayload.parse(request.payload)
+        if (!payload.confirm) throw new Error("确认沿用现有图操作必须来自用户在聊天中的明确同意。")
+        if (!payload.approved) throw new Error("确认沿用现有图操作必须由执行层完成版本校验并记录批准。")
+        const next = transition(state, "确认沿用现有图操作", "图操作已生成")
+        await writeState(directory, next)
+        return ok(project, directory, next, "用户已确认沿用当前图操作，可以在页面审核并提交。")
       }
 
       if (request.action === "提出修订意见") {

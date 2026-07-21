@@ -283,6 +283,16 @@ body.workflow-maximized-chat #chat-panel {
   justify-content: space-between;
   gap: 10px;
 }
+.operation-review-warning {
+  margin-bottom: 6px;
+  border: 1px solid #a16207;
+  border-radius: 6px;
+  background: #422006;
+  color: #fde68a;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+}
 .preview-header h3,
 .side-header h3 {
   font-size: 13px;

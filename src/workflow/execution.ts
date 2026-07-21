@@ -1,5 +1,6 @@
 import fs from "fs/promises"
 import path from "path"
+import { createHash } from "crypto"
 import z from "zod"
 import { GraphEngine } from "@/graph/engine"
 import { EdgeType, GraphCommand, GraphSnapshot, NODE_DRAFT_FIELD_KEYS, NodeType, type GraphCommand as GraphCommandData } from "@/graph/schema"
@@ -83,6 +84,54 @@ export namespace ProjectWorkflowExecution {
     errors: z.array(z.string()).default([]),
   }).passthrough()
   export type ApplyResultArtifact = z.infer<typeof ApplyResultArtifact>
+
+  const ArtifactDigest = z.string().regex(/^[a-f0-9]{64}$/u)
+
+  export const OperationBasisArtifact = z.object({
+    schemaVersion: z.literal(1),
+    generatedAt: z.string(),
+    noteHash: ArtifactDigest,
+    draftHash: ArtifactDigest,
+    operationsHash: ArtifactDigest,
+  })
+  export type OperationBasisArtifact = z.infer<typeof OperationBasisArtifact>
+
+  export const OperationReviewArtifact = z.object({
+    schemaVersion: z.literal(1),
+    reviewedAt: z.string(),
+    noteHash: ArtifactDigest,
+    draftHash: ArtifactDigest,
+    operationsHash: ArtifactDigest,
+    verdict: z.enum(["consistent", "issues"]),
+    issueCount: z.number().int().nonnegative(),
+    summary: z.string(),
+  })
+  export type OperationReviewArtifact = z.infer<typeof OperationReviewArtifact>
+
+  export const OperationReuseApprovalArtifact = z.object({
+    schemaVersion: z.literal(1),
+    approvedAt: z.string(),
+    noteHash: ArtifactDigest,
+    draftHash: ArtifactDigest,
+    operationsHash: ArtifactDigest,
+    sessionID: z.string().optional(),
+    userMessageID: z.string().optional(),
+    userMessageCreatedAt: z.number().int().nonnegative().optional(),
+  })
+  export type OperationReuseApprovalArtifact = z.infer<typeof OperationReuseApprovalArtifact>
+
+  const OperationReviewPayload = z.object({
+    verdict: z.enum(["consistent", "issues"]),
+    issueCount: z.number().int().nonnegative(),
+    summary: z.string().min(1).max(2000),
+  })
+
+  const OperationReuseConfirmPayload = z.object({
+    confirm: z.boolean().default(false),
+    sessionID: z.string().min(1),
+    userMessageID: z.string().min(1),
+    userMessageCreatedAt: z.number().int().nonnegative(),
+  })
 
   const TimestampDraft = z.union([
     z.string(),
@@ -257,6 +306,66 @@ export namespace ProjectWorkflowExecution {
 
   async function readOptionalText(file: string) {
     return fs.readFile(file, "utf8").catch(() => undefined)
+  }
+
+  function sha256(content: string) {
+    return createHash("sha256").update(content).digest("hex")
+  }
+
+  async function currentOperationDigests(directory: string) {
+    const [note, draft, operations] = await Promise.all([
+      fs.readFile(artifactPath(directory, "note.md"), "utf8"),
+      fs.readFile(artifactPath(directory, "operations.draft.json"), "utf8"),
+      fs.readFile(artifactPath(directory, "operations.json"), "utf8"),
+    ])
+    return {
+      noteHash: sha256(note),
+      draftHash: sha256(draft),
+      operationsHash: sha256(operations),
+    }
+  }
+
+  function sameOperationDigests(
+    expected: { noteHash: string; draftHash: string; operationsHash: string },
+    current: { noteHash: string; draftHash: string; operationsHash: string },
+  ) {
+    return expected.noteHash === current.noteHash && expected.draftHash === current.draftHash && expected.operationsHash === current.operationsHash
+  }
+
+  async function writeOperationBasis(directory: string) {
+    const digests = await currentOperationDigests(directory)
+    const basis = OperationBasisArtifact.parse({
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      ...digests,
+    })
+    await atomicWriteText(artifactPath(directory, "operation_basis.json"), JSON.stringify(basis, null, 2) + "\n")
+    return basis
+  }
+
+  async function ensureLegacyOperationBasis(directory: string) {
+    const basisPath = artifactPath(directory, "operation_basis.json")
+    if (await fileExists(basisPath)) return readJsonFile(basisPath, OperationBasisArtifact)
+    const hasOperations = await Promise.all([
+      fileExists(artifactPath(directory, "note.md")),
+      fileExists(artifactPath(directory, "operations.draft.json")),
+      fileExists(artifactPath(directory, "operations.json")),
+    ]).then((values) => values.every(Boolean))
+    return hasOperations ? writeOperationBasis(directory) : undefined
+  }
+
+  async function operationSubmissionAuthorization(directory: string) {
+    const basisPath = artifactPath(directory, "operation_basis.json")
+    if (!(await fileExists(basisPath))) return { authorized: true as const, legacy: true as const }
+    const basis = await readJsonFile(basisPath, OperationBasisArtifact)
+    const current = await currentOperationDigests(directory)
+    if (basis.draftHash !== current.draftHash || basis.operationsHash !== current.operationsHash) {
+      return { authorized: false as const, reason: "图操作草案或可执行图操作已在生成后发生变化，请重新生成并校验图操作。" }
+    }
+    if (basis.noteHash === current.noteHash) return { authorized: true as const, legacy: false as const }
+    const approval = await readJsonFile(artifactPath(directory, "operation_reuse_approval.json"), OperationReuseApprovalArtifact).catch(() => undefined)
+    if (approval && sameOperationDigests(approval, current)) return { authorized: true as const, legacy: false as const }
+    return { authorized: false as const, reason: "工作笔记已在图操作生成后更新；现有图操作必须完成只读复核，并由用户在聊天中明确同意沿用。" }
   }
 
   async function syncDirectory(directory: string) {
@@ -1232,6 +1341,9 @@ export namespace ProjectWorkflowExecution {
       "operations.draft.json",
       "operations.json",
       "operation_index.json",
+      "operation_basis.json",
+      "operation_review.json",
+      "operation_reuse_approval.json",
       "validation.json",
       "preview.json",
       "apply_result.json",
@@ -1259,6 +1371,8 @@ export namespace ProjectWorkflowExecution {
       files: [
         "validation.json",
         "preview.json",
+        "operation_review.json",
+        "operation_reuse_approval.json",
         "apply_result.json",
         "apply_result.json.preparing",
         "step.md",
@@ -1271,6 +1385,34 @@ export namespace ProjectWorkflowExecution {
     })
     await GraphVersionStore.cleanup(directory)
     return invalidatedArtifacts
+  }
+
+  async function hasRetainableOperationSet(directory: string) {
+    const [draft, operations, operationIndex, preview, previewGraph, validation] = await Promise.all([
+      fileExists(artifactPath(directory, "operations.draft.json")),
+      fileExists(artifactPath(directory, "operations.json")),
+      fileExists(artifactPath(directory, "operation_index.json")),
+      fileExists(artifactPath(directory, "preview.json")),
+      fileExists(previewGraphDir(directory)),
+      readJsonFile(artifactPath(directory, "validation.json"), ValidationArtifact).catch(() => undefined),
+    ])
+    return draft && operations && operationIndex && preview && previewGraph && validation?.passed === true
+  }
+
+  async function prepareExistingOperationsForNoteReview(directory: string) {
+    return removeExistingArtifacts({
+      directory,
+      files: [
+        "note_review.json",
+        "operation_review.json",
+        "operation_reuse_approval.json",
+        "apply_result.json",
+        "apply_result.json.preparing",
+        "step.md",
+        "step.md.preparing",
+      ],
+      directories: [],
+    })
   }
 
   async function prepareOperationArtifactManifest(input: {
@@ -1295,6 +1437,9 @@ export namespace ProjectWorkflowExecution {
       fs.rm(artifactPath(input.directory, "changelog_entry.txt"), { force: true }),
       fs.rm(artifactPath(input.directory, "operation_index.json"), { force: true }),
       fs.rm(artifactPath(input.directory, "operations.json"), { force: true }),
+      fs.rm(artifactPath(input.directory, "operation_basis.json"), { force: true }),
+      fs.rm(artifactPath(input.directory, "operation_review.json"), { force: true }),
+      fs.rm(artifactPath(input.directory, "operation_reuse_approval.json"), { force: true }),
       fs.rm(artifactPath(input.directory, "apply_result.json"), { force: true }),
       fs.rm(artifactPath(input.directory, "apply_result.json.preparing"), { force: true }),
       fs.rm(artifactPath(input.directory, "step.md"), { force: true }),
@@ -1332,7 +1477,7 @@ export namespace ProjectWorkflowExecution {
 
   export async function readOperationArtifacts(input: { project: string; directory?: string }): Promise<OperationArtifactSnapshot> {
     const directory = input.directory ?? ProjectWorkflow.projectDirectory(input.project)
-    const workflow = await ProjectWorkflow.getActive({ project: input.project, directory })
+    const workflow = await getActive({ project: input.project, directory })
     const state = workflow.state
     if (!state) return OperationArtifactSnapshot.parse({ workflow, files: [] })
     const files = await Promise.all(operationArtifactDefinitions.map(async (definition) => {
@@ -1368,6 +1513,11 @@ export namespace ProjectWorkflowExecution {
   }
 
   export async function compileOperationDraft(input: { directory: string }) {
+    await Promise.all([
+      fs.rm(artifactPath(input.directory, "operation_basis.json"), { force: true }),
+      fs.rm(artifactPath(input.directory, "operation_review.json"), { force: true }),
+      fs.rm(artifactPath(input.directory, "operation_reuse_approval.json"), { force: true }),
+    ])
     let raw: unknown
     try {
       raw = await readJsonValue(artifactPath(input.directory, "operations.draft.json"))
@@ -1428,6 +1578,7 @@ export namespace ProjectWorkflowExecution {
         fs.writeFile(artifactPath(input.directory, "operations.json"), JSON.stringify(command, null, 2) + "\n", "utf8"),
         fs.writeFile(artifactPath(input.directory, "operation_index.json"), JSON.stringify(await buildOperationIndex(command, input.directory), null, 2) + "\n", "utf8"),
       ])
+      await writeOperationBasis(input.directory)
       return { ok: true as const, command, extraIssues }
     }
 
@@ -1834,6 +1985,8 @@ export namespace ProjectWorkflowExecution {
     if (active.stage !== "图操作已生成") throw new Error("尚未生成可审核的图操作预览，不能应用图操作。")
     if (!active.state) throw new Error("缺少 active workflow state，不能应用图操作。")
     const originalState = active.state
+    const authorization = await operationSubmissionAuthorization(input.directory)
+    if (!authorization.authorized) throw new Error(authorization.reason)
     const validation = await readJsonFile(artifactPath(input.directory, "validation.json"), ValidationArtifact)
     if (!validation.passed) throw new Error("最近一次图操作校验未通过，不能应用图操作。")
     if (!(await fileExists(previewGraphDir(input.directory)))) throw new Error("缺少 preview_graph，不能应用图操作。")
@@ -2105,7 +2258,7 @@ export namespace ProjectWorkflowExecution {
 
   export async function getActive(input: { project: string; directory: string }) {
     await GraphVersionStore.ensure(input.directory)
-    const active = await ProjectWorkflow.getActive(input)
+    let active = await ProjectWorkflow.getActive(input)
     if (!active.state) {
       const latest = await GraphVersionStore.resolve(input.directory, "latest")
       return {
@@ -2114,13 +2267,45 @@ export namespace ProjectWorkflowExecution {
         sessionReady: false,
       }
     }
+    if (active.state.stage === "图操作已生成" && await hasRetainableOperationSet(input.directory)) {
+      await ensureLegacyOperationBasis(input.directory)
+      const authorization = await operationSubmissionAuthorization(input.directory).catch((error) => ({
+        authorized: false as const,
+        reason: error instanceof Error ? error.message : String(error),
+      }))
+      if (!authorization.authorized) {
+        active = {
+          ...active,
+          availableActions: active.availableActions.filter((entry) => entry.action !== "应用图操作"),
+          blockedActions: [
+            ...active.blockedActions.filter((entry) => entry.action !== "应用图操作"),
+            { action: "应用图操作", reason: authorization.reason },
+          ],
+          data: {
+            ...active.data,
+            operationSubmissionAuthorized: false,
+            operationSubmissionBlockedReason: authorization.reason,
+          },
+        }
+      } else {
+        active = {
+          ...active,
+          data: {
+            ...active.data,
+            operationSubmissionAuthorized: true,
+          },
+        }
+      }
+    }
+    const state = active.state
+    if (!state) return active
     const base = await GraphVersionStore.resolveActiveBase(input.directory)
     const baseIsEmpty = await GraphVersionStore.isEmpty(base)
     return {
       ...active,
       baseIsEmpty,
-      sessionReady: !!active.state.sessionID,
-      warmupStatus: active.state.warmupStatus,
+      sessionReady: !!state.sessionID,
+      warmupStatus: state.warmupStatus,
     }
   }
 
@@ -2164,6 +2349,7 @@ export namespace ProjectWorkflowExecution {
     if (input.action === "更新工作笔记") {
       const payload = NoteWritePayload.parse(input.payload)
       await runAction({ project: input.project, directory, action: "开始或恢复", payload: {} })
+      if (await hasRetainableOperationSet(directory)) await ensureLegacyOperationBasis(directory)
       await writeNote({ directory, content: payload.content })
       return runAction({
         project: input.project,
@@ -2181,9 +2367,47 @@ export namespace ProjectWorkflowExecution {
       if (!(await fileExists(artifactPath(directory, "note.md")))) {
         return ProjectWorkflow.runAction(input)
       }
-      const invalidatedArtifacts = await clearGraphDraftArtifacts({ directory, includeNoteReview: true })
-      const result = await ProjectWorkflow.runAction(input)
+      const requiresOperationReview = await hasRetainableOperationSet(directory)
+      if (requiresOperationReview) await ensureLegacyOperationBasis(directory)
+      const invalidatedArtifacts = requiresOperationReview
+        ? await prepareExistingOperationsForNoteReview(directory)
+        : await clearGraphDraftArtifacts({ directory, includeNoteReview: true })
+      const result = await ProjectWorkflow.runAction({
+        ...input,
+        payload: {
+          ...input.payload,
+          requiresOperationReview,
+        },
+      })
       const invalidation = graphArtifactInvalidation(invalidatedArtifacts)
+      if (requiresOperationReview) {
+        const retainedArtifacts = [
+          "operation_notes.md",
+          "changelog_entry.txt",
+          "operations.draft.json",
+          "operations.json",
+          "operation_index.json",
+          "operation_basis.json",
+          "validation.json",
+          "preview.json",
+        ]
+        const existingRetainedArtifacts = (await Promise.all(retainedArtifacts.map(async (name) => ({
+          name,
+          exists: await fileExists(artifactPath(directory, name)),
+        })))).filter((item) => item.exists).map((item) => item.name)
+        if (await fileExists(previewGraphDir(directory))) existingRetainedArtifacts.push("preview_graph")
+        return {
+          ...result,
+          message: "已同步工作笔记变更；现有图操作和预览已保留，但提交资格已撤销，等待只读复核和用户确认。",
+          data: {
+            ...result.data,
+            operationReviewRequired: true,
+            retainedArtifacts: existingRetainedArtifacts,
+            invalidatedArtifacts,
+            nextAction: "立即调用 project_workflow_graph_operation_reviewer 只读检查最新 note.md 与现有图操作；不要修改图操作，先向用户说明结论并询问是否沿用。",
+          },
+        }
+      }
       return {
         ...result,
         message: invalidation.invalidationSummary
@@ -2199,6 +2423,73 @@ export namespace ProjectWorkflowExecution {
               : "以最新工作笔记作为后续工作的依据。",
         },
       }
+    }
+
+    if (input.action === "登记图操作复核") {
+      const payload = OperationReviewPayload.parse(input.payload)
+      const basis = await ensureLegacyOperationBasis(directory)
+      if (!basis) throw new Error("缺少可复核的工作笔记或图操作产物。")
+      const current = await currentOperationDigests(directory)
+      if (basis.draftHash !== current.draftHash || basis.operationsHash !== current.operationsHash) {
+        throw new Error("图操作草案或可执行图操作已在生成后发生变化，不能登记旧图操作复核；请重新生成图操作。")
+      }
+      const review = OperationReviewArtifact.parse({
+        schemaVersion: 1,
+        reviewedAt: new Date().toISOString(),
+        ...current,
+        verdict: payload.verdict,
+        issueCount: payload.issueCount,
+        summary: payload.summary,
+      })
+      await Promise.all([
+        atomicWriteText(artifactPath(directory, "operation_review.json"), JSON.stringify(review, null, 2) + "\n"),
+        fs.rm(artifactPath(directory, "operation_reuse_approval.json"), { force: true }),
+      ])
+      return ProjectWorkflow.runAction({
+        ...input,
+        directory,
+        payload: {
+          recorded: true,
+          verdict: review.verdict,
+          issueCount: review.issueCount,
+          summary: review.summary,
+        },
+      })
+    }
+
+    if (input.action === "确认沿用现有图操作") {
+      const payload = OperationReuseConfirmPayload.parse(input.payload)
+      if (!payload.confirm) throw new Error("确认沿用现有图操作必须来自用户在聊天中的明确同意。")
+      const active = await ProjectWorkflow.getActive({ project: input.project, directory })
+      if (!active.state?.sessionID || active.state.sessionID !== payload.sessionID) {
+        throw new Error("确认沿用现有图操作必须由当前工作推进聊天会话发起。")
+      }
+      const [review, validation, current] = await Promise.all([
+        readJsonFile(artifactPath(directory, "operation_review.json"), OperationReviewArtifact),
+        readJsonFile(artifactPath(directory, "validation.json"), ValidationArtifact),
+        currentOperationDigests(directory),
+      ])
+      if (!sameOperationDigests(review, current)) throw new Error("工作笔记或图操作已在复核后变化，请重新进行只读复核。")
+      if (payload.userMessageCreatedAt < Date.parse(review.reviewedAt)) {
+        throw new Error("确认沿用必须来自图操作复核完成后的用户消息。")
+      }
+      if (!validation.passed || !(await fileExists(previewGraphDir(directory))) || !(await fileExists(artifactPath(directory, "preview.json")))) {
+        throw new Error("现有图操作缺少通过的校验或完整预览，不能确认沿用；请先修订并重新生成图操作。")
+      }
+      const approval = OperationReuseApprovalArtifact.parse({
+        schemaVersion: 1,
+        approvedAt: new Date().toISOString(),
+        ...current,
+        sessionID: payload.sessionID,
+        userMessageID: payload.userMessageID,
+        userMessageCreatedAt: payload.userMessageCreatedAt,
+      })
+      await atomicWriteText(artifactPath(directory, "operation_reuse_approval.json"), JSON.stringify(approval, null, 2) + "\n")
+      return ProjectWorkflow.runAction({
+        ...input,
+        directory,
+        payload: { confirm: true, approved: true },
+      })
     }
 
     if (input.action === "生成图操作草案") {
@@ -2273,9 +2564,20 @@ export namespace ProjectWorkflowExecution {
     if (input.action === "提出修订意见") {
       const target = typeof input.payload?.target === "string" ? input.payload.target : undefined
       const result = await ProjectWorkflow.runAction(input)
-      const invalidatedArtifacts = target === "图操作"
-        ? await clearValidationAndPreview(directory)
-        : await clearGraphDraftArtifacts({ directory, includeNoteReview: true })
+      let invalidatedArtifacts: string[]
+      if (target === "图操作") {
+        invalidatedArtifacts = await clearValidationAndPreview(directory)
+      } else if (target === "工作笔记") {
+        invalidatedArtifacts = await prepareExistingOperationsForNoteReview(directory)
+      } else {
+        const previewArtifacts = await clearValidationAndPreview(directory)
+        const noteArtifacts = await removeExistingArtifacts({
+          directory,
+          files: ["note_review.json"],
+          directories: [],
+        })
+        invalidatedArtifacts = [...previewArtifacts, ...noteArtifacts]
+      }
       const invalidation = graphArtifactInvalidation(invalidatedArtifacts)
       const refreshed = await ProjectWorkflow.getActive({ project: input.project, directory })
       return {

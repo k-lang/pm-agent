@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { WorkflowActionTool, workflowActionResultForModel } from "./workflow-action"
+import { latestExplicitUserMessage, WorkflowActionTool, workflowActionResultForModel } from "./workflow-action"
 import type { Tool } from "./tool"
 import type { ProjectWorkflow } from "@/workflow/state"
 
@@ -40,6 +40,8 @@ describe("workflow_action tool", () => {
     expect(actionOptions).not.toContain("更新工作笔记")
     expect(actionOptions).not.toContain("生成预览")
     expect(actionOptions).not.toContain("应用图操作")
+    expect(actionOptions).toContain("登记图操作复核")
+    expect(actionOptions).toContain("确认沿用现有图操作")
   })
 
   test("rejects internal actions at schema validation", async () => {
@@ -70,6 +72,33 @@ describe("workflow_action tool", () => {
     }, context("project_workflow"))).rejects.toThrow("不能通过 workflow_action 传输草稿正文")
   })
 
+  test("requires a user message before chat can confirm operation reuse", async () => {
+    const tool = await WorkflowActionTool.init()
+
+    await expect(tool.execute({
+      project: "demo",
+      action: "确认沿用现有图操作",
+      payload: { confirm: true },
+    }, context("project_workflow"))).rejects.toThrow("用户明确同意消息")
+  })
+
+  test("does not treat synthetic note-update context as explicit reuse approval", () => {
+    expect(latestExplicitUserMessage([
+      {
+        info: { id: "msg_older", role: "user" },
+        parts: [{ type: "text", text: "生成上一版图操作" }],
+      },
+      {
+        info: { id: "msg_synthetic", role: "user" },
+        parts: [{ type: "text", text: "工作笔记已更新", synthetic: true }],
+      },
+    ] as any)).toBeUndefined()
+    expect(String(latestExplicitUserMessage([{
+      info: { id: "msg_explicit", role: "user", time: { created: 123 } },
+      parts: [{ type: "text", text: "同意沿用现有图操作" }],
+    }] as any)?.info.id)).toBe("msg_explicit")
+  })
+
   test("redacts hard-correction internals from model-facing output", () => {
     const result = {
       ok: true,
@@ -97,6 +126,9 @@ describe("workflow_action tool", () => {
           operationsDraft: "operations.draft.json",
           operations: "operations.json",
           operationIndex: "operation_index.json",
+          operationBasis: "operation_basis.json",
+          operationReview: "operation_review.json",
+          operationReuseApproval: "operation_reuse_approval.json",
           validation: "validation.json",
           preview: "preview.json",
           previewGraph: "preview_graph",

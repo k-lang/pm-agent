@@ -100,6 +100,9 @@
 - `operations.draft.json`：模型写出的压缩结构化图操作草案，只保存语义增量。
 - `operations.json`：后端执行层从 draft 编译生成的最终图操作命令。
 - `operation_index.json`：后端执行层从最终图操作命令派生的自然语言索引。
+- `operation_basis.json`：执行层记录图操作生成时 note/draft/operations 哈希的提交门禁基线。
+- `operation_review.json`：工作笔记更新后，执行层登记的只读复核摘要和当前文件哈希。
+- `operation_reuse_approval.json`：用户在聊天中明确同意沿用现有图操作后，执行层登记的当前哈希批准记录。
 - `validation.json`：后端执行层生成的图操作校验结果。
 - `preview.json`：后端执行层生成的图谱预览元数据。
 - `context_warmup.md`：项目上下文预热输出，可选。
