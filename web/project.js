@@ -1,3 +1,5 @@
+import { sessionAbortControl, sessionAbortUrl, sessionIsRunning } from './session-abort-view.js'
+
 const API = ''
 const params = new URLSearchParams(location.search)
 let projectDir = params.get('directory') || ''
@@ -14,6 +16,7 @@ const messagesEl = document.getElementById('messages')
 const questionInput = document.getElementById('question-input')
 const btnAsk = document.getElementById('btn-ask')
 const btnFollowup = document.getElementById('btn-followup')
+const btnAbortQuestion = document.getElementById('btn-abort-question')
 const btnCollapseProcess = document.getElementById('btn-collapse-process')
 const btnExpandProcess = document.getElementById('btn-expand-process')
 const btnRerun = document.getElementById('btn-rerun')
@@ -42,6 +45,9 @@ let isEditingSummary = false
 let refreshPromise = null
 let refreshQueued = false
 let shouldScrollMessagesToBottom = false
+let questionAbortPending = false
+let sessionStatusAvailable = false
+let sessionStatuses = {}
 let projects = []
 const SOURCE_ROOTS = ['notes/', 'nodes/', 'descriptions_output/', 'changes/', 'snapshots/', 'edges/', 'metadata/', 'report_output/']
 
@@ -244,8 +250,20 @@ function projectDetailUrl(questionId = selectedQuestionId) {
   return url.toString()
 }
 
+async function refreshSessionStatuses() {
+  const result = await fetchJson(API + '/session/status?directory=' + encodeURIComponent(projectDir))
+    .then((statuses) => ({ available: true, statuses: statuses || {} }))
+    .catch(() => ({ available: false, statuses: null }))
+  sessionStatusAvailable = result.available
+  sessionStatuses = result.available ? result.statuses : {}
+}
+
 async function fetchProjectView(questionId = selectedQuestionId) {
-  detail = await fetchJson(projectDetailUrl(questionId))
+  const [nextDetail] = await Promise.all([
+    fetchJson(projectDetailUrl(questionId)),
+    refreshSessionStatuses(),
+  ])
+  detail = nextDetail
   selectedQuestionId = detail.selectedQuestionID || detail.questions?.[0]?.id || null
   selectedQuestionSessionId = detail.selectedThread?.sessionID || selectedQuestion()?.sessionID || null
 }
@@ -303,6 +321,10 @@ function handleBusEvent(event) {
   if (event.type === 'session.status') {
     const sessionID = event.properties?.sessionID
     if (sessionID && (sessionID === currentSummarySessionId || sessionID === currentQuestionSessionId)) {
+      const status = event.properties?.status || { type: 'idle' }
+      sessionStatusAvailable = true
+      if (sessionIsRunning(status)) sessionStatuses[sessionID] = status
+      else delete sessionStatuses[sessionID]
       refreshProjectView().catch(() => {})
     }
   }
@@ -381,10 +403,26 @@ async function renderQuestionList() {
 function updateQuestionSelectionUI() {
   const question = selectedQuestion()
   const ready = qaBaselineReady()
-  questionInput.disabled = !ready
-  btnAsk.disabled = !ready
-  btnFollowup.disabled = !ready || !question?.id || !question?.sessionID
-  questionInput.placeholder = ready ? '输入一个项目问题' : qaBaselineMessage()
+  const fallbackRunning = !sessionStatusAvailable
+    && detail?.selectedThread?.sessionID === question?.sessionID
+    && detail?.selectedThread?.running === true
+  const abortControl = sessionAbortControl({
+    sessionID: question?.sessionID,
+    status: question?.sessionID ? sessionStatuses[question.sessionID] : undefined,
+    pending: questionAbortPending,
+    fallbackRunning,
+  })
+  questionInput.disabled = !ready || abortControl.visible
+  btnAsk.disabled = !ready || abortControl.visible
+  btnFollowup.disabled = !ready || abortControl.visible || !question?.id || !question?.sessionID
+  btnAbortQuestion.classList.toggle('hidden', !abortControl.visible)
+  btnAbortQuestion.disabled = abortControl.disabled
+  btnAbortQuestion.textContent = abortControl.label
+  questionInput.placeholder = !ready
+    ? qaBaselineMessage()
+    : abortControl.visible
+      ? '大模型正在处理，可点击中止当前回答。'
+      : '输入一个项目问题'
 }
 
 function renderPartNode(part) {
@@ -612,8 +650,30 @@ async function ask(mode) {
   }
   shouldScrollMessagesToBottom = true
   questionInput.value = ''
+  await refreshSessionStatuses()
   renderSummary()
   await renderQuestions()
+}
+
+async function abortQuestion() {
+  const question = selectedQuestion()
+  const sessionID = question?.sessionID
+  if (!sessionID || questionAbortPending) return
+  const fallbackRunning = !sessionStatusAvailable
+    && detail?.selectedThread?.sessionID === sessionID
+    && detail?.selectedThread?.running === true
+  if (!sessionIsRunning(sessionStatuses[sessionID]) && !fallbackRunning) return
+
+  questionAbortPending = true
+  updateQuestionSelectionUI()
+  try {
+    await fetchJson(API + sessionAbortUrl(sessionID, projectDir), { method: 'POST' })
+    delete sessionStatuses[sessionID]
+    await refreshProjectView(selectedQuestionId)
+  } finally {
+    questionAbortPending = false
+    updateQuestionSelectionUI()
+  }
 }
 
 summaryPreview.onclick = async (event) => {
@@ -642,6 +702,9 @@ sourceViewerModal.onclick = (event) => {
 
 btnAsk.onclick = () => ask('question')
 btnFollowup.onclick = () => ask('followup')
+btnAbortQuestion.onclick = () => abortQuestion().catch((error) => {
+  alert(error.message || '中止会话失败')
+})
 btnCollapseProcess.onclick = async () => {
   showAllProcessDetails = false
   await renderQuestions()

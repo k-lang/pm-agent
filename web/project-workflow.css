@@ -686,7 +686,7 @@ body.workflow-maximized-chat #chat-panel {
 }
 #chat-composer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 10px;
   padding-top: 12px;
 }

@@ -34,6 +34,7 @@ import {
   workflowPermissionTitle,
 } from './project-workflow-view.js'
 import { graphDetailUrlKey, ProjectGraphRenderer } from './project-graph-renderer.js'
+import { sessionAbortControl, sessionAbortUrl, sessionIsRunning } from './session-abort-view.js'
 
 const API = ''
 const params = new URLSearchParams(location.search)
@@ -64,6 +65,7 @@ const chatLog = document.getElementById('chat-log')
 const chatHint = document.getElementById('chat-hint')
 const chatInput = document.getElementById('chat-input')
 const btnChatSend = document.getElementById('btn-chat-send')
+const btnChatAbort = document.getElementById('btn-chat-abort')
 const btnChatMaximize = document.getElementById('btn-chat-maximize')
 const btnWarmup = document.getElementById('btn-warmup')
 const warmupStatus = document.getElementById('warmup-status')
@@ -145,6 +147,7 @@ let workflowRefreshQueued = false
 let workflowViewGeneration = 0
 let terminalActionPending = false
 let chatSending = false
+let chatAbortPending = false
 let warmupStarting = false
 let workflowPollTimer = null
 let currentSSE = null
@@ -1537,6 +1540,12 @@ function renderChat() {
   const currentWarmupStatus = effectiveWarmupStatus(state)
   const lockReason = chatLockReason(project, state)
   const running = workflowIsRunning()
+  const chatSessionID = state?.sessionID || ''
+  const abortControl = sessionAbortControl({
+    sessionID: chatSessionID,
+    status: chatSessionID ? workflowStatusById.get(chatSessionID) : undefined,
+    pending: chatAbortPending,
+  })
   updateTerminalActionButtons()
   const canChat = !!project && !running && !lockReason
   const canWarmup = !!project && !terminalActionPending && workflowStatusAvailable && currentWarmupStatus !== 'running'
@@ -1550,6 +1559,9 @@ function renderChat() {
       : '描述项目背景、目标、现状或已有笔记；也可以在工作笔记页签导入/人工修改。'
 
   btnChatSend.disabled = !canChat || !chatInput.value.trim()
+  btnChatAbort.classList.toggle('hidden', !abortControl.visible)
+  btnChatAbort.disabled = abortControl.disabled
+  btnChatAbort.textContent = abortControl.label
   chatInput.disabled = !canChat
   chatInput.placeholder = lockReason || readyHint
   chatHint.textContent = lockReason
@@ -2026,6 +2038,9 @@ chatInput.onkeydown = (event) => {
 btnChatSend.onclick = () => sendChat().catch((error) => {
   chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '发送失败')}</div>`
 })
+btnChatAbort.onclick = () => abortWorkflowChat().catch((error) => {
+  alert(error.message || '中止会话失败')
+})
 btnWarmup.onclick = () => startWarmup().catch((error) => {
   chatLog.innerHTML = `<div class="placeholder">${esc(error.message || '预热失败')}</div>`
 })
@@ -2301,6 +2316,26 @@ async function sendChat() {
     throw error
   } finally {
     chatSending = false
+    renderChat()
+  }
+}
+
+async function abortWorkflowChat() {
+  const project = selectedProject()
+  const sessionID = currentWorkflowState()?.sessionID
+  if (!project || !sessionID || chatAbortPending) return
+  if (!sessionIsRunning(workflowStatusById.get(sessionID))) return
+
+  chatAbortPending = true
+  renderChat()
+  try {
+    await fetchJson(API + sessionAbortUrl(sessionID, project.directory), { method: 'POST' })
+    updateWorkflowStatus(sessionID, { type: 'idle' })
+    workflowAwaitingReply = false
+    await loadWorkflow({ askRestore: false })
+    await loadWorkflowOperations().catch(() => {})
+  } finally {
+    chatAbortPending = false
     renderChat()
   }
 }
